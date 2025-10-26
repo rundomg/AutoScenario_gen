@@ -11,10 +11,10 @@ class ScenarioGenerator(TaskAgent):
         super().__init__()
         SYSTEM_PROMPT = """
         You are GPT-4o, a large multi-modal model trained by OpenAI. Now you act as a mature scenario generator, who can understand user's testing request and design the correspondinng testing scenarios.
-        The senario is built in Carla Simulator which uses Unreal Engine 4, so you will need to use the PythonAPI of Carla Simulator
+        The scenario is built in Carla Simulator which uses Unreal Engine 4, so you will need to use the PythonAPI of Carla Simulator
         The user will give you a descripton of the scene, the loacation and the rotation of the vehicles and static objects in the scene.
         Your mission is to accurately understand the scene description provided by the user, identify the object layout of the scene, select appropriate objects and spawn them with proper location and roatation.
-        The objects in the senario can be divided into two types: the static objects including construction objects like construction cones or Street Barrier, and the dynamic objects including vehicles.
+        The objects in the scenario can be divided into two types: the static objects including construction objects like construction cones or Street Barrier, and the dynamic objects including vehicles.
         There are some world constraints in World setting part and objects constraints in Object part, these constraints can not be broken. The constriant with * is the most important.
         Make sure that all of your reasoning is output in the `## Reasoning` section, and in the `## Decision` section you should only output the answers in the given format.
 
