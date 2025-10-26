@@ -49,9 +49,13 @@ def compute_connected_angles(node_file, edge_file):
     connected_angles = {}
 
     for i, edge1 in enumerate(edges):
-        for edge2 in edges[i + 1:]:
-            if set([edge1[1], edge1[2]]) & set([edge2[1], edge2[2]]):  # Check shared nodes
-                angle = angle_between_vectors(direction_vectors[edge1[0]], direction_vectors[edge2[0]])
+        for edge2 in edges[i + 1 :]:
+            if set([edge1[1], edge1[2]]) & set(
+                [edge2[1], edge2[2]]
+            ):  # Check shared nodes
+                angle = angle_between_vectors(
+                    direction_vectors[edge1[0]], direction_vectors[edge2[0]]
+                )
                 connected_angles[(edge1[0], edge2[0])] = angle
 
     return connected_angles
@@ -64,10 +68,14 @@ def compute_entropy(data_list):
         frequency[count] += 1
     total = sum(frequency.values())
 
-    return -sum((freq / total) * math.log(freq / total, 2) for freq in frequency.values())
+    return -sum(
+        (freq / total) * math.log(freq / total, 2) for freq in frequency.values()
+    )
 
 
-def plot_histograms(edge_numbers, lane_numbers, total_lengths, save_fig=False, save_fn="edge_dist.png"):
+def plot_histograms(
+    edge_numbers, lane_numbers, total_lengths, save_fig=False, save_fn="edge_dist.png"
+):
     """Plots histograms for edge count, lane count, and total length."""
     fig, axs = plt.subplots(1, 3, figsize=(12, 6))
     data = [edge_numbers, lane_numbers, total_lengths]
@@ -89,7 +97,11 @@ def plot_histograms(edge_numbers, lane_numbers, total_lengths, save_fig=False, s
 
 def list_xml_files(folder_dir):
     """Lists all .xml files in a directory."""
-    return [os.path.join(folder_dir, f) for f in os.listdir(folder_dir) if f.endswith(".xml")]
+    return [
+        os.path.join(folder_dir, f)
+        for f in os.listdir(folder_dir)
+        if f.endswith(".xml")
+    ]
 
 
 def compute_states(folder_dir):

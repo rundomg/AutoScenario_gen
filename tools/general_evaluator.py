@@ -19,7 +19,9 @@ def count_lanes_edges(xml_file):
             edge_count += 1
             lanes = edge.findall("lane")
             lane_count += len(lanes)
-            lane_lengths = [float(lane.get("length")) for lane in lanes if lane.get("length")]
+            lane_lengths = [
+                float(lane.get("length")) for lane in lanes if lane.get("length")
+            ]
             if len(lane_lengths) > 0:
                 total_length += sum(lane_lengths) / len(lane_lengths)
 
@@ -33,14 +35,23 @@ def compute_entropy(data_list):
         frequency[count] += 1
     total_count = sum(frequency.values())
 
-    return -sum((freq / total_count) * math.log(freq / total_count, 2) for freq in frequency.values())
+    return -sum(
+        (freq / total_count) * math.log(freq / total_count, 2)
+        for freq in frequency.values()
+    )
 
 
-def plot_histograms(edge_numbers, lane_numbers, total_length, save_fig=False, save_fn=None):
+def plot_histograms(
+    edge_numbers, lane_numbers, total_length, save_fig=False, save_fn=None
+):
     """Plots histograms for edge count, lane count, and total length."""
     fig, axs = plt.subplots(1, 3, figsize=(12, 6))
     data = [edge_numbers, lane_numbers, total_length]
-    titles = ["Histogram of Edge Numbers", "Histogram of Lane Numbers", "Histogram of Total Length"]
+    titles = [
+        "Histogram of Edge Numbers",
+        "Histogram of Lane Numbers",
+        "Histogram of Total Length",
+    ]
     colors = ["blue", "green", "red"]
 
     for ax, d, title, color in zip(axs, data, titles, colors):
@@ -66,15 +77,23 @@ def plot_scatters(ax, edge_numbers, total_length, angle_list, num_angles_xml):
     ax2 = ax.twinx()
     cnt = 0
     for net_idx, num_angle in enumerate(num_angles_xml):
-        ax2.scatter([edge_numbers[net_idx]] * num_angle, angle_list[cnt: cnt + num_angle], 
-                    color=colors[1], marker=markers[1])
+        ax2.scatter(
+            [edge_numbers[net_idx]] * num_angle,
+            angle_list[cnt : cnt + num_angle],
+            color=colors[1],
+            marker=markers[1],
+        )
         cnt += num_angle
     ax2.set_ylabel("Angles", color=colors[1], fontsize=12)
 
 
 def list_xml_files(folder_dir):
     """Lists all .net.xml files in the given directory."""
-    return [os.path.join(folder_dir, f) for f in os.listdir(folder_dir) if f.endswith("net.xml")]
+    return [
+        os.path.join(folder_dir, f)
+        for f in os.listdir(folder_dir)
+        if f.endswith("net.xml")
+    ]
 
 
 def compute_mean_std(data_array):
@@ -88,7 +107,9 @@ def compute_angle_info(xml_files):
     for xml_file in xml_files:
         dir_name, net_name = os.path.dirname(xml_file), os.path.basename(xml_file)
         prefix = net_name.split(".")[0]
-        node_fn, edge_fn = os.path.join(dir_name, f"{prefix}.nod.xml"), os.path.join(dir_name, f"{prefix}.edg.xml")
+        node_fn, edge_fn = os.path.join(dir_name, f"{prefix}.nod.xml"), os.path.join(
+            dir_name, f"{prefix}.edg.xml"
+        )
 
         angles = compute_connected_angles(node_fn, edge_fn)
         angle_list.extend(angles.values())
@@ -110,15 +131,26 @@ def compute_net_states(folder_dir):
 
     angle_list, num_angles_xml = compute_angle_info(xml_files)
 
-    return xml_files, lane_counts, edge_counts, total_lengths, angle_list, num_angles_xml
+    return (
+        xml_files,
+        lane_counts,
+        edge_counts,
+        total_lengths,
+        angle_list,
+        num_angles_xml,
+    )
 
 
 def compute_and_visualize_net_states(folder_dir, save_fig=False, save_fn=None):
     """Computes and visualizes network statistics (histograms and scatter plots)."""
-    xml_files, lane_counts, edge_counts, total_lengths, angle_list, num_angles_xml = compute_net_states(folder_dir)
+    xml_files, lane_counts, edge_counts, total_lengths, angle_list, num_angles_xml = (
+        compute_net_states(folder_dir)
+    )
 
     if save_fig:
-        plot_histograms(lane_counts, edge_counts, total_lengths, save_fig=True, save_fn=save_fn)
+        plot_histograms(
+            lane_counts, edge_counts, total_lengths, save_fig=True, save_fn=save_fn
+        )
         fig, ax = plt.subplots(figsize=(8, 5))
         plot_scatters(ax, edge_counts, total_lengths, angle_list, num_angles_xml)
         plt.savefig(os.path.join(os.path.dirname(save_fn), "net_scatter.png"))
@@ -127,12 +159,15 @@ def compute_and_visualize_net_states(folder_dir, save_fig=False, save_fn=None):
     for data in [lane_counts, edge_counts, total_lengths, angle_list]:
         print(compute_mean_std(data))
 
-    return [compute_entropy(data) for data in [lane_counts, edge_counts, total_lengths, angle_list]]
+    return [
+        compute_entropy(data)
+        for data in [lane_counts, edge_counts, total_lengths, angle_list]
+    ]
 
 
 class Evaluator:
     """Evaluates network entropy for lanes, edges, lengths, and angles."""
-    
+
     def __init__(self, result_dir, output_dir):
         self.result_dir = result_dir
         self.output_dir = output_dir
@@ -141,12 +176,14 @@ class Evaluator:
         """Computes and saves entropy of lane, edge, and route length distributions."""
         if save_fig:
             os.makedirs(self.output_dir, exist_ok=True)
-        
+
         save_fn = os.path.join(self.output_dir, "net_KL_dist.png")
-        lane_entropy, edge_entropy, length_entropy, angle_entropy = compute_and_visualize_net_states(
-            self.result_dir, save_fig, save_fn
+        lane_entropy, edge_entropy, length_entropy, angle_entropy = (
+            compute_and_visualize_net_states(self.result_dir, save_fig, save_fn)
         )
-        print(f"Entropy of Lanes, Edges, Length, and Angles: {lane_entropy}, {edge_entropy}, {length_entropy}, {angle_entropy}")
+        print(
+            f"Entropy of Lanes, Edges, Length, and Angles: {lane_entropy}, {edge_entropy}, {length_entropy}, {angle_entropy}"
+        )
 
 
 if __name__ == "__main__":
@@ -154,5 +191,3 @@ if __name__ == "__main__":
     stats = {cat: {"lanes": [], "edges": [], "lengths": []} for cat in categories}
     evaluator = Evaluator("auto_result", "result_analysis")
     evaluator.compute_states()
-
-
