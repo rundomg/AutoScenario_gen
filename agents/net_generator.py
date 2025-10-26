@@ -44,8 +44,7 @@ class NetGenerator(TaskAgent):
         final_request += road_constraints
         final_request += additional_hints
         self.pre_prompt = final_request
-        self.save_dir = save_dir  # "generated_net"
-
+        self.save_dir = save_dir
 
     def call_agent(self, user_request, scenario_id, add_info=None):
         request_valid_result = True
@@ -72,7 +71,6 @@ class NetGenerator(TaskAgent):
         if add_info is not None:
             if "example" in add_info:
                 final_request += add_info["example"]
-        #
         return final_request
 
     def extract_decision_data(self, scenario_id, output_fn):
@@ -189,19 +187,18 @@ class NetGenerator(TaskAgent):
                 str(100 / number_vehicles),
             ]
         )
-    
+
     def prepare_net_based_on_gps(self, data_dir, scenario_id, gps_info, radius_m=50):
         create_osm_file_from_point(
-                lat=gps_info["lat"],
-                lon=gps_info["lon"],
-                radius_m=gps_info.get("radius_m", radius_m),
-                data_dir=data_dir,
-                scenario_id=scenario_id
+            lat=gps_info["lat"],
+            lon=gps_info["lon"],
+            radius_m=gps_info.get("radius_m", radius_m),
+            data_dir=data_dir,
+            scenario_id=scenario_id,
         )
         convert_osm_to_sumo_network(
-            osm_path=os.path.join(data_dir, f"{scenario_id}.osm"), output_dir=data_dir)
-        
-      
+            osm_path=os.path.join(data_dir, f"{scenario_id}.osm"), output_dir=data_dir
+        )
 
 
 def convert_osm_to_sumo_network(osm_path, output_dir, netconvert_path="netconvert"):
@@ -210,7 +207,7 @@ def convert_osm_to_sumo_network(osm_path, output_dir, netconvert_path="netconver
     """
     if not os.path.exists(osm_path):
         raise FileNotFoundError(f"OSM file not found: {osm_path}")
-    
+
     os.makedirs(output_dir, exist_ok=True)
 
     base = os.path.splitext(os.path.basename(osm_path))[0]
@@ -221,25 +218,28 @@ def convert_osm_to_sumo_network(osm_path, output_dir, netconvert_path="netconver
     # Step 1: Convert .osm to .nod.xml and .edg.xml
     extract_cmd = [
         netconvert_path,
-        "--osm-files", osm_path,
-        "--plain-output-prefix", os.path.join(output_dir, base),
-        "--no-internal-links"
+        "--osm-files",
+        osm_path,
+        "--plain-output-prefix",
+        os.path.join(output_dir, base),
+        "--no-internal-links",
     ]
-    
     print("Extracting .nod.xml and .edg.xml from .osm...")
     subprocess.run(extract_cmd, check=True)
 
     # Step 2: Use .nod.xml and .edg.xml to generate .net.xml
     netconvert_cmd = [
         netconvert_path,
-        "--node-files", nod_path,
-        "--edge-files", edg_path,
-        "--output-file", net_path
+        "--node-files",
+        nod_path,
+        "--edge-files",
+        edg_path,
+        "--output-file",
+        net_path,
     ]
-    
+
     print("Converting .nod.xml and .edg.xml to .net.xml...")
     subprocess.run(netconvert_cmd, check=True)
-
     print(f"Generated files in {output_dir}:")
     print(f"   Nodes: {nod_path}")
     print(f"   Edges: {edg_path}")
@@ -270,7 +270,7 @@ def create_osm_file_from_point(lat, lon, radius_m, data_dir, scenario_id):
     out body;
     """
 
-    response = requests.get(url, params={'data': query})
+    response = requests.get(url, params={"data": query})
     if response.status_code == 200:
         out_osm_fn = os.path.join(data_dir, f"{scenario_id}.osm")
         with open(out_osm_fn, "w", encoding="utf-8") as file:
@@ -278,5 +278,3 @@ def create_osm_file_from_point(lat, lon, radius_m, data_dir, scenario_id):
             print(f"OSM data saved to {out_osm_fn}")
     else:
         print(f"Error fetching data: {response.status_code}")
-
- 

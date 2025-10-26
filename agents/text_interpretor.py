@@ -1,4 +1,5 @@
 "Thanks GPT for all its major contribution:) Glory belongs to it. qiujing 2024.6.4."
+
 import re
 import os
 import numpy as np
@@ -63,7 +64,6 @@ class TextInterpreter(TaskAgent):
             + f"\n Crash report is :\n {text}"
             + f"\nUser request is : {user_request}"
         )
-        #print("The interpreter's final request is:", final_request)
         return final_request
 
     def extract_decision_data(self, file_path):
@@ -76,7 +76,4 @@ class TextInterpreter(TaskAgent):
             decision_text = decision_text.group(1)
         else:
             return "No decision section found."
-
-        #print("matched result", decision_text)
         return decision_text, False
-

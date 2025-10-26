@@ -1,4 +1,5 @@
 import os, sys
+
 sys.path.insert(0, "../")
 import cv2
 import base64
@@ -8,7 +9,6 @@ from agents.task_agent import TaskAgent
 
 
 class VLMInterpreter(TaskAgent):
-    # def __init__(self, post_header, json_file, mode="generation"):
     def __init__(self):
         super().__init__()
 
@@ -64,7 +64,6 @@ class VLMInterpreter(TaskAgent):
         img_base64 = base64.b64encode(buffer).decode("utf-8")
         return img_base64
 
-
     def refine_request(self, user_request, add_info=None):
         assert "image_path" in add_info
         image_path = add_info["image_path"]
@@ -102,12 +101,11 @@ class VLMInterpreter(TaskAgent):
                 )
         return result
 
-
     def extract_decision_data(self, file_path):
         """Return extracted structured answer and determine if regeneration is needed."""
         text = read_file(file_path)
         decision_text = extract_text_section(text, r"## Decision\n(.+)")
         if decision_text is None:
             return "No decision section found.", True
-        
+
         return decision_text, False

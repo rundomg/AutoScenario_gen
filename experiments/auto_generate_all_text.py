@@ -13,21 +13,22 @@ from agents.obstacle_generator import ObstacleGenerator
 from agents.universal_interpreter import UniInterpreter
 from agents.scenario_generator import ScenarioGenerator
 
-# Load API Key from environment variables
 load_dotenv()
 OPENAI_KEY = os.getenv("OPENAI_KEY")
+
 
 class AutoGenerator:
     """
     A class responsible for generating road network descriptions, obstacles, and full simulation scenarios.
     """
-    def __init__(self,  output_folder, info_dict=None):
+
+    def __init__(self, output_folder, info_dict=None):
         """
         Initialize the AutoGenerator with required components.
         """
         if info_dict is None:
             info_dict = {"input_type": "image"}
-        
+
         self.interpreter = UniInterpreter(info_dict["input_type"])
         self.net_generator = NetGenerator(output_folder)
         self.obstacle_generator = ObstacleGenerator()
@@ -39,7 +40,11 @@ class AutoGenerator:
         Extract the road network description from a stored text file.
         """
         text = read_file(join(self.output_folder, f"{scene_id}.txt"))
-        match = re.search(r"##\s*Road Net Description\s*:\s*(.*?)\s*##", text, re.DOTALL | re.IGNORECASE)
+        match = re.search(
+            r"##\s*Road Net Description\s*:\s*(.*?)\s*##",
+            text,
+            re.DOTALL | re.IGNORECASE,
+        )
         return match.group(1).strip() if match else ""
 
     def extract_scene_description(self, scene_id):
@@ -47,15 +52,18 @@ class AutoGenerator:
         Extract the scenario description from a stored text file.
         """
         text = read_file(join(self.output_folder, f"{scene_id}.txt"))
-        #match = re.search(r"## Road Net Description:\s*(.*)", text, re.DOTALL)
-        match = re.search(r"## Scenario Description:\s*(.*)", text, re.DOTALL) 
+        match = re.search(r"## Scenario Description:\s*(.*)", text, re.DOTALL)
         return match.group(1).strip() if match else ""
 
     def generate_net(self, scene_id, road_net_description):
         """
         Generate a road network file using the NetGenerator component.
         """
-        return self.net_generator.call_agent(road_net_description, scene_id, {"output_fn": join(self.output_folder, f"{scene_id}_net.txt")})
+        return self.net_generator.call_agent(
+            road_net_description,
+            scene_id,
+            {"output_fn": join(self.output_folder, f"{scene_id}_net.txt")},
+        )
 
     def generate_objects(self, scene_id, scenario_description):
         """
@@ -63,10 +71,12 @@ class AutoGenerator:
         """
         net_info = self.obstacle_generator.extract_network_info_with_xml(
             join(self.output_folder, f"{scene_id}_net.txt"),
-            join(self.output_folder, f"{scene_id}.net.xml")
+            join(self.output_folder, f"{scene_id}.net.xml"),
         )
         final_request = scenario_description + "\n" + net_info
-        return self.obstacle_generator.call_agent(final_request, scene_id, self.output_folder)
+        return self.obstacle_generator.call_agent(
+            final_request, scene_id, self.output_folder
+        )
 
     def generate_scene(self, scene_id, scenario_description):
         """
@@ -74,7 +84,9 @@ class AutoGenerator:
         """
         self.scenario_generator.run_scenario_generation(
             join(self.output_folder, f"{scene_id}_scene.py"),
-            scene_id, scenario_description, self.output_folder
+            scene_id,
+            scenario_description,
+            self.output_folder,
         )
 
     def generate_interpretation(self, user_request, input_dict):
@@ -89,8 +101,10 @@ class AutoGenerator:
         Retrieve road network and scenario descriptions from stored files.
         """
         scene_id = input_dict["scene_id"]
-        return self.extract_net_description(scene_id), self.extract_scene_description(scene_id)
-    
+        return self.extract_net_description(scene_id), self.extract_scene_description(
+            scene_id
+        )
+
 
 if __name__ == "__main__":
     output_folder = os.path.join(os.getcwd(), "auto_result")
@@ -100,19 +114,23 @@ if __name__ == "__main__":
 
     num_generated_scenes = 1
     mode = "FullPipeline"  # "AfterInterpreter" #"AfterNet","AfterObject"
-    input_type = "crash_report"  
+    input_type = "crash_report"
     input_info = {"generation_mode": "generation", "input_type": input_type}
     auto_generator = AutoGenerator(output_folder, input_info)
-    
+
     for i in range(num_generated_scenes):
         scene_id = f"{input_type}_interpreter_{i:04d}_split"
-        additional_info = {"output_fn": join(output_folder, f"{input_type}_interpreter_{i:04d}.txt"), "scene_id": scene_id, "text_path": text_path}
+        additional_info = {
+            "output_fn": join(output_folder, f"{input_type}_interpreter_{i:04d}.txt"),
+            "scene_id": scene_id,
+            "text_path": text_path,
+        }
 
         if input_type == "request":
             user_request = input_info["input_data"]
         else:
             user_request = ""
-    
+
         if mode == "FullPipeline":
             standard_description = auto_generator.generate_interpretation(
                 user_request, additional_info

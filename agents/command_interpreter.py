@@ -1,5 +1,6 @@
 import re
 import sys
+
 sys.path.insert(0, "../")
 from agents.task_agent import TaskAgent
 from tools.evaluation_metrics import compute_entropy
@@ -24,7 +25,7 @@ class CommandInterpreter(TaskAgent):
         Output a string list ["road description:", "traffic density:", "test goal:"], and a vector (number of lanes, number of vehicles) for each scenario. SHOULD BE exactly same and no other words!
         Test goal should be one of ["scene_orientated", "av_behavior", " bv_behavior", "general"]. For a given goal, provide a detailed description, such as turning behavior. 
         """
-        road_description="""If a GPS location is provided, generate a brief road description based on the latitude and longitude. """
+        road_description = """If a GPS location is provided, generate a brief road description based on the latitude and longitude. """
 
         type_instruction = """In terms of road geometry, a realistic intersection structure takes into account several factors to ensure safe and efficient vehicle and pedestrian movement. Here are the key elements:
         1. Lane Width
@@ -54,9 +55,12 @@ class CommandInterpreter(TaskAgent):
         Adjacent to the intersection are several critical connectors. On the northwest corner, Elm Street branches off from Grand Avenue, acting as a key feeder road for the residential neighborhood it serves. This street features traffic calming measures such as speed bumps and narrow lanes to maintain safe speeds. On the southeast side, Oak Road provides a direct route to the nearby commercial district, with wide lanes to accommodate delivery trucks and heavy traffic", "traffic density: medium", "test goal: av_behavior: turning"], [2, 5]"""
 
         self.pre_prompt = (
-            SYSTEM_PROMPT + road_description + type_instruction + additional_hints + FORMAT_PROMT
+            SYSTEM_PROMPT
+            + road_description
+            + type_instruction
+            + additional_hints
+            + FORMAT_PROMT
         )
-
 
     def task_summary(self, results):
         num_scenarios = len(results)
@@ -125,5 +129,4 @@ class CommandInterpreter(TaskAgent):
             )
         if len(result) == 0:
             return result, True
-        #print("matched result", result)
         return result, False

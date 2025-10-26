@@ -4,10 +4,12 @@ import xml.etree.ElementTree as ET
 from agents.task_agent import TaskAgent
 from tools.utils import read_sumo_file, extract_text_section, read_file
 
+
 class ObstacleGenerator(TaskAgent):
     """
     Obstacle Generator for controlled scenario generation in SUMO simulation.
     """
+
     def __init__(self):
         super().__init__()
         SYSTEM_PROMPT = """
@@ -127,40 +129,54 @@ class ObstacleGenerator(TaskAgent):
         
         """
         self.pre_prompt = SYSTEM_PROMPT
-    
+
     def refine_request(self, user_request, add_info=None):
         """Formats user request by appending the system prompt."""
         return f"{self.pre_prompt}\nScenario Description:\n{user_request}"
 
-
-    def extract_network_info(self, txt_file_path: str, include_node_edge: Optional[bool] = False) -> str:
+    def extract_network_info(
+        self, txt_file_path: str, include_node_edge: Optional[bool] = False
+    ) -> str:
         """Extracts network description and SUMO specifications(Node and Edge) from the given text file."""
         with open(txt_file_path, "r") as file:
             content = file.read()
         description = extract_text_section(content, r"## Description\s+(.*?)\s+##")
         if include_node_edge:
-            net_info = extract_text_section(content, r"## SUMO Files Specification\s+(.*)")
+            net_info = extract_text_section(
+                content, r"## SUMO Files Specification\s+(.*)"
+            )
             return f"Map Description:\n{description}\nSUMO Network Info:\n{net_info}"
-        return   f"Map Description:\n{description}"
+        return f"Map Description:\n{description}"
 
-    def extract_network_info_with_gps(self, txt_file_path: str, xml_file_path: str)-> str:
+    def extract_network_info_with_gps(
+        self, txt_file_path: str, xml_file_path: str
+    ) -> str:
         with open(txt_file_path, "r") as file:
             content = file.read()
-        description = extract_text_section(content, r"#{2,3}\s*Road Net Description:\s*\n(.*?)(?=\n#{2,3}|\Z)")
+        description = extract_text_section(
+            content, r"#{2,3}\s*Road Net Description:\s*\n(.*?)(?=\n#{2,3}|\Z)"
+        )
         sumo_net = read_sumo_file(xml_file_path)
         return f"{description}\nNetwork XML:\n{sumo_net}"
-        
-    def extract_network_info_with_xml(self, txt_file_path: str, xml_file_path: str, include_node_edge: Optional[bool] = False) -> str:
+
+    def extract_network_info_with_xml(
+        self,
+        txt_file_path: str,
+        xml_file_path: str,
+        include_node_edge: Optional[bool] = False,
+    ) -> str:
         """Extracts network description and SUMO Net XML information."""
         description = self.extract_network_info(txt_file_path, include_node_edge)
         sumo_net = read_sumo_file(xml_file_path)
         return f"{description}\nNetwork XML:\n{sumo_net}"
-    
-    def extract_network_info_with_offset(self, txt_file_path: str, xml_file_path: str) -> str:
+
+    def extract_network_info_with_offset(
+        self, txt_file_path: str, xml_file_path: str
+    ) -> str:
         """Extracts network description, SUMO network data, and netOffset value."""
         description = self.extract_network_info(txt_file_path)
         net_offset = self._extract_net_offset(xml_file_path)
-        
+
         return f"{description}\nNet Offset: {net_offset}\n(Ensure to consider netOffset when calculating coordinates.)"
 
     def _extract_net_offset(self, xml_file_path: str) -> str:
@@ -169,47 +185,55 @@ class ObstacleGenerator(TaskAgent):
             tree = ET.parse(xml_file_path)
             root = tree.getroot()
             location = root.find("location")
-            return location.attrib.get("netOffset", "Not found") if location is not None else "Not found"
+            return (
+                location.attrib.get("netOffset", "Not found")
+                if location is not None
+                else "Not found"
+            )
         except ET.ParseError:
             return "XML parsing error"
 
-    def call_agent(self, user_request: str, scenario_id: str, output_folder: str) -> int:
+    def call_agent(
+        self, user_request: str, scenario_id: str, output_folder: str
+    ) -> int:
         """Generates an obstacle and extracts the decision data."""
         attempt_count = 0
         success = False
         output_file = os.path.join(output_folder, f"{scenario_id}_scene.txt")
-        
+
         while not success:
             self.send_request(user_request, {"output_fn": output_file})
             success = self.extract_decision_data(scenario_id, output_folder)
             attempt_count += 1
             if attempt_count > 1:
                 print(f"Regenerating obstacle... Attempt {attempt_count}")
-        
+
         return attempt_count
 
     def extract_decision_data(self, scenario_id: str, output_folder: str) -> bool:
         """Extracts the generated Python code from the Decision section of the output."""
         file_path = os.path.join(output_folder, f"{scenario_id}_scene.txt")
         text = read_file(file_path)
-        
+
         decision_content = extract_text_section(text, r"## Decision\s+(.*?)(?=\s+##|$)")
         if decision_content is None:
             return False
-        
+
         python_code = extract_text_section(decision_content, r"```python\s+(.*?)\s+```")
         if python_code is None:
             return False
-        
-        with open(os.path.join(output_folder, f"{scenario_id}_scene.py"), "w", encoding="utf-8") as output_file:
+
+        with open(
+            os.path.join(output_folder, f"{scenario_id}_scene.py"),
+            "w",
+            encoding="utf-8",
+        ) as output_file:
             output_file.write(python_code)
         return True
-   
-
 
 
 if __name__ == "__main__":
- 
+
     file_folder = os.path.join(os.getcwd(), "auto_result", "module_test")
     obstaclegen = ObstacleGenerator()
     scene_id = f"crash_report_interpreter_0000_split"

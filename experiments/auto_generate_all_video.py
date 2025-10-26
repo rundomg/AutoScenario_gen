@@ -3,6 +3,7 @@ import re
 import sys
 from os.path import join
 from dotenv import load_dotenv
+
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from tools.utils import read_file
@@ -11,7 +12,6 @@ from agents.obstacle_generator import ObstacleGenerator
 from agents.universal_interpreter import UniInterpreter
 from agents.scenario_generator import ScenarioGenerator
 
-# Load API Key from environment variables
 load_dotenv()
 OPENAI_KEY = os.getenv("OPENAI_KEY")
 
@@ -51,7 +51,6 @@ class AutoGenerator:
         Extract the scenario description from a stored text file.
         """
         text = read_file(join(self.output_folder, f"{scene_id}.txt"))
-        # match = re.search(r"## Road Net Description:\s*(.*)", text, re.DOTALL)
         match = re.search(r"## Scenario Description:\s*(.*)", text, re.DOTALL)
         return match.group(1).strip() if match else ""
 

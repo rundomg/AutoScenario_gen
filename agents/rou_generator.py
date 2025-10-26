@@ -64,7 +64,6 @@ class RouteGenerator(TaskAgent):
         self.vehicle_data = None
 
     def refine_request(self, user_request, added_info=None):
-        # There are
         final_request = self.pre_prompt + f"\nUser request is : {user_request}"
         return final_request
 
@@ -84,7 +83,6 @@ class RouteGenerator(TaskAgent):
                 },
             )
 
-        # tree = ET.ElementTree(root)
         xml_str = ET.tostring(root, "utf-8")
         parsed_str = minidom.parseString(xml_str).toprettyxml(indent="  ")
         with open(filename, "w") as f:

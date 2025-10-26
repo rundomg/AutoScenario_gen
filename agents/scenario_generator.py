@@ -4,12 +4,13 @@ import xml.etree.ElementTree as ET
 from agents.task_agent import TaskAgent
 from tools.utils import extract_text_section, read_file, write_to_file
 
+
 class ScenarioGenerator(TaskAgent):
 
     def __init__(self):
         super().__init__()
         SYSTEM_PROMPT = """
-        You are GPT-4o, a large multi-modal model trained by OpenAI. Now you act as a mature senario generator, who can understand user's testing request and design the correspondinng testing scenarios.
+        You are GPT-4o, a large multi-modal model trained by OpenAI. Now you act as a mature scenario generator, who can understand user's testing request and design the correspondinng testing scenarios.
         The senario is built in Carla Simulator which uses Unreal Engine 4, so you will need to use the PythonAPI of Carla Simulator
         The user will give you a descripton of the scene, the loacation and the rotation of the vehicles and static objects in the scene.
         Your mission is to accurately understand the scene description provided by the user, identify the object layout of the scene, select appropriate objects and spawn them with proper location and roatation.
@@ -99,12 +100,12 @@ class ScenarioGenerator(TaskAgent):
         self.obstalce_postition = None
         self.onstalce_type = None
 
-
     def refine_request(self, user_request, add_info=None):
         """Based on the scene description, add the description of the obstacle."""
-        assert add_info and "object_info" in add_info, "Missing required object_info in add_info."
+        assert (
+            add_info and "object_info" in add_info
+        ), "Missing required object_info in add_info."
         return f"{self.pre_prompt}\nThe scene description is:\n{user_request}\nObject and agent information:\n{add_info['object_info']}"
-
 
     def run_scenario_generation(
         self, obj_code_fn, scenario_id, scenario_description, output_folder
@@ -123,15 +124,15 @@ class ScenarioGenerator(TaskAgent):
         attempts = 0
         output_file = os.path.join(output_folder, f"{scenario_id}_scene_final.txt")
         while not success_bool:
-            self.send_request(user_request, {"output_fn": output_file, "object_info": object_info})
+            self.send_request(
+                user_request, {"output_fn": output_file, "object_info": object_info}
+            )
             success_bool = self.extract_decision_data(
                 scenario_id, output_folder=output_folder
             )
             attempts += 1
             if attempts > 1:
-                print(
-                    f"Regenerating scene... Attempt {attempts}"
-                )
+                print(f"Regenerating scene... Attempt {attempts}")
         return attempts
 
     def extract_decision_data(self, scenario_id, output_folder=None, response=None):
@@ -141,14 +142,21 @@ class ScenarioGenerator(TaskAgent):
         else:
             file_path = os.path.join(output_folder, f"{scenario_id}_scene_final.txt")
             text = read_file(file_path)
-        
+
         decision_content = extract_text_section(text, r"## Decision\s+(.*?)(?=\s+##|$)")
-        python_code = extract_text_section(decision_content, r"```python\s+(.*?)\s+```") if decision_content else None
-        if python_code is None:            
+        python_code = (
+            extract_text_section(decision_content, r"```python\s+(.*?)\s+```")
+            if decision_content
+            else None
+        )
+        if python_code is None:
             return False
-        
-        write_to_file(os.path.join(output_folder, f"{scenario_id}_scene_final.py"), python_code)
+
+        write_to_file(
+            os.path.join(output_folder, f"{scenario_id}_scene_final.py"), python_code
+        )
         return True
+
 
 if __name__ == "__main__":
     scenegen = ScenarioGenerator()
