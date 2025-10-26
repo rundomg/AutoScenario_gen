@@ -48,12 +48,20 @@ pip install -r requirements.txt
 ### **Step 1: Set Up API Key and Configuration**
 Before running simulations, configure your API key:
 
-1. **Set your OpenAI API key and URL** in the `.env` file:
+1. **Copy the example configuration file:**
+   ```sh
+   cp config.example .env
    ```
-   OPENAI_KEY=your-api-key-here
-   OPENAI_URL=XXX
+
+2. **Edit the `.env` file** with your actual API credentials:
    ```
-2. Save the file in the project root directory.
+   OPENAI_KEY=your-openai-api-key-here
+   OPENAI_URL=https://api.openai.com/v1/chat/completions
+   OPENAI_MODEL=gpt-4o
+   OPENAI_MAX_TOKENS=2000
+   OPENAI_TIMEOUT=30
+   ```
+3. Save the file in the project root directory.
 
 ---
 

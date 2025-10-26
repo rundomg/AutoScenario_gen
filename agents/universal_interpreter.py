@@ -90,31 +90,6 @@ class UniInterpreter(TaskAgent):
         self.send_request("", add_info)
         return
 
-    def prepare_structurer_prompt(self, raw_description_fn):
-        decision = self.interpreter.extract_decision_data(raw_description_fn)
-        request = """
-        Before this I give you a text about decision.
-        The text about decision I give you contains information about the road net, road users and static objects within the scenario..
-        But the content dosen't match the format I need, so I need you to help me split the content into three parts.
-        You need to unleash your imagination and creativity to generate a more detailed description of the road net, road users and static objects within the scenario. 
-        The scenario involves hazardous situations for autonomous vehicles.
-        """
-        format = """
-        The output shoud be in the following format:
-        ## Road Net Description:
-        The description of the road net.
-        ## Road Users Description:
-        The description of the road users, including their relative positions, movements in the scenario.
-        ## Static Objects Description:
-        The description of objects in the scene, including traffic cones, fences, traffic signs, etc.
-        ## Vehicles' Locations and Behaviors
-        The description of the agent vehicle location and behavior, and the surrounding vehicles' locations and behaviors.
-        ## Scenario Description:
-        The description of the whole scenario.
-        """
-        task_prompt = str(decision) + request + format
-        return task_prompt
-
     def prepare_structurer_prompt_chinese(self, raw_description_fn):
         decision = self.interpreter.extract_full_data(raw_description_fn)
         request = """
