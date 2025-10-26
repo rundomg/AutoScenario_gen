@@ -42,6 +42,9 @@ Once the virtual environment is activated, install the required dependencies:
 ```sh
 pip install -r requirements.txt
 ```
+If you have not installed **CARLA** yet, please follow the official installation guide here:  
+👉 [**CARLA Quick Start Guide**](https://carla.readthedocs.io/en/latest/start_quickstart/)
+
 ---
 
 ## **Usage**
