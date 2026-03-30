@@ -63,9 +63,6 @@ class TaskAgent:
             # Save output to file if specified
             if add_info and "output_fn" in add_info:
                 output_fn = add_info["output_fn"]
-                output_dir = os.path.dirname(output_fn)
-                if output_dir:
-                    os.makedirs(output_dir, exist_ok=True)
                 with open(output_fn, "w", encoding="utf-8") as file:
                     file.write(res_content)
 

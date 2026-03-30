@@ -9,12 +9,6 @@ from agents.task_agent import TaskAgent
 
 
 class VLMInterpreter(TaskAgent):
-    SUPPORTED_IMAGE_FORMATS = {
-        ".png": ("image/png", ".png"),
-        ".jpg": ("image/jpeg", ".jpg"),
-        ".jpeg": ("image/jpeg", ".jpg"),
-    }
-
     def __init__(self):
         super().__init__()
 
@@ -65,45 +59,28 @@ class VLMInterpreter(TaskAgent):
             SYSTEM_PROMPT + example_prompt + additional_hints + accuracy_prompt
         )
 
-    def ImageEncode(self, image, encode_ext):
-        success, buffer = cv2.imencode(encode_ext, image)
-        if not success:
-            raise ValueError(f"Failed to encode image as {encode_ext}.")
+    def ImageEncode(self, image):
+        _, buffer = cv2.imencode(".jpg", image)
         img_base64 = base64.b64encode(buffer).decode("utf-8")
         return img_base64
-
-    def _load_image_payload(self, image_path):
-        image_ext = os.path.splitext(image_path)[1].lower()
-        if image_ext not in self.SUPPORTED_IMAGE_FORMATS:
-            supported = ", ".join(sorted(self.SUPPORTED_IMAGE_FORMATS))
-            raise ValueError(
-                f"Unsupported image format '{image_ext}'. Supported formats: {supported}."
-            )
-
-        mime_type, encode_ext = self.SUPPORTED_IMAGE_FORMATS[image_ext]
-        image = cv2.imread(image_path, cv2.IMREAD_COLOR)
-        if image is None:
-            raise ValueError(f"Failed to read image file: {image_path}")
-
-        image_base64 = self.ImageEncode(image, encode_ext)
-        return mime_type, image_base64
 
     def refine_request(self, user_request, add_info=None):
         assert "image_path" in add_info
         image_path = add_info["image_path"]
         assert os.path.exists(image_path)
+        image = cv2.imread(image_path)
 
         if user_request is not None:
             generation_request = self.pre_prompt + f"\nUser request is : {user_request}"
         else:
             generation_request = self.pre_prompt
 
-        mime_type, image_base64 = self._load_image_payload(image_path)
+        image_base64 = self.ImageEncode(image)
         final_request = [
             {"type": "text", "text": generation_request},
             {
                 "type": "image_url",
-                "image_url": {"url": f"data:{mime_type};base64,{image_base64}"},
+                "image_url": {"url": f"data:image/jpeg;base64,{image_base64}"},
             },
         ]
         return final_request
