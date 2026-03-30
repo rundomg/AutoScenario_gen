@@ -26,6 +26,7 @@ class ObstacleGenerator(TaskAgent):
         3. Unless otherwise specified, before assign the rotation of the vehicle, use the function to carlculate the road direction and then let the vehicle direction is the same as the road.
         4. Save the information of the vehicles and objects in the format of following code.
         5. Don't omit repeated code
+        6. If CARLA spawn points are provided, choose one spawn point as the anchor and initialize all generated coordinates near that anchor instead of inventing arbitrary small coordinates far away from the spawn-point range.
 
         Object constraints
         1. Choose static objects from these: warningconstruction, streetbarrier, constructioncone, warningaccident. Do not choose other objects!
@@ -133,6 +134,34 @@ class ObstacleGenerator(TaskAgent):
     def refine_request(self, user_request, add_info=None):
         """Formats user request by appending the system prompt."""
         return f"{self.pre_prompt}\nScenario Description:\n{user_request}"
+
+    def format_carla_spawn_points_info(self, spawn_context: dict) -> str:
+        """Formats CARLA spawn point metadata so the LLM can initialize coordinates near a real anchor."""
+        if not spawn_context:
+            return ""
+
+        map_name = spawn_context.get("map_name", "unknown")
+        spawn_points = spawn_context.get("spawn_points", [])
+        if not spawn_points:
+            return f"CARLA Map: {map_name}\nCARLA Spawn Points: unavailable"
+
+        lines = [
+            f"CARLA Map: {map_name}",
+            "CARLA Spawn Points (use one of these as the coordinate anchor for initialization):",
+        ]
+        for point in spawn_points:
+            location = point["location"]
+            rotation = point["rotation"]
+            lines.append(
+                "  - "
+                f"index={point['index']}, "
+                f"location=({location['x']:.6f}, {location['y']:.6f}, {location['z']:.6f}), "
+                f"rotation=({rotation['pitch']:.6f}, {rotation['yaw']:.6f}, {rotation['roll']:.6f})"
+            )
+        lines.append(
+            "Initialization rule: pick one spawn point as the anchor and keep all generated object coordinates in that same neighborhood."
+        )
+        return "\n".join(lines)
 
     def extract_network_info(
         self, txt_file_path: str, include_node_edge: Optional[bool] = False

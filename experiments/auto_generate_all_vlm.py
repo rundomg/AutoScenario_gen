@@ -27,11 +27,90 @@ class AutoGenerator:
         if info_dict is None:
             info_dict = {"input_type": "image"}
 
+        os.makedirs(output_folder, exist_ok=True)
+
+        self.carla_host = info_dict.get("carla_host", "localhost")
+        self.carla_port = info_dict.get("carla_port", 2000)
+        self.carla_timeout = info_dict.get("carla_timeout", 10.0)
+        self.carla_map = info_dict.get("carla_map")
+        self.spawn_point_limit = info_dict.get("spawn_point_limit", 12)
+        self.require_carla_connection = info_dict.get("require_carla_connection", True)
+
         self.interpreter = UniInterpreter(info_dict["input_type"])
         self.net_generator = NetGenerator(output_folder)
         self.obstacle_generator = ObstacleGenerator()
         self.scenario_generator = ScenarioGenerator()
+        self.carla_spawn_context = self._load_carla_spawn_context()
+        actual_map_name = self._normalize_carla_world_name(
+            (self.carla_spawn_context or {}).get("map_name")
+        )
+        if actual_map_name:
+            self.carla_map = actual_map_name
         self.output_folder = output_folder
+
+    @staticmethod
+    def _normalize_carla_world_name(map_name):
+        if not map_name:
+            return None
+        return map_name.split("/")[-1]
+
+    def _load_carla_spawn_context(self):
+        if not self.require_carla_connection:
+            return None
+
+        try:
+            import carla
+        except ImportError as exc:
+            raise RuntimeError(
+                f"CARLA Python API is required before object generation: {exc}"
+            ) from exc
+
+        try:
+            client = carla.Client(self.carla_host, self.carla_port)
+            client.set_timeout(self.carla_timeout)
+            world = (
+                client.load_world(self.carla_map)
+                if self.carla_map
+                else client.get_world()
+            )
+            world_map = world.get_map()
+            spawn_points = world_map.get_spawn_points()
+        except Exception as exc:
+            raise RuntimeError(
+                f"Failed to connect to CARLA before object generation: {exc}"
+            ) from exc
+
+        if not spawn_points:
+            raise RuntimeError(
+                f"Connected to CARLA map {world_map.name}, but no spawn points were found."
+            )
+
+        sampled_spawn_points = []
+        for index, transform in enumerate(spawn_points[: self.spawn_point_limit]):
+            sampled_spawn_points.append(
+                {
+                    "index": index,
+                    "location": {
+                        "x": transform.location.x,
+                        "y": transform.location.y,
+                        "z": transform.location.z,
+                    },
+                    "rotation": {
+                        "pitch": transform.rotation.pitch,
+                        "yaw": transform.rotation.yaw,
+                        "roll": transform.rotation.roll,
+                    },
+                }
+            )
+
+        print(
+            f"Connected to CARLA map {world_map.name} and cached "
+            f"{len(sampled_spawn_points)} spawn points for coordinate initialization."
+        )
+        return {
+            "map_name": world_map.name,
+            "spawn_points": sampled_spawn_points,
+        }
 
     def extract_net_description(self, scene_id):
         """
@@ -72,7 +151,13 @@ class AutoGenerator:
             join(self.output_folder, f"{scene_id}_net.txt"),
             join(self.output_folder, f"{scene_id}.net.xml"),
         )
-        final_request = scenario_description + "\n" + net_info
+        spawn_points_info = self.obstacle_generator.format_carla_spawn_points_info(
+            self.carla_spawn_context
+        )
+        final_request_parts = [scenario_description, net_info]
+        if spawn_points_info:
+            final_request_parts.append(spawn_points_info)
+        final_request = "\n".join(final_request_parts)
         print("Generating objects .......")
         return self.obstacle_generator.call_agent(
             final_request, scene_id, self.output_folder
@@ -117,7 +202,12 @@ if __name__ == "__main__":
     num_generated_scenes = 1
     mode = "FullPipeline"  #  "AfterInterpreter" #"AfterNet","AfterObject"
     input_type = "image"
-    input_info = {"generation_mode": "generation", "input_type": input_type}
+    input_info = {
+        "generation_mode": "generation",
+        "input_type": input_type,
+        "require_carla_connection": True,
+        "spawn_point_limit": 12,
+    }
     auto_generator = AutoGenerator(output_folder, input_info)
 
     for i in range(num_generated_scenes):
