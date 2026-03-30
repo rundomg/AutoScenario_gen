@@ -75,5 +75,5 @@ class TextInterpreter(TaskAgent):
         if decision_text:
             decision_text = decision_text.group(1)
         else:
-            return "No decision section found."
+            return "No decision section found.", True
         return decision_text, False
