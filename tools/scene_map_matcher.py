@@ -434,13 +434,38 @@ class SceneMapMatcher:
         return "other"
 
     def _select_anchor(self, entities: List[SceneEntity]) -> Optional[SceneEntity]:
-        for entity in entities:
-            if entity.role == "ego":
-                return entity
-        for entity in entities:
-            if entity.role == "dynamic_vehicle":
-                return entity
-        return entities[0] if entities else None
+        if not entities:
+            return None
+
+        ranked_entities = []
+        for index, entity in enumerate(entities):
+            ranked_entities.append((self._anchor_priority(entity), index, entity))
+        ranked_entities.sort(key=lambda item: (item[0], item[1]))
+        return ranked_entities[0][2]
+
+    @staticmethod
+    def _anchor_priority(entity: SceneEntity) -> int:
+        lowered_name = entity.name.lower()
+        if entity.role == "ego":
+            return 0
+
+        if entity.role == "dynamic_vehicle":
+            if any(
+                keyword in lowered_name
+                for keyword in ("ego", "av", "host", "vehicle", "agent", "car")
+            ):
+                return 1
+            if entity.entity_type in {"car", "jeep", "suv", "truck", "van"}:
+                return 2
+            if entity.entity_type == "motorcycle":
+                return 3
+            return 4
+
+        if entity.role == "parked_vehicle":
+            return 5
+        if entity.role == "pedestrian":
+            return 6
+        return 7
 
     def _parse_sumo_topology(
         self, net_xml_path: str, nod_xml_path: str, edg_xml_path: str
