@@ -10,6 +10,7 @@ from agents.net_generator import NetGenerator
 from agents.obstacle_generator import ObstacleGenerator
 from agents.universal_interpreter import UniInterpreter
 from agents.scenario_generator import ScenarioGenerator
+from tools.scene_map_matcher import SceneMapMatcher
 
 load_dotenv()
 OPENAI_KEY = os.getenv("OPENAI_KEY")
@@ -40,12 +41,20 @@ class AutoGenerator:
         self.net_generator = NetGenerator(output_folder)
         self.obstacle_generator = ObstacleGenerator()
         self.scenario_generator = ScenarioGenerator()
+        self.enable_scene_match = info_dict.get("enable_scene_match", True)
+        self.scene_matcher = SceneMapMatcher(
+            host=self.carla_host,
+            port=self.carla_port,
+            timeout=self.carla_timeout,
+            load_world_name=self._normalize_carla_world_name(self.carla_map),
+        )
         self.carla_spawn_context = self._load_carla_spawn_context()
         actual_map_name = self._normalize_carla_world_name(
             (self.carla_spawn_context or {}).get("map_name")
         )
         if actual_map_name:
             self.carla_map = actual_map_name
+            self.scene_matcher.load_world_name = actual_map_name
         self.output_folder = output_folder
 
     @staticmethod
@@ -175,6 +184,29 @@ class AutoGenerator:
             self.output_folder,
         )
 
+    def analyze_scene_match(self, scene_id):
+        """
+        Match the generated scene to a region in the current CARLA world.
+        """
+        if not self.enable_scene_match:
+            return None
+
+        print("Analyzing scene-to-CARLA match .......")
+        try:
+            report_path = self.scene_matcher.analyze_scene_assets(
+                scene_id, self.output_folder
+            )
+            print(f"Scene match report saved to {report_path}")
+            matched_scene_path = self.scene_matcher.apply_match_to_scene_script(
+                scene_id, self.output_folder
+            )
+            if matched_scene_path:
+                print(f"Matched scene script saved to {matched_scene_path}")
+            return report_path
+        except Exception as exc:
+            print(f"Scene matching skipped for {scene_id}: {exc}")
+            return None
+
     def generate_interpretation(self, user_request, input_dict):
         """
         Process a user request and generate structured output.
@@ -234,6 +266,7 @@ if __name__ == "__main__":
             auto_generator.generate_net(scene_id, road_net_description)
             auto_generator.generate_objects(scene_id, scenario_description)
             auto_generator.generate_scene(scene_id, scenario_description)
+            auto_generator.analyze_scene_match(scene_id)
 
         elif mode == "AfterInterpreter":
             road_net_description, scenario_description = (
@@ -242,6 +275,7 @@ if __name__ == "__main__":
             auto_generator.generate_net(scene_id, road_net_description)
             auto_generator.generate_objects(scene_id, scenario_description)
             auto_generator.generate_scene(scene_id, scenario_description)
+            auto_generator.analyze_scene_match(scene_id)
 
         elif mode == "AfterNet":
             road_net_description, scenario_description = (
@@ -249,9 +283,11 @@ if __name__ == "__main__":
             )
             auto_generator.generate_objects(scene_id, scenario_description)
             auto_generator.generate_scene(scene_id, scenario_description)
+            auto_generator.analyze_scene_match(scene_id)
 
         elif mode == "AfterObject":
             road_net_description, scenario_description = (
                 auto_generator.fetch_interpretation(additional_info)
             )
             auto_generator.generate_scene(scene_id, scenario_description)
+            auto_generator.analyze_scene_match(scene_id)
