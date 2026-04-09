@@ -1,4 +1,4 @@
-import os, sys
+import os, re, sys
 
 sys.path.insert(0, "../")
 import cv2
@@ -9,55 +9,55 @@ from agents.task_agent import TaskAgent
 
 
 class VLMInterpreter(TaskAgent):
+    REQUIRED_SECTION_HEADERS = (
+        "Road Net Description",
+        "Road Users Description",
+        "Static Objects Description",
+        "Vehicles' Locations and Behaviors",
+        "Scenario Description",
+    )
+    LEGACY_HEADERS = ("## Description", "## Reasoning", "## Decision")
+
     def __init__(self):
         super().__init__()
 
         SYSTEM_PROMPT = """
-        You are an assistant for generating autonomous vehicle testing scenario. You should generate a detailed description of the road network, the behaviors of the vehicles and the scenario based on the given image data.
-        Make sure that all of your reasoning is output in the `## Reasoning` section, and in the `## Decision` section you should only output the answers in the given format.
-        Your answer should restrictly follow this format:
-        ## Description
-        Your description of the user request.
-        ## Reasoning
-        reasoning based on user request, what is the testing goal and what are the best testing scenarios. Try to create complex road network with varying road types, road sturcture and connections.  The generated road network should be *very detailed and shorter than 100m*. Provide detailed description in "road geometry" part in the `## Decision` section.
-        ## Decision
-        This part should be as detailed as possible. Your output should contain as much concrete data as possible and include the number of the lanes, the width of the lanes, the number of vehicles and so on.
-        Important: If you can, plan a route that will reach each point in the network, and describe the road in the first perspective of the vehicle.
-        Important: If there is a fork in the road, you must point out the angle of the road. And if there is a intersection, you must point out the angle of the intersection.(For example, there is a four-way intersection, you can describe that, the main road points to the north, and the angle between the second road and the main road(the first road) is about 30 degrees, and the angle between the third road and the second road is about 150 degrees, and the third road and the main road is in a straight line and so on.)
-        You can also describe angle information like that: "The main road, Pine Street, runs north-south. On the east side, Maple Avenue is located 30 degrees north northeast of the Pine Street, and on the west side, Oak Street is located 45 degrees north northwest of the Pine Street."
-        You can identify and analyze the geometric structure of roads by referring to surrounding buildings and trees, as well as cars parked on the roadside and cars walking on the road. You need to give me the position of the surrounding objects relative to the vehicle.  You need to give me the starting position of other vehicles on the lane relative to this vehicle, or the absolute starting position of other vehicles on the lane.
+        You are an assistant for faithfully describing a traffic image from the ego vehicle perspective.
+        Your task is to describe only what is directly visible in the image so the scene can later be reconstructed.
+        Do not invent, enrich, imagine, extrapolate, or plan any scenario beyond the image evidence.
+        Do not output JSON or dictionary format.
+        Do not output reasoning, chain-of-thought, test goals, route plans, or ego driving suggestions.
+        Do not use the old sections `## Description`, `## Reasoning`, or `## Decision`.
+        If something is not clearly visible, partially occluded, too small, or uncertain, explicitly say `not visible`, `unclear`, or `occluded`.
+        Do not provide numeric values such as lane width, road length, distance, speed, or angle unless they are directly and reliably visible in the image itself.
+        Describe each visible object once to avoid repetition.
+        Your answer must strictly follow this exact section format:
+        ## Road Net Description:
+        ## Road Users Description:
+        ## Static Objects Description:
+        ## Vehicles' Locations and Behaviors:
+        ## Scenario Description:
         """
 
-        example_prompt = """
-        I give you a example to help you generate better description for road geometry in ##Decision. You should conduct the description like this example.
-        ----example begin----
-        The road network primarily consists of an intersection where four roads converge. Two of the roads (Road 1 and Road 2) run in the north-south direction and form the main route on which the current vehicle is traveling. Both Road 1 and Road 2 have three lanes for northbound traffic and three lanes for southbound traffic. Road 1 extends northward from the intersection, while Road 2 extends southward from the intersection. Road 3 intersects with Road 1 at a 90-degree angle and extends eastward from the intersection. It has two lanes for eastbound traffic and two lanes for westbound traffic. Road 4 intersects with Road 2 at a 60-degree angle and extends southwestward (i.e., 60 degrees south of east relative to Road 2). It has two lanes for southwestbound traffic and two lanes for traffic in the opposite direction.
-        ----example end----
+        section_guidance = """
+        Section rules:
+        1. `## Road Net Description:` only describe visible road geometry and road-state evidence, such as lane markings, intersections, crosswalks, curbs, medians, shoulders, sidewalks, road surface condition, and visible traffic organization.
+        2. `## Road Users Description:` only describe dynamic road users that can affect the ego car, including cars, trucks, buses, motorcycles, cyclists, and pedestrians. For each object, include a visible description and why it matters to the ego vehicle. If none are clearly visible, say so.
+        3. `## Static Objects Description:` describe visible static scene elements relevant to driving, such as traffic signs, traffic lights and their visible state, cones, barriers, parked objects, debris, bins, storefront fixtures, or other fixed roadside objects. For each object, include a visible description and why it matters to the ego vehicle. If none are clearly visible, say so.
+        4. `## Vehicles' Locations and Behaviors:` summarize only visible vehicles from the ego perspective, including relative lane position, orientation, whether they appear stopped or moving if visually evident, and any uncertainty. Do not infer future trajectories.
+        5. `## Scenario Description:` provide a short factual summary of the visible traffic scene and the immediate constraints it presents to the ego vehicle. Keep it grounded in visible evidence only.
         """
 
-        additional_hints = """
-        Use realistic road network descriptions. Typical intersection types include:
-        - Crossroad
-        - T-intersection
-        - Y-intersection
-        - Ramp merges
-        - Deformed intersections
-
-        Be precise with geometric details, such as:
-        - Lane widths (e.g., 3.6 meters standard, turn lanes may be wider).
-        - Intersection angles (e.g., 90 degrees, 45 degrees).
-        - Road lengths (under 100 meters).
+        output_rules = """
+        Additional output rules:
+        - Keep the five section headers exactly as written.
+        - Do not add extra headers.
+        - Do not leave sections blank; if evidence is missing, explicitly state that it is not visible or unclear.
+        - Do not repeat the same object across multiple bullet points unless needed for a brief cross-reference.
+        - Prefer relative descriptions such as left, right, ahead, near the curb, in the oncoming lane, or on the sidewalk when these are visually supported.
         """
 
-        accuracy_prompt = """
-        If there is a fork in the road, you need to point out the angle of the road.
-        If there is a intersection, you need to point out the angle of the intersection.(For example, there is a four-way intersection, you can describe that, the main road points to the north, and the angle between the second road and the main road(the first road) is about 30 degrees, and the angle between the third road and the second road is about 150 degrees, and the third road and the main road is in a straight line and so on.)
-        You can identify and analyze the geometric structure of roads by referring to surrounding buildings and trees, as well as cars parked on the roadside and cars walking on the road.
-        """
-
-        self.pre_prompt = (
-            SYSTEM_PROMPT + example_prompt + additional_hints + accuracy_prompt
-        )
+        self.pre_prompt = SYSTEM_PROMPT + section_guidance + output_rules
 
     def ImageEncode(self, image):
         _, buffer = cv2.imencode(".jpg", image)
@@ -101,11 +101,47 @@ class VLMInterpreter(TaskAgent):
                 )
         return result
 
+    def validate_output_structure(self, text):
+        for header in self.LEGACY_HEADERS:
+            if re.search(rf"(?m)^{re.escape(header)}\b", text):
+                return f"Legacy section header found: {header}"
+
+        pattern = re.compile(
+            r"(?m)^##\s*(Road Net Description|Road Users Description|Static Objects Description|Vehicles' Locations and Behaviors|Scenario Description)\s*:\s*$"
+        )
+        matches = list(pattern.finditer(text))
+        if len(matches) != len(self.REQUIRED_SECTION_HEADERS):
+            return "Missing required section headers or unexpected header format."
+
+        found_headers = tuple(match.group(1) for match in matches)
+        if found_headers != self.REQUIRED_SECTION_HEADERS:
+            return "Section headers are missing, duplicated, or out of order."
+
+        for index, match in enumerate(matches):
+            next_start = matches[index + 1].start() if index + 1 < len(matches) else len(text)
+            content = text[match.end() : next_start].strip()
+            if not content:
+                return f"Section `{match.group(1)}` is empty."
+
+        return None
+
     def extract_decision_data(self, file_path):
         """Return extracted structured answer and determine if regeneration is needed."""
         text = read_file(file_path)
-        decision_text = extract_text_section(text, r"## Decision\n(.+)")
-        if decision_text is None:
-            return "No decision section found.", True
+        validation_error = self.validate_output_structure(text)
+        if validation_error is not None:
+            return validation_error, True
 
-        return decision_text, False
+        road_net_description = extract_text_section(
+            text,
+            r"##\s*Road Net Description\s*:\s*(.*?)\s*##\s*Road Users Description\s*:",
+        )
+        scenario_description = extract_text_section(
+            text, r"##\s*Scenario Description\s*:\s*(.*)"
+        )
+        if not road_net_description:
+            return "Road Net Description is empty.", True
+        if not scenario_description:
+            return "Scenario Description is empty.", True
+
+        return text, False

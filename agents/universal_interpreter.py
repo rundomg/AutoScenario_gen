@@ -23,6 +23,7 @@ class UniInterpreter(TaskAgent):
 
     def __init__(self, input_type="image") -> None:
         super().__init__()
+        self.input_type = input_type
 
         SYSTEM_PROMPT = """
         You are GPT-4V(ision), a large multi-modal model trained by OpenAI. 
@@ -49,7 +50,7 @@ class UniInterpreter(TaskAgent):
 
     def call_agent(self, user_request, input_info, use_system_prompt=True):
         # Use the system pre_prompt or not
-        if use_system_prompt:
+        if use_system_prompt and self.input_type != "image":
             self.interpreter.pre_prompt += self.pre_prompt
         return self.interpreter.call_agent(user_request, input_info)
 
@@ -86,6 +87,8 @@ class UniInterpreter(TaskAgent):
 
     def structure_output(self, raw_description_fn):
         """Generate structured output and save into xxx_split.txt"""
+        if self.input_type == "image":
+            return raw_description_fn
         add_info = {"output_fn": raw_description_fn.replace(".txt", "_split.txt")}
         self.send_request("", add_info)
         return

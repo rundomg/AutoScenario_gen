@@ -27,6 +27,7 @@ class AutoGenerator:
         """
         if info_dict is None:
             info_dict = {"input_type": "image"}
+        self.input_type = info_dict["input_type"]
 
         os.makedirs(output_folder, exist_ok=True)
 
@@ -212,7 +213,9 @@ class AutoGenerator:
         Process a user request and generate structured output.
         """
         print("Generating scene description.......")
-        self.interpreter.call_agent(user_request, input_dict)
+        result = self.interpreter.call_agent(user_request, input_dict)
+        if self.input_type == "image":
+            return result
         return self.interpreter.structure_output(input_dict["output_fn"])
 
     def fetch_interpretation(self, input_dict):
@@ -245,7 +248,7 @@ if __name__ == "__main__":
     for i in range(num_generated_scenes):
         scene_id = f"{input_type}_interpreter_{i:04d}_split"
         additional_info = {
-            "output_fn": join(output_folder, f"{input_type}_interpreter_{i:04d}.txt"),
+            "output_fn": join(output_folder, f"{scene_id}.txt"),
             "scene_id": scene_id,
             "image_path": image_path,
         }
