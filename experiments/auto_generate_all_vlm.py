@@ -142,6 +142,33 @@ class AutoGenerator:
         match = re.search(r"## Scenario Description:\s*(.*)", text, re.DOTALL)
         return match.group(1).strip() if match else ""
 
+    @staticmethod
+    def extract_split_sections_from_text(text):
+        section_names = (
+            "Road Net Description",
+            "Road Users Description",
+            "Static Objects Description",
+            "Vehicles' Locations and Behaviors",
+            "Scenario Description",
+        )
+        sections = {}
+        for index, section_name in enumerate(section_names):
+            next_name = section_names[index + 1] if index + 1 < len(section_names) else None
+            if next_name:
+                pattern = (
+                    rf"##\s*{re.escape(section_name)}\s*:\s*(.*?)"
+                    rf"\s*##\s*{re.escape(next_name)}\s*:"
+                )
+            else:
+                pattern = rf"##\s*{re.escape(section_name)}\s*:\s*(.*)"
+            match = re.search(pattern, text, re.DOTALL | re.IGNORECASE)
+            sections[section_name] = match.group(1).strip() if match else ""
+        return sections
+
+    def extract_scene_sections(self, scene_id):
+        text = read_file(join(self.output_folder, f"{scene_id}.txt"))
+        return self.extract_split_sections_from_text(text)
+
     def generate_net(self, scene_id, road_net_description):
         """
         Generate a road network file using the NetGenerator component.
@@ -157,6 +184,7 @@ class AutoGenerator:
         """
         Generate objects within the simulation scene.
         """
+        scene_sections = self.extract_scene_sections(scene_id)
         net_info = self.obstacle_generator.extract_network_info_with_xml(
             join(self.output_folder, f"{scene_id}_net.txt"),
             join(self.output_folder, f"{scene_id}.net.xml"),
@@ -164,10 +192,9 @@ class AutoGenerator:
         spawn_points_info = self.obstacle_generator.format_carla_spawn_points_info(
             self.carla_spawn_context
         )
-        final_request_parts = [scenario_description, net_info]
-        if spawn_points_info:
-            final_request_parts.append(spawn_points_info)
-        final_request = "\n".join(final_request_parts)
+        final_request = self.obstacle_generator.format_scene_context(
+            scene_sections, net_info, spawn_points_info
+        )
         print("Generating objects .......")
         return self.obstacle_generator.call_agent(
             final_request, scene_id, self.output_folder
@@ -230,7 +257,7 @@ class AutoGenerator:
 
 if __name__ == "__main__":
     output_folder = os.path.join(os.getcwd(), "auto_result")
-    image_path = os.path.join(os.getcwd(), "data", "0107.jpg")
+    image_path = os.path.join(os.getcwd(), "data", "020.jpg")
 
     os.makedirs(output_folder, exist_ok=True)
 

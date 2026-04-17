@@ -233,6 +233,11 @@ class VideoInterpreter(TaskAgent):
 
             result, answer_not_right = self.extract_decision_data(output_fn)
             generation_cnt += 1
+            if answer_not_right and generation_cnt >= self.MAX_REGENERATE_ATTEMPTS:
+                raise RuntimeError(
+                    "Scene interpretation failed after "
+                    f"{self.MAX_REGENERATE_ATTEMPTS} attempts: {result}"
+                )
             if generation_cnt > 1:
                 print(f"Regenerating scene interpretation! Round:{generation_cnt}")
         return result

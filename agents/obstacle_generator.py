@@ -5,7 +5,7 @@ import subprocess
 import sys
 from typing import Optional
 import xml.etree.ElementTree as ET
-from agents.task_agent import TaskAgent
+from agents.task_agent import OPENAI_TIMEOUT, TaskAgent
 from tools.utils import read_sumo_file, extract_text_section, read_file, write_to_file
 
 
@@ -20,127 +20,45 @@ class ObstacleGenerator(TaskAgent):
     def __init__(self):
         super().__init__()
         SYSTEM_PROMPT = """
-        You are GPT-4o, a large multi-modal model trained by OpenAI. Now you act as a mature senario generator, who can understand user's testing request and design the correspondinng testing scenarios.
-        The user will give you an existing map in sumo format containing node and edge, a description of the map and a description of the scenario.
-        Your mission is to accurately understand the scene description provided by the user, identify the object layout of the scene, select appropriate objects and spawn them with proper location and roatation.
-        The objects in the senario can be divided into two types: the static objects including construction objects like construction cones or Street Barrier, and the dynamic objects including vehicles.
-        There are some world constraints in World setting part and objects constraints in Object part, these constraints can not be broken. The constriant with * is the most important.
-        Make sure that all of your reasoning is output in the `## Reasoning` section, and in the `## Decision` section you should only output the answers in the given format.
+        You generate object placement code for a scene reconstructed from a single traffic image and a simple road-network summary.
+        Use only the visible scene evidence and the provided road-network context.
+        Do not invent extra actors or enrich the scene.
+        Unsupported visual objects such as traffic lights, road signs, storefronts, trees, or benches are layout references only. Do not include them in object_dict.
 
-        World constraints
-        1. Generate both the location and rotation for the objects, and list the reasons.
-        2. Both the Y-axis value and yaw-value of the objects need to be negated when spawning.
-        3. Unless otherwise specified, before assign the rotation of the vehicle, use the function to carlculate the road direction and then let the vehicle direction is the same as the road.
-        4. Save the information of the vehicles and objects in the format of following code.
-        5. Don't omit repeated code
-        6. If CARLA spawn points are provided, choose one spawn point as the anchor and initialize all generated coordinates near that anchor instead of inventing arbitrary small coordinates far away from the spawn-point range.
+        Required output:
+        - Include `## Description`, `## Reasoning`, and `## Decision`
+        - Keep `## Description` and `## Reasoning` brief and focused
+        - `## Decision` must contain exactly one executable ```python fenced block
+        - The code must define `agent_dict` and `object_dict`
 
-        Object constraints
-        1. Choose static objects from these: warningconstruction, streetbarrier, constructioncone, warningaccident. Do not choose other objects!
-        2. Choose vehicles from these: bike, car, jeep, motorcycle, suv, truck and van. Do not choose other vehicles!
-        3. Pedestrian usually show up around crosswalk.
-        4. Spawn the construnctioncone at z=0.5, streetbarrier at z=1, the warningstruction at z=1, the vehicles at z=2, the pedestrian at z=1.
-        5. The vehicles must be spawned on the road
-        *6. The distance between the vehicles and other objects must not be less than 8 meters. The distance between other objects must not be less than 0.5 meters.
-        7. Constructioncones are usually placed near the roadside, while streetbarriers are usually placed in the middle of the road.
-        8. Streetbarrier and warningconstruction need to be perpendicular to the direction of the road.
-        9. When mentioned about "wait at a intersection", do not put the vehicle in the middle of the intersection. They should be put on one road near intersection.
-        10. If an accident happened, the vehicles in accident are always closed to each other and static objects are always placed closed around accident car. But at least put them 1.5 meters apart.
-        11. You can use for loop to simulate high density traffic.
-        12. Do not spawn the car at the edge of the road
-        14. Crosswalk at intersections are typically located along the edges of the intersection where pedestrian pathways meet and cross the roads.
-        15. If an accident happened when the pedestrian is crossing the roadway, put them near the crosswalk.
-        16. When a car turn right, it must be at the rightest lane of the road. And for turn left, it must be put at the leftest lane of the road.
+        Spawnable types:
+        - Static objects: warningconstruction, streetbarrier, constructioncone, warningaccident
+        - Vehicles: bike, car, jeep, motorcycle, suv, truck, van
+        - Pedestrians may appear in `agent_dict` when clearly supported
 
+        Placement constraints:
+        - Generate both location and rotation for every spawned entity
+        - Negate Y coordinates and yaw before spawning
+        - Keep vehicles on the road and align them with the road direction unless the input clearly requires otherwise
+        - If CARLA spawn points are provided, choose one as the anchor and keep all coordinates in that neighborhood
+        - If the scene is uncertain, spawn fewer objects rather than hallucinating more
+        - Vehicle/object distance must be at least 8 meters; object/object distance must be at least 0.5 meters
+        - constructioncone z=0.5, streetbarrier z=1, warningconstruction z=1, vehicles z=2, pedestrians z=1
+        - Use crosswalk context for pedestrians when clearly supported
 
-        Your answer should follow this format:
-        ## Description
-        Your description of the user request.
-        ## Reasoning
-        Reasoning based on user request, identify the type of obstalces and put at the designated coordinate. Tell the details how you calculate the coordinates of the objects.
-        ## Decision
-        The python code you generated. It should be like this format:
-        Here is an example for the code, follow this format exactly:
-        import time
-        import math
-        import random
-
-        class Location:
-            def __init__(self, x, y, z):
-                self.x = x
-                self.y = y
-                self.z = z
-
-            def __add__(self, other):
-                return Location(self.x + other.x, self.y + other.y, self.z + other.z)
-
-        class Rotation:
-            def __init__(self, pitch, yaw, roll):
-                self.pitch = pitch
-                self.yaw = yaw
-                self.roll = roll
-
-        # Function to negate the y axis
-        def nege_y(location)
-
-        # Function to negate the yaw axis
-        def nege_yaw(rotation)
-
-        # Function to calculate the road direction (angle) from start to end
-        def road_direction(start, end):
-            # Extract coordinates from the start and end points
-            x1, y1 = start.x, start.y
-            x2, y2 = end.x, end.y
-
-            # Calculate the angle in radians
-            angle_radians = math.atan2(y2 - y1, x2 - x1)
-
-            # Convert radians to degrees
-            angle_degrees = math.degrees(angle_radians)
-
-            return yaw
-
-        # Get the node
-        node1 = Location(x, y, 0)
-        node2 = ...
-
-        # Function to negate the y axis
-        def nege_y(location)
-
-        # Function to negate the yaw axis
-        def nege_yaw(rotation)
-
-        # Ensure all objects, including statics and vehicles' location is 5 meters apart from each other
-        # The loc and rot of static objects, use nege_y
-        s1_loc = nege_y(Location(x, y, z))
-        road_angle = road_direction(start_node, end_node)
-        s1_rot = Rotation(x, road_angle + 90, z)
-        s2 = ...
-
-        # All the car must be on the road
-        # The loc and rot of vehicle, use nege_y and road_direction
-        v1_loc = nege_y(Location(x, y, z))
-        road_angle = road_direction(start_node, end_node)
-        v1_rot = nege_yaw(Rotation(x, road_angle, z))
-
-        v2_loc = nege_y(Location(x, y, z))
-        road_angle = road_direction(start_node, end_node)
-        v2_rot = nege_yaw(Rotation(x, road_angle, z))
-
-        # save all agents location, rotation, type into a dictionary with key as agent name. Type includes pedestrain, bike, car, jeep, motorcycle, suv, truck and van
-        agent_dict = {"v1": {"location": (v1_loc.x, v1_loc.y, v1_loc.z), "rotation":(v1_rot.x, v1_rot.y, v1_rot.z), "type": "vehicle"}, "v2":{"location":, "rotation":, "type": "vehicle"}}
-        # save all objects location, rotation, type into a dictionary with key as object name. Type includes warningconstruction, streetbarrier, constructioncone, warningaccident
-        object_dict = {"s1": {"location": (s1_loc.x, s1_loc.y, s1_loc.z), "rotation":(s1_rot.x, s1_rot.y, s1_rot.z), "type": "streetbarrier"},}
-
-        # Print the dictionaries
-        
-        
+        Code requirements:
+        - Return the simplest executable Python code possible
+        - Save spawned agents in `agent_dict`
+        - Save spawned static objects in `object_dict`
+        - Define `agent_dict` and `object_dict` directly as plain Python dictionaries
+        - Store `location` and `rotation` as numeric length-3 lists
+        - Avoid custom classes, CARLA imports, and extra helper functions unless absolutely necessary
         """
         self.pre_prompt = SYSTEM_PROMPT
 
     def refine_request(self, user_request, add_info=None):
         """Formats user request by appending the system prompt."""
-        request = f"{self.pre_prompt}\nScenario Description:\n{user_request}"
+        request = f"{self.pre_prompt}\nVisible Scene and Network Inputs:\n{user_request}"
         if add_info and add_info.get("validation_error"):
             request += (
                 "\n\nPrevious generation failed validation and must be regenerated."
@@ -150,9 +68,31 @@ class ObstacleGenerator(TaskAgent):
                 "1. Return executable Python code inside the ## Decision python fence.\n"
                 "2. Ensure the script defines agent_dict and object_dict as dictionaries.\n"
                 "3. Each entry must include location, rotation, and type.\n"
-                "4. The script must execute successfully and print valid object info."
+                "4. Use plain numeric lists for location and rotation.\n"
+                "5. Keep the script minimal and executable without unnecessary helpers.\n"
+                "6. The script must execute successfully and print valid object info."
             )
         return request
+
+    @staticmethod
+    def format_scene_context(scene_sections: dict, net_info: str, spawn_points_info: str) -> str:
+        ordered_sections = [
+            "Road Net Description",
+            "Road Users Description",
+            "Static Objects Description",
+            "Vehicles' Locations and Behaviors",
+            "Scenario Description",
+        ]
+        parts = []
+        for section_name in ordered_sections:
+            section_content = scene_sections.get(section_name, "").strip()
+            if section_content:
+                parts.append(f"{section_name}:\n{section_content}")
+        if net_info:
+            parts.append(f"Generated Road Network Summary:\n{net_info}")
+        if spawn_points_info:
+            parts.append(spawn_points_info)
+        return "\n\n".join(parts)
 
     def format_carla_spawn_points_info(self, spawn_context: dict) -> str:
         """Formats CARLA spawn point metadata so the LLM can initialize coordinates near a real anchor."""
@@ -168,7 +108,7 @@ class ObstacleGenerator(TaskAgent):
             f"CARLA Map: {map_name}",
             "CARLA Spawn Points (use one of these as the coordinate anchor for initialization):",
         ]
-        for point in spawn_points:
+        for point in spawn_points[:5]:
             location = point["location"]
             rotation = point["rotation"]
             lines.append(
@@ -213,10 +153,36 @@ class ObstacleGenerator(TaskAgent):
         xml_file_path: str,
         include_node_edge: Optional[bool] = False,
     ) -> str:
-        """Extracts network description and SUMO Net XML information."""
+        """Extracts a compact network summary from text metadata and SUMO Net XML."""
         description = self.extract_network_info(txt_file_path, include_node_edge)
-        sumo_net = read_sumo_file(xml_file_path)
-        return f"{description}\nNetwork XML:\n{sumo_net}"
+        compact_summary = self._summarize_network_xml(xml_file_path)
+        return f"{description}\nCompact Network Summary:\n{compact_summary}"
+
+    def _summarize_network_xml(self, xml_file_path: str) -> str:
+        try:
+            tree = ET.parse(xml_file_path)
+            root = tree.getroot()
+        except ET.ParseError:
+            return "Network summary unavailable because XML parsing failed."
+
+        edge_lines = []
+        for edge in root.findall("edge"):
+            if edge.attrib.get("function") == "internal":
+                continue
+            lanes = edge.findall("lane")
+            num_lanes = len(lanes)
+            lane = lanes[0] if lanes else None
+            length = lane.attrib.get("length", "unknown") if lane is not None else "unknown"
+            shape = lane.attrib.get("shape", "") if lane is not None else ""
+            edge_lines.append(
+                f"- edge_id={edge.attrib.get('id')}, from={edge.attrib.get('from')}, "
+                f"to={edge.attrib.get('to')}, num_lanes={num_lanes}, length={length}, "
+                f"shape={shape}"
+            )
+
+        if not edge_lines:
+            return "No non-internal edges found."
+        return "\n".join(edge_lines[:8])
 
     def extract_network_info_with_offset(
         self, txt_file_path: str, xml_file_path: str
@@ -251,15 +217,41 @@ class ObstacleGenerator(TaskAgent):
         output_file = os.path.join(output_folder, f"{scenario_id}_scene.txt")
 
         while not success:
-            request_info = {"output_fn": output_file}
+            request_info = {
+                "output_fn": output_file,
+                "request_timeout": max(OPENAI_TIMEOUT, 180),
+                "request_retries": 2,
+                "request_label": "Obstacle generation",
+            }
             if validation_error:
                 request_info["validation_error"] = validation_error
 
-            self.send_request(user_request, request_info)
+            print(f"Obstacle generation attempt {attempt_count + 1}")
+            try:
+                self.send_request(user_request, request_info)
+            except Exception as exc:
+                validation_error = str(exc)
+                attempt_count += 1
+                print(f"Obstacle generation failed: {validation_error}")
+                if attempt_count >= self.MAX_REGENERATE_ATTEMPTS:
+                    raise RuntimeError(
+                        "Obstacle generation failed after "
+                        f"{self.MAX_REGENERATE_ATTEMPTS} attempts: {validation_error}"
+                    ) from exc
+                print(f"Regenerating obstacle... Attempt {attempt_count + 1}")
+                continue
+
             success, validation_error = self.extract_decision_data(
                 scenario_id, output_folder
             )
             attempt_count += 1
+            if not success and validation_error:
+                print(f"Obstacle generation failed: {validation_error}")
+            if not success and attempt_count >= self.MAX_REGENERATE_ATTEMPTS:
+                raise RuntimeError(
+                    "Obstacle generation failed after "
+                    f"{self.MAX_REGENERATE_ATTEMPTS} attempts: {validation_error}"
+                )
             if attempt_count > 1:
                 print(f"Regenerating obstacle... Attempt {attempt_count}")
 
@@ -271,6 +263,8 @@ class ObstacleGenerator(TaskAgent):
         """Extracts the generated Python code from the Decision section of the output."""
         file_path = os.path.join(output_folder, f"{scenario_id}_scene.txt")
         text = read_file(file_path)
+        if not text.strip():
+            return False, "Empty obstacle generator output."
 
         decision_content = extract_text_section(text, r"## Decision\s+(.*?)(?=\s+##|$)")
         if decision_content is None:

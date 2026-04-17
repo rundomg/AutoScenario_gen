@@ -167,6 +167,11 @@ class ScenarioGenerator(TaskAgent):
             attempts += 1
             if not success_bool and error_message:
                 print(f"Scene normalization failed: {error_message}")
+            if not success_bool and attempts >= self.MAX_REGENERATE_ATTEMPTS:
+                raise RuntimeError(
+                    "Scene generation failed after "
+                    f"{self.MAX_REGENERATE_ATTEMPTS} attempts: {error_message}"
+                )
             if attempts > 1:
                 print(f"Regenerating scene... Attempt {attempts}")
         return attempts

@@ -254,6 +254,11 @@ class RouteGenerator(TaskAgent):
                     agents_dict, scenario_id, scenario_id, output_folder
                 )
             attempt_count += 1
+            if not success and attempt_count >= self.MAX_REGENERATE_ATTEMPTS:
+                raise RuntimeError(
+                    "Vehicle route generation failed after "
+                    f"{self.MAX_REGENERATE_ATTEMPTS} attempts."
+                )
             if attempt_count > 1:
                 print(f"Regenerating vehicles Routes... Attempt {attempt_count}")
         return attempt_count

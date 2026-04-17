@@ -41,6 +41,11 @@ class TextInterpreter(TaskAgent):
             self.send_request(user_request, input_dict)
             result, answer_not_right = self.extract_decision_data(output_fn)
             generation_cnt += 1
+            if answer_not_right and generation_cnt >= self.MAX_REGENERATE_ATTEMPTS:
+                raise RuntimeError(
+                    "Scene interpretation failed after "
+                    f"{self.MAX_REGENERATE_ATTEMPTS} attempts: {result}"
+                )
             if generation_cnt > 1:
                 print(
                     "Regenerating the scene interpretation! Generation Round:",

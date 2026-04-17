@@ -20,30 +20,46 @@ class NetGenerator(TaskAgent):
     def __init__(self, save_dir) -> None:
 
         super().__init__()
-        """Figure out how many lanes, how many vehicles and what is the generated road type the user wants to generate. """
-        SYSTEM_PROMPT = "Now you act as a professional scenario initializer, who can generate realistic vehicle positions \
-        and road structure in complex urban driving scenarios according to user's generation request. You'll receive an scenario description. \
-        First figure out how many lanes, how many vehicles and what is the generated road type the user wants to generate. \
-            Then generate SUMO node and edge files starting with <?xml version>. Your answer should follow this format:\n## Description \nYour description of the request.\
-        #                   \n## Reasoning \nreasoning based on the lane information and the user's request.\
-        #                   \n## Decision \nnumber of scenarios \nnumber of lanes, \nnumber of vehicles.\
-        #                   \n## SUMO Files Specification \n**Nodes (nodes.xml)** \n**Edges (edges.xml)** .\
-        #                   \nMake sure your answer follow this given format strictly."
+        SYSTEM_PROMPT = """
+        You generate a minimal SUMO road network from a road description that comes from a single traffic image.
+        Your goal is faithful reconstruction, not creative scenario design.
 
-        crossing_instruction = """If there are any crossing: 1. Determine Crossing Locations: Crossings are typically placed at the ends of each approach to the intersection, aligning with sidewalks or pedestrian paths.
-            2. Create Nodes for Crossings: Define nodes at the start and end points of each crossing.
-            3. Connect Crossing Nodes with Edges: Create edges between crossing nodes to represent pedestrian and bicycle paths.
-            4. Do not have negative number in the net."""
+        Core rules:
+        1. Use only road facts supported by the input description.
+        2. Do not invent road length, lane width, turn angles, traffic density, or vehicle counts unless they are explicitly provided or strictly required to create a minimal valid network.
+        3. When a detail is uncertain, choose the simplest valid network that preserves the visible road structure and state the uncertainty in ## Reasoning.
+        4. Keep the generated network short and minimal. Prefer a straight segment over extra branches unless a branch or intersection is clearly described.
+        5. Do not add traffic lights, extra lanes, or extra roads unless the input clearly requires them.
+        6. Do not mention or estimate number of vehicles in ## Decision.
 
-        task_constraints = "Don't generate Tram Lines. If it is an intersection, then all roads are bidirectional. Determine the number of lanes in each direction and ensure they match the description(the total number of lanes or the number of lanes in the specified direction) by setting the numLanes attribute in the edge definition. Ensure the in and out edges are well defined. If there are more than one lane in one direction, add traffic light."
-        road_constraints = "The generated road network should be very detailed and shorter than 200m. Avoid using duplicate edge ids."
-        additional_hints = "Use the edge shape property to define curves according to the description. Ensure the intermedia points inside shape create natural curve without sharpe edges while maintaining reasonable start and end locations. For exmaple: 581.45,148.50 578.00,142.23 575.40,139.59 571.84,137.13 568.36,135.48 564.31,134.51 562.23,134.16"
-        final_request = ""
-        final_request += SYSTEM_PROMPT
-        final_request += task_constraints
-        final_request += road_constraints
-        final_request += additional_hints
-        self.pre_prompt = final_request
+        Your answer must strictly follow this format:
+        ## Description
+        Briefly restate only the visible road facts from the input.
+        ## Reasoning
+        Explain only the minimum necessary assumptions used to make the network valid.
+        ## Decision
+        Summarize the chosen network structure and clearly note any remaining uncertainty.
+        ## SUMO Files Specification
+        **Nodes (nodes.xml)**
+        ```xml
+        ...
+        ```
+        **Edges (edges.xml)**
+        ```xml
+        ...
+        ```
+        """
+
+        task_constraints = """
+        SUMO constraints:
+        - Don't generate Tram Lines.
+        - Ensure the in and out edges are well defined.
+        - Avoid duplicate edge ids.
+        - Keep coordinates non-negative.
+        - Use the edge shape property only when the road visibly curves.
+        - If a crosswalk is visible but cannot be represented directly in nodes/edges, mention it in ## Description or ## Reasoning instead of fabricating unsupported geometry.
+        """
+        self.pre_prompt = SYSTEM_PROMPT + task_constraints
         self.save_dir = save_dir
 
     def call_agent(self, user_request, scenario_id, add_info=None):
@@ -55,12 +71,17 @@ class NetGenerator(TaskAgent):
             # save data: node, edge and combined net file
             result = self.extract_decision_data(scenario_id, output_fn)
             request_valid_result = not result
+            generation_cnt += 1
+            if request_valid_result and generation_cnt >= self.MAX_REGENERATE_ATTEMPTS:
+                raise RuntimeError(
+                    "Road network generation failed after "
+                    f"{self.MAX_REGENERATE_ATTEMPTS} attempts."
+                )
             if generation_cnt > 1:
                 print(
                     "----------------------------regenerating-------------------generation_cnt--",
                     generation_cnt,
                 )
-            generation_cnt += 1
 
         return result, generation_cnt
 
