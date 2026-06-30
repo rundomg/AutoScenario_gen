@@ -174,10 +174,12 @@ secrets.json
 # Model files (if large)
 *.pkl
 *.model
+*.pt
 *.h5
 *.hdf5
 
 # Data files (if large)
+data/map_cache/
 *.csv
 *.json
 *.xml

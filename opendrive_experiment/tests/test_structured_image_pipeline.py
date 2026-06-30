@@ -1,4 +1,5 @@
 import json
+import math
 import sys
 import tempfile
 import types
@@ -222,7 +223,7 @@ class TestSceneUnderstandingNormalization(unittest.TestCase):
             entity for entity in sample["traffic_subjects"] if entity["category"] != "cone_group"
         ]
         sample["road_network"]["control_elements"].append(
-            {"type": "traffic_cones", "position": "left_edge_ahead", "confidence": "high"}
+            {"type": "traffic_cones", "location_relation": "left_edge_ahead", "confidence": "high"}
         )
         payload, error = normalize_scene_understanding(sample)
         self.assertIsNone(error)
@@ -277,6 +278,70 @@ class TestSceneUnderstandingNormalization(unittest.TestCase):
             payload, error = interpreter.extract_decision_data(str(path))
             self.assertIsNone(error)
             self.assertEqual(payload["metadata"]["input_type"], "image")
+
+    def test_merge_with_user_description_accepts_fenced_json(self):
+        class FakeMergeInterpreter(SceneUnderstandingInterpreter):
+            def __init__(self, response):
+                super().__init__()
+                self.response = response
+                self.sent_prompts = []
+
+            def send_request(self, user_request, add_info=None):
+                self.sent_prompts.append(add_info["merge_prompt"])
+                Path(add_info["output_fn"]).write_text(self.response, encoding="utf-8")
+
+        merged = _sample_scene_understanding()
+        merged["background_traffic"].append(
+            {
+                "id": "right_parked_scooter",
+                "category": "parked_vehicle",
+                "subtype": "motor_scooter",
+                "source": "user",
+                "representative_count": 1,
+                "lane_side_relation": "right_edge",
+                "longitudinal_band": "near",
+                "motion_bias": "parked",
+                "heading_relation_to_ego": "same_direction",
+                "density_role": "sparse_filler",
+                "confidence": "high",
+                "spawn_priority": "low",
+            }
+        )
+        response = "```json\n" + json.dumps(merged) + "\n```"
+        interpreter = FakeMergeInterpreter(response)
+        with tempfile.TemporaryDirectory() as tmp:
+            output_path = Path(tmp) / "merged.json"
+            payload = interpreter.merge_with_user_description(
+                _sample_scene_understanding(),
+                "右侧停车道近处有一辆停靠摩托车",
+                str(output_path),
+            )
+        by_id = {entity["id"]: entity for entity in payload["background_traffic"]}
+        self.assertEqual(by_id["right_parked_scooter"]["category"], "parked_vehicle")
+        self.assertEqual(by_id["right_parked_scooter"]["lane_side_relation"], "right_edge")
+        self.assertTrue(payload["metadata"]["user_description_applied"])
+        self.assertIn("user description is authoritative", interpreter.sent_prompts[0])
+
+    def test_merge_with_user_description_accepts_bare_json(self):
+        class FakeMergeInterpreter(SceneUnderstandingInterpreter):
+            def __init__(self, response):
+                super().__init__()
+                self.response = response
+
+            def send_request(self, user_request, add_info=None):
+                Path(add_info["output_fn"]).write_text(self.response, encoding="utf-8")
+
+        merged = _sample_scene_understanding()
+        merged["metadata"]["scene_type"] = "user_corrected_scene"
+        interpreter = FakeMergeInterpreter(json.dumps(merged))
+        with tempfile.TemporaryDirectory() as tmp:
+            payload = interpreter.merge_with_user_description(
+                _sample_scene_understanding(),
+                "用户修正描述",
+                str(Path(tmp) / "merged.json"),
+            )
+        self.assertEqual(payload["metadata"]["scene_type"], "user_corrected_scene")
+        self.assertTrue(payload["metadata"]["user_description_applied"])
 
     def test_road_generation_request_prioritizes_lane_first_evidence(self):
         request = build_road_generation_request(_sample_scene_understanding())
@@ -351,11 +416,88 @@ class TestStructuredPipeline(unittest.TestCase):
                 "spawn_priority": "low",
             }
         )
+        sample["background_traffic"].append(
+            {
+                "id": "near_right_parked_scooter",
+                "category": "parked_scooter",
+                "subtype": "motor_scooter",
+                "source": "observed",
+                "representative_count": 1,
+                "lane_side_relation": "right_edge",
+                "longitudinal_band": "near",
+                "motion_bias": "parked",
+                "heading_relation_to_ego": "same_direction",
+                "density_role": "sparse_filler",
+                "confidence": "high",
+                "spawn_priority": "low",
+            }
+        )
+        sample["background_traffic"].append(
+            {
+                "id": "partial_parked_vehicle",
+                "category": "parked_vehicle_partial",
+                "source": "observed",
+                "representative_count": 1,
+                "lane_side_relation": "left_edge",
+                "longitudinal_band": "near",
+                "motion_bias": "parked",
+                "heading_relation_to_ego": "unknown",
+                "density_role": "sparse_filler",
+                "confidence": "medium",
+                "spawn_priority": "low",
+            }
+        )
+        sample["background_traffic"].append(
+            {
+                "id": "curbside_car_row",
+                "category": "car_row",
+                "source": "observed",
+                "representative_count": 3,
+                "lane_side_relation": "right_edge",
+                "longitudinal_band": "mid",
+                "motion_bias": "parked",
+                "heading_relation_to_ego": "unknown",
+                "density_role": "curbside_row",
+                "confidence": "medium",
+                "spawn_priority": "low",
+            }
+        )
+        sample["background_traffic"].append(
+            {
+                "id": "generic_vehicle",
+                "category": "vehicle",
+                "source": "observed",
+                "representative_count": 1,
+                "lane_side_relation": "left_lane",
+                "longitudinal_band": "far",
+                "motion_bias": "moving",
+                "heading_relation_to_ego": "unknown",
+                "density_role": "opposing_flow",
+                "confidence": "medium",
+                "spawn_priority": "low",
+            }
+        )
         payload, error = normalize_scene_understanding(sample)
         self.assertIsNone(error)
         by_id = {entity["id"]: entity for entity in payload["background_traffic"]}
         self.assertEqual(by_id["opposing_car"]["lane_side_relation"], "left_lane")
         self.assertEqual(by_id["parked_two_wheelers"]["category"], "parked_vehicle")
+        self.assertEqual(by_id["near_right_parked_scooter"]["category"], "parked_vehicle")
+        self.assertEqual(by_id["partial_parked_vehicle"]["category"], "parked_vehicle")
+        self.assertEqual(by_id["curbside_car_row"]["category"], "parked_vehicle")
+        self.assertEqual(by_id["generic_vehicle"]["category"], "car")
+        relation_scene = {
+            **payload,
+            "traffic_subjects": [],
+            "background_traffic": [by_id["near_right_parked_scooter"]],
+        }
+        relation = build_relation_dsl(relation_scene, _sample_spawn_context(), road_artifact={})
+        parked_scooter = next(
+            entity
+            for entity in relation["entities"]
+            if entity["entity_id"] == "near_right_parked_scooter"
+        )
+        self.assertEqual(parked_scooter["blueprint_name"], "motorcycle")
 
     def test_pairwise_validation_detects_expected_vehicle_order(self):
         relation = build_relation_dsl(
@@ -689,6 +831,7 @@ class TestStructuredAutoGenerator(unittest.TestCase):
             content = Path(output_path).read_text(encoding="utf-8")
             self.assertIn("spawn_entities.json", content)
             self.assertIn("_AUTOSCENARIO_SPAWN_PAYLOAD", content)
+            self.assertIn("_autoscenario_clear_existing_vehicles()", content)
             self.assertIn("scene.xodr", content)
 
     def test_spawn_payload_prefers_vlm_vehicle_color(self):
@@ -708,6 +851,69 @@ class TestStructuredAutoGenerator(unittest.TestCase):
         payload = build_projected_spawn_payload(projected)
         self.assertEqual(payload["entities"][0]["color"], "255,255,255")
         self.assertEqual(payload["entities"][0]["appearance"]["color"], "white")
+
+    def test_xodr_oncoming_vehicle_keeps_opposite_yaw_and_payload_semantics(self):
+        scene_understanding = {
+            "traffic_subjects": [],
+            "background_traffic": [],
+            "key_pairwise_relations": [],
+            "road_network": {
+                "road_type": "urban_straight",
+                "directionality": "two_way",
+                "road_segments": [{"id": "r0", "geometry_type": "straight"}],
+                "lane_groups": [{"forward_lane_count": 1, "opposing_lane_count": 1}],
+                "lane_markings": {},
+                "special_road_areas": [],
+                "junctions": [],
+                "roadside_boundaries": {},
+                "control_elements": [],
+            },
+            "general_environment": {},
+            "metadata": {},
+        }
+        anchor = {
+            "road_id": 1,
+            "lane_id": 1,
+            "start": {"x": 0.0, "y": 0.0, "z": 0.0, "yaw": 0.0},
+            "end": {"x": 50.0, "y": 0.0, "z": 0.0, "yaw": 0.0},
+        }
+        opposing = {
+            "road_id": 1,
+            "lane_id": -1,
+            "start": {"x": 0.0, "y": -3.5, "z": 0.0, "yaw": 180.0},
+            "end": {"x": 50.0, "y": -3.5, "z": 0.0, "yaw": 180.0},
+        }
+        raw = {
+            "selected_anchor_lane": anchor,
+            "entities": [
+                {
+                    "id": "opposing_car",
+                    "category": "car",
+                    "spawn_kind": "vehicle",
+                    "blueprint_name": "car",
+                    "lane_side_relation": "left_lane",
+                    "heading_relation": "opposite_direction",
+                    "motion_state": "moving",
+                    "location": {"x": 20.0, "y": -3.5, "z": 0.3},
+                    "rotation": {"pitch": 0.0, "yaw": 180.0, "roll": 0.0},
+                }
+            ],
+        }
+
+        projected = project_entities_to_xodr(
+            raw,
+            scene_understanding,
+            {"topology_sample": [anchor, opposing]},
+        )
+        yaw = projected["entities"][0]["rotation"]["yaw"]
+        yaw_delta = abs(((yaw - anchor["start"]["yaw"] + 180.0) % 360.0) - 180.0)
+        self.assertAlmostEqual(yaw_delta, 180.0, places=3)
+
+        payload = build_projected_spawn_payload(projected)
+        entity = payload["entities"][0]
+        self.assertEqual(entity["heading_relation"], "opposite_direction")
+        self.assertEqual(entity["motion_state"], "moving")
+        self.assertEqual(entity["projected_lane"]["lane_id"], -1)
 
 
 if __name__ == "__main__":

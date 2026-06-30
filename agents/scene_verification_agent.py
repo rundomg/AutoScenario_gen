@@ -9,7 +9,7 @@ from tools.utils import read_file
 
 
 class SceneVerificationAgent(TaskAgent):
-    """VLM judge for comparing the source image with the generated CARLA BEV."""
+    """VLM judge for comparing the source image with generated CARLA layout views."""
 
     DEFAULT_REPORT = {
         "passed": False,
@@ -18,6 +18,7 @@ class SceneVerificationAgent(TaskAgent):
         "mismatches": [],
         "recommended_stage": "match_spawn",
         "repair_hints": [],
+        "repair_actions": [],
     }
 
     @staticmethod
@@ -35,7 +36,7 @@ class SceneVerificationAgent(TaskAgent):
     def refine_request(self, user_request=None, add_info=None):
         add_info = add_info or {}
         source_image_path = add_info["source_image_path"]
-        bev_image_path = add_info["bev_image_path"]
+        layout_image_path = add_info.get("layout_image_path") or add_info["bev_image_path"]
         prompt = self._build_prompt(add_info)
         return [
             {"type": "text", "text": prompt},
@@ -52,8 +53,8 @@ class SceneVerificationAgent(TaskAgent):
                 "type": "image_url",
                 "image_url": {
                     "url": (
-                        f"data:{self._mime_type(bev_image_path)};base64,"
-                        f"{self._encode_image(bev_image_path)}"
+                        f"data:{self._mime_type(layout_image_path)};base64,"
+                        f"{self._encode_image(layout_image_path)}"
                     )
                 },
             },
@@ -61,36 +62,63 @@ class SceneVerificationAgent(TaskAgent):
 
     @staticmethod
     def _build_prompt(add_info: Dict[str, Any]) -> str:
-        if add_info.get("verification_task") == "map_match":
-            return SceneVerificationAgent._build_map_match_prompt(add_info)
         scene_understanding = add_info.get("scene_understanding") or {}
         scene_match = add_info.get("scene_match") or {}
         spawn_entities = add_info.get("spawn_entities") or {}
         user_description = str(add_info.get("user_scene_description") or "").strip()
+        capture_mode = str(add_info.get("capture_mode") or "bev_fallback")
+        if capture_mode == "ego_view":
+            view_intro = (
+                "You are verifying whether the actor layout in a generated CARLA "
+                "ego-view image correctly reconstructs the traffic participants "
+                "from the original image. The first image is the original ego-view input. "
+                "The second image is the generated CARLA ego-view image.\n\n"
+                "Use the two ego-view images directly for front/left/right/near/far "
+                "comparison. Do NOT penalize actors not visible in the forward ego-view "
+                "field of view. Only judge actors that appear in both images or are "
+                "expected to appear in the forward cone based on the scene description.\n\n"
+            )
+        else:
+            view_intro = (
+                "You are verifying whether the actor layout in a generated CARLA "
+                "bird's-eye-view image correctly reconstructs the traffic participants "
+                "from the original image. The first image is the original ego-view input. "
+                "The second image is the generated CARLA BEV.\n\n"
+                "Use the same ego-centric frame for the original image and the BEV: the "
+                "ego vehicle's forward travel direction is positive longitudinal/ahead, "
+                "ego-left is negative lateral, and ego-right is positive lateral. The BEV "
+                "may be rotated or cropped, so do not judge left/right/ahead/behind from "
+                "screen pixel directions. Use the ego actor and spawn_entities yaw/location "
+                "to infer the BEV ego frame before comparing actor positions.\n\n"
+            )
         return (
-            "You are verifying whether the actor layout in a generated CARLA "
-            "bird's-eye-view image correctly reconstructs the traffic participants "
-            "from the original image. The first image is the original ego-view input. "
-            "The second image is the generated CARLA BEV.\n\n"
+            f"{view_intro}"
             "IMPORTANT: The road map and environment (road type, urban/rural context, "
             "sidewalks, buildings, crosswalks) are already fixed and cannot be changed "
             "at this stage. Do NOT penalize score for road topology differences, map "
-            "type mismatches, or missing environmental features. Those are evaluated "
-            "separately before this stage.\n\n"
+            "type mismatches, or missing environmental features.\n\n"
             "Judge ONLY the actor layout. Focus on:\n"
             "- Actor count: does the number of vehicles/pedestrians/cyclists match the source?\n"
             "- Actor categories: are vehicle types (car, truck, motorcycle, pedestrian) correct?\n"
-            "- Relative spatial relations: left/right and near/far positions between actors.\n"
+            "- Relative spatial relations: ego-centric left/right and near/far positions between actors.\n"
             "- Lane side relations: same lane, adjacent lane, opposing lane, roadside/parked.\n"
             "- Heading/yaw: are actors facing the correct direction relative to the road?\n"
             "- Overlaps: are any actors unrealistically overlapping each other?\n"
             "- Moving vs parked: does each actor's motion state match the source?\n\n"
             "Output only JSON with these keys: passed, score, hard_failures, "
-            "mismatches, recommended_stage, repair_hints. score must be 0.0-1.0. "
+            "mismatches, recommended_stage, repair_hints, repair_actions. "
+            "score must be 0.0-1.0. "
             "recommended_stage must be one of: match_spawn, scene_understanding, pass.\n"
             "Use recommended_stage='scene_understanding' only when actor count or "
             "categories are wrong. Use 'match_spawn' when positions/relations are wrong.\n"
-            "Use passed=true only when score >= 0.70 and no hard failure remains.\n\n"
+            "Use passed=true only when score >= 0.70 and no hard failure remains.\n"
+            "repair_actions must be a list. Supported action types are: "
+            "lane_side_mismatch, pairwise_mismatch, category_mismatch, count_mismatch, "
+            "overlap, heading_mismatch. For lane_side_mismatch, overlap, and "
+            "heading_mismatch include entity_id. For pairwise_mismatch include "
+            "entity_id, reference_entity_id, and target_relation. For count_mismatch "
+            "and category_mismatch entity_id is optional. Each action should include "
+            "severity and evidence.\n\n"
             f"User description, if any:\n{user_description or '(none)'}\n\n"
             "Current scene_understanding JSON:\n"
             f"{json.dumps(scene_understanding, ensure_ascii=False, sort_keys=True)}\n\n"
@@ -98,34 +126,6 @@ class SceneVerificationAgent(TaskAgent):
             f"{json.dumps(scene_match, ensure_ascii=False, sort_keys=True)}\n\n"
             "Current spawn_entities JSON:\n"
             f"{json.dumps(spawn_entities, ensure_ascii=False, sort_keys=True)}"
-        )
-
-    @staticmethod
-    def _build_map_match_prompt(add_info: Dict[str, Any]) -> str:
-        topology_signature = add_info.get("road_topology_signature") or {}
-        scene_match = add_info.get("scene_match") or {}
-        user_description = str(add_info.get("user_scene_description") or "").strip()
-        return (
-            "You are verifying whether a clean CARLA map bird's-eye-view region "
-            "matches the road topology of the original traffic image. The first image "
-            "is the original ego-view input. The second image is the clean CARLA map BEV "
-            "before scenario vehicles are added.\n\n"
-            "Judge the road region only. Do not penalize missing target vehicles, "
-            "pedestrians, cones, or parked cars, because those will be added later. "
-            "Focus primarily on topology: straight road, T-junction, cross intersection, "
-            "multi-branch junction, curve, one-way/two-way organization, visible median "
-            "or island, and branch geometry. Use side context such as buildings, shops, "
-            "trees, sidewalks, and curbside parking as auxiliary evidence. Crosswalks, "
-            "traffic lights, and traffic signs are also auxiliary evidence.\n\n"
-            "Output only JSON with these keys: passed, score, road_topology_mismatches, "
-            "side_context_mismatches, auxiliary_mismatches, rematch_hints. score must be "
-            "0.0-1.0. Use passed=true only when score >= 0.70 and the road topology is "
-            "similar enough for later actor placement.\n\n"
-            f"User description, if any:\n{user_description or '(none)'}\n\n"
-            "Road topology signature:\n"
-            f"{json.dumps(topology_signature, ensure_ascii=False, sort_keys=True)}\n\n"
-            "Current scene_match JSON:\n"
-            f"{json.dumps(scene_match, ensure_ascii=False, sort_keys=True)}"
         )
 
     @classmethod
@@ -160,24 +160,7 @@ class SceneVerificationAgent(TaskAgent):
         report["repair_hints"] = (
             report["repair_hints"] if isinstance(report.get("repair_hints"), list) else []
         )
-        report["road_topology_mismatches"] = (
-            report["road_topology_mismatches"]
-            if isinstance(report.get("road_topology_mismatches"), list)
-            else []
-        )
-        report["side_context_mismatches"] = (
-            report["side_context_mismatches"]
-            if isinstance(report.get("side_context_mismatches"), list)
-            else []
-        )
-        report["auxiliary_mismatches"] = (
-            report["auxiliary_mismatches"]
-            if isinstance(report.get("auxiliary_mismatches"), list)
-            else []
-        )
-        report["rematch_hints"] = (
-            report["rematch_hints"] if isinstance(report.get("rematch_hints"), list) else []
-        )
+        report["repair_actions"] = cls._normalize_repair_actions(report.get("repair_actions"))
         recommended_stage = str(report.get("recommended_stage") or "match_spawn")
         if recommended_stage not in {"match_spawn", "scene_understanding", "pass"}:
             recommended_stage = "match_spawn"
@@ -185,6 +168,45 @@ class SceneVerificationAgent(TaskAgent):
             recommended_stage = "pass"
         report["recommended_stage"] = recommended_stage
         return report
+
+    @staticmethod
+    def _normalize_repair_actions(value: Any) -> list:
+        if not isinstance(value, list):
+            return []
+        requires_entity = {
+            "lane_side_mismatch",
+            "pairwise_mismatch",
+            "overlap",
+            "heading_mismatch",
+        }
+        optional_entity = {"count_mismatch", "category_mismatch"}
+        normalized = []
+        for item in value:
+            if not isinstance(item, dict):
+                continue
+            action_type = str(item.get("type") or "").strip()
+            if action_type not in requires_entity and action_type not in optional_entity:
+                continue
+            severity = str(item.get("severity") or "").strip()
+            if not severity:
+                continue
+            entity_id = str(item.get("entity_id") or "").strip()
+            if action_type in requires_entity and not entity_id:
+                continue
+            reference_id = str(item.get("reference_entity_id") or "").strip()
+            if action_type == "pairwise_mismatch" and not reference_id:
+                continue
+            action = dict(item)
+            action["type"] = action_type
+            action["severity"] = severity
+            if entity_id:
+                action["entity_id"] = entity_id
+            elif "entity_id" in action:
+                action.pop("entity_id", None)
+            if reference_id:
+                action["reference_entity_id"] = reference_id
+            normalized.append(action)
+        return normalized
 
     def extract_decision_data(self, file_path: str) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
         text = read_file(file_path)

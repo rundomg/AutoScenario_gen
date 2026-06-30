@@ -18,6 +18,10 @@ OPENAI_REQUEST_RETRIES = int(os.getenv("OPENAI_REQUEST_RETRIES", 2))
 OPENAI_SYSTEM_PROMPT = os.getenv("OPENAI_SYSTEM_PROMPT")
 
 
+class APIResponseError(Exception):
+    """Raised for API responses that cannot be parsed as chat-completions JSON."""
+
+
 class TaskAgent:
     def __init__(self):
         self.post_header = {
@@ -67,8 +71,25 @@ class TaskAgent:
                     )
                     response.raise_for_status()
 
-                    res = response.json()
-                    res_content = self._extract_response_content(res)
+                    try:
+                        res = response.json()
+                    except ValueError as e:
+                        raise APIResponseError(
+                            self._format_response_error(
+                                response,
+                                "API returned a non-JSON response",
+                            )
+                        ) from e
+
+                    try:
+                        res_content = self._extract_response_content(res)
+                    except Exception as e:
+                        raise APIResponseError(
+                            self._format_response_error(
+                                response,
+                                f"API response JSON has invalid chat format: {e}",
+                            )
+                        ) from e
 
                     if add_info and "output_fn" in add_info:
                         output_fn = add_info["output_fn"]
@@ -79,6 +100,7 @@ class TaskAgent:
                 except (
                     requests.exceptions.Timeout,
                     requests.exceptions.ConnectionError,
+                    APIResponseError,
                 ) as e:
                     last_error = e
                     if attempt >= max_attempts:
@@ -93,12 +115,20 @@ class TaskAgent:
                     raise Exception(self._format_http_error(e)) from e
 
             raise Exception(
-                f"API request failed after {max_attempts} attempts: {str(last_error)}"
+                f"{request_label} request failed after {max_attempts} attempts: "
+                f"{str(last_error)}"
             ) from last_error
         except KeyError as e:
             raise Exception(f"Invalid response format: missing key {str(e)}")
         except Exception as e:
-            raise Exception(f"Unexpected error: {str(e)}")
+            message = str(e)
+            if (
+                "request failed after" in message
+                or message.startswith("API request failed")
+                or message.startswith("Invalid response format")
+            ):
+                raise
+            raise Exception(f"Unexpected error: {message}")
 
     @staticmethod
     def _resolve_request_timeout(add_info):
@@ -145,6 +175,25 @@ class TaskAgent:
                 f"{body_preview}"
             )
         return f"API request failed with status {response.status_code}: {str(error)}"
+
+    @staticmethod
+    def _format_response_error(response, reason):
+        status_code = getattr(response, "status_code", "unknown")
+        headers = getattr(response, "headers", {}) or {}
+        content_type = ""
+        if hasattr(headers, "get"):
+            content_type = headers.get("Content-Type") or headers.get("content-type") or ""
+
+        body_preview = (getattr(response, "text", "") or "").strip()
+        if len(body_preview) > 400:
+            body_preview = f"{body_preview[:400]}..."
+        if not body_preview:
+            body_preview = "<empty>"
+
+        return (
+            f"{reason}; status={status_code}; content_type={content_type or 'unknown'}; "
+            f"body_preview={body_preview}"
+        )
 
     @staticmethod
     def _extract_response_content(res):

@@ -677,35 +677,50 @@ def _autoscenario_load_xodr_world(client):
         time.sleep(1.0)
     return world"""
 
-    def _build_deterministic_scene_script(
-        self,
-        spawn_payload_filename: str,
-        xodr_filename: str,
-        generation_params: Dict[str, Any],
-    ) -> str:
-        loader_block = self._build_xodr_loader_block(
-            xodr_filename,
-            generation_params,
-        )
-        helper_block = self._build_scene_helper_block()
+    @staticmethod
+    def _build_spawn_payload_loop() -> str:
         return (
-            f"{loader_block}\n\n"
-            f"{helper_block}\n\n"
-            "import json\n"
-            "import os\n"
-            "import carla\n"
-            "import time\n\n"
-            f"_AUTOSCENARIO_SPAWN_PAYLOAD = {spawn_payload_filename!r}\n\n"
-            "client = carla.Client('localhost', 2000)\n"
-            "client.set_timeout(10.0)\n"
-            "world = _autoscenario_load_xodr_world(client)\n"
-            "blueprint_library = world.get_blueprint_library()\n\n"
             "def _autoscenario_load_spawn_payload():\n"
             "    payload_path = os.path.join(os.path.dirname(__file__), _AUTOSCENARIO_SPAWN_PAYLOAD)\n"
             "    with open(payload_path, 'r', encoding='utf-8') as file:\n"
             "        return json.load(file)\n\n"
+            "def _autoscenario_payload_ego_yaw(spawn_payload):\n"
+            "    for payload_entity in spawn_payload.get('entities', []):\n"
+            "        if str(payload_entity.get('id')) in {'ego', 'ego_vehicle'}:\n"
+            "            try:\n"
+            "                return float((payload_entity.get('rotation') or {}).get('yaw'))\n"
+            "            except Exception:\n"
+            "                return None\n"
+            "    return None\n\n"
+            "def _autoscenario_apply_heading_relation(entity, rotation, ego_yaw):\n"
+            "    if ego_yaw is None:\n"
+            "        return rotation\n"
+            "    relation = str(entity.get('heading_relation') or 'unknown')\n"
+            "    yaw = float(rotation.yaw)\n"
+            "    if relation == 'opposite_direction' and _autoscenario_angle_distance(yaw, ego_yaw) < 90.0:\n"
+            "        rotation.yaw = _autoscenario_normalize_yaw(yaw + 180.0)\n"
+            "    elif relation == 'same_direction' and _autoscenario_angle_distance(yaw, ego_yaw) > 90.0:\n"
+            "        rotation.yaw = _autoscenario_normalize_yaw(yaw + 180.0)\n"
+            "    return rotation\n\n"
+            "def _autoscenario_clear_existing_vehicles():\n"
+            "    try:\n"
+            "        existing_vehicles = list(world.get_actors().filter('vehicle.*'))\n"
+            "    except Exception:\n"
+            "        existing_vehicles = []\n"
+            "    for actor in existing_vehicles:\n"
+            "        try:\n"
+            "            actor.destroy()\n"
+            "        except Exception:\n"
+            "            pass\n"
+            "    if existing_vehicles:\n"
+            "        try:\n"
+            "            world.wait_for_tick()\n"
+            "        except Exception:\n"
+            "            time.sleep(0.5)\n\n"
             "_autoscenario_apply_weather(carla.WeatherParameters.ClearNoon)\n"
+            "_autoscenario_clear_existing_vehicles()\n"
             "spawn_payload = _autoscenario_load_spawn_payload()\n"
+            "_autoscenario_ego_yaw = _autoscenario_payload_ego_yaw(spawn_payload)\n"
             "for entity in spawn_payload.get('entities', []):\n"
             "    location = carla.Location(\n"
             "        x=float(entity['location']['x']),\n"
@@ -717,6 +732,7 @@ def _autoscenario_load_xodr_world(client):
             "        yaw=float(entity['rotation']['yaw']),\n"
             "        roll=float(entity['rotation']['roll']),\n"
             "    )\n"
+            "    rotation = _autoscenario_apply_heading_relation(entity, rotation, _autoscenario_ego_yaw)\n"
             "    spawn_kind = str(entity.get('spawn_kind') or 'vehicle')\n"
             "    if spawn_kind == 'pedestrian':\n"
             "        _autoscenario_spawn_pedestrian(location, rotation)\n"
@@ -742,4 +758,67 @@ def _autoscenario_load_xodr_world(client):
             "    )\n\n"
             "_autoscenario_focus_spectator()\n"
             "time.sleep(2)\n"
+        )
+
+    def _build_deterministic_scene_script(
+        self,
+        spawn_payload_filename: str,
+        xodr_filename: str,
+        generation_params: Dict[str, Any],
+    ) -> str:
+        loader_block = self._build_xodr_loader_block(
+            xodr_filename,
+            generation_params,
+        )
+        helper_block = self._build_scene_helper_block()
+        return (
+            f"{loader_block}\n\n"
+            f"{helper_block}\n\n"
+            "import json\n"
+            "import os\n"
+            "import carla\n"
+            "import time\n\n"
+            f"_AUTOSCENARIO_SPAWN_PAYLOAD = {spawn_payload_filename!r}\n\n"
+            "client = carla.Client('localhost', 2000)\n"
+            "client.set_timeout(10.0)\n"
+            "world = _autoscenario_load_xodr_world(client)\n"
+            "blueprint_library = world.get_blueprint_library()\n\n"
+            f"{self._build_spawn_payload_loop()}"
+        )
+
+    def build_existing_world_scene_script(
+        self,
+        spawn_payload_filename: str,
+        carla_host: str = "localhost",
+        carla_port: int = 2000,
+        carla_map: Optional[str] = None,
+        scene_match_status: Optional[str] = None,
+        scene_match_reason: Optional[str] = None,
+    ) -> str:
+        helper_block = self._build_scene_helper_block()
+        status_comment = f"# scene_match_status: {scene_match_status or 'unknown'}"
+        if scene_match_reason:
+            status_comment += f"; reason: {scene_match_reason}"
+        world_loader = (
+            f"world = client.load_world({carla_map!r})\n"
+            if carla_map
+            else "world = client.get_world()\n"
+        )
+        return (
+            f"{status_comment}\n"
+            f"{helper_block}\n\n"
+            "import json\n"
+            "import os\n"
+            "import carla\n"
+            "import time\n\n"
+            f"_AUTOSCENARIO_SPAWN_PAYLOAD = {spawn_payload_filename!r}\n\n"
+            f"client = carla.Client({carla_host!r}, {int(carla_port)})\n"
+            "client.set_timeout(10.0)\n"
+            f"{world_loader}"
+            "try:\n"
+            "    world.wait_for_tick()\n"
+            "except Exception:\n"
+            "    time.sleep(1.0)\n"
+            "blueprint_library = world.get_blueprint_library()\n\n"
+            f"{self._build_spawn_payload_loop()}"
         )

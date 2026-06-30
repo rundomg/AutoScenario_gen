@@ -100,6 +100,10 @@ class SceneUnderstandingInterpreter(TaskAgent):
         - Keep `background_traffic` to a small representative set.
         - `key_pairwise_relations` is optional and should include only the most useful, high-confidence pairwise relations between visible actors.
         - Do not invent exact metric distances.
+        - Enumerate clearly visible vehicle-like actors before adding generic background activity. This includes cars, motorcycles, scooters, bicycles, and parked two-wheelers.
+        - If a scooter or motorcycle is stopped or parked in a curbside parking lane/bay, represent it as `category="parked_vehicle"` with `subtype="motorcycle"` or `subtype="motor_scooter"`, not as pedestrian or sidewalk activity.
+        - Do not add spawnable pedestrians unless human bodies are clearly visible and relevant to the ego path. Storefront customers, distant silhouettes, or ambiguous sidewalk activity should be contextual environment, not `background_traffic`.
+        - For curbside parking rows, include the row as background traffic and preserve the visible side (`right_edge` or `left_edge`). If an individual nearby parked motorcycle/scooter is distinct from the row, include it separately.
         - Determine lane count from visible ground evidence first: lane lines, edge lines, parking-lane separators, curb-adjacent boundaries, and other painted ground markings.
         - Do not infer lane count only from how many rows of vehicles are present.
         - If a parking lane is visibly continuous and separated from the adjacent driving lane by a clear boundary, count it as its own lane in `road_network.lane_groups`.
@@ -121,6 +125,9 @@ class SceneUnderstandingInterpreter(TaskAgent):
         return base64.b64encode(buffer).decode("utf-8")
 
     def refine_request(self, user_request, add_info=None):
+        if add_info and add_info.get("merge_scene_understanding"):
+            return add_info["merge_prompt"]
+
         assert add_info and "image_path" in add_info, "Missing image_path"
         image_path = add_info["image_path"]
         if not os.path.exists(image_path):
@@ -137,6 +144,66 @@ class SceneUnderstandingInterpreter(TaskAgent):
                 },
             },
         ]
+
+    def merge_with_user_description(
+        self,
+        scene_understanding,
+        user_description: str,
+        output_fn: str,
+    ):
+        description = str(user_description or "").strip()
+        if not description:
+            return scene_understanding
+
+        attempts = 0
+        merge_prompt = self._build_merge_prompt(scene_understanding, description)
+        while True:
+            self.send_request(
+                "",
+                {
+                    "output_fn": output_fn,
+                    "merge_scene_understanding": True,
+                    "merge_prompt": merge_prompt,
+                    "request_label": "Scene understanding merge",
+                    "request_timeout": 180,
+                },
+            )
+            payload, validation_error = self.extract_decision_data(output_fn)
+            attempts += 1
+            if validation_error is None:
+                payload.setdefault("metadata", {})["user_description_applied"] = True
+                write_to_file(output_fn, json.dumps(payload, indent=2, sort_keys=True))
+                return payload
+            if attempts >= self.MAX_REGENERATE_ATTEMPTS:
+                raise RuntimeError(
+                    "Scene understanding merge failed after "
+                    f"{self.MAX_REGENERATE_ATTEMPTS} attempts: {validation_error}"
+                )
+            print(f"Regenerating scene understanding merge... Attempt {attempts + 1}")
+
+    @staticmethod
+    def _build_merge_prompt(scene_understanding, user_description: str) -> str:
+        return (
+            "You are merging a VLM-generated traffic scene JSON with a user-provided "
+            "description of the same image.\n\n"
+            "Output only a complete JSON object using the Scene Understanding DSL schema. "
+            "Do not output markdown fences or prose.\n\n"
+            "Priority rules:\n"
+            "1. The user description is authoritative when it conflicts with the VLM JSON.\n"
+            "2. Preserve VLM road_network, general_environment, and visible actors that the "
+            "user does not contradict.\n"
+            "3. Add or correct vehicles, parked rows, motorcycles, scooters, pedestrians, "
+            "cones, left/right relations, ahead/behind relations, lane-side relations, and "
+            "pairwise relations explicitly mentioned by the user.\n"
+            "4. Use conservative uncertainty where the user and VLM are both ambiguous.\n"
+            "5. Do not store or repeat the raw user description in metadata.\n\n"
+            "Required top-level keys: traffic_subjects, background_traffic, "
+            "key_pairwise_relations, road_network, general_environment, metadata.\n\n"
+            "User description:\n"
+            f"{user_description.strip()}\n\n"
+            "VLM scene understanding JSON:\n"
+            f"{json.dumps(scene_understanding, indent=2, sort_keys=True, ensure_ascii=False)}"
+        )
 
     def call_agent(self, user_request, add_info):
         output_fn = add_info["output_fn"]

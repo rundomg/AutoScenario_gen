@@ -11,7 +11,6 @@ from tools.utils import write_to_file
 
 SCENE_UNDERSTANDING_REQUIRED_KEYS = (
     "traffic_subjects",
-    "background_traffic",
     "road_network",
     "general_environment",
     "metadata",
@@ -39,15 +38,29 @@ LANE_WIDTH_METERS = {
 
 PARKING_LANE_WIDTH_METERS = 2.5
 SIDEWALK_BUFFER_METERS = 1.5
+# A local scene spans at most ~100m; reject candidate lanes farther than this
+# from the anchor so a leaked fallback/origin lane can never capture an actor.
+MAX_LOCAL_LANE_DISTANCE_M = 150.0
+# Lateral width of a center median expressed in lane-width multiples. Used to
+# push opposite-direction (oncoming) actors across the divider onto the opposing
+# carriageway instead of leaving them in an adjacent same-direction lane.
+MEDIAN_GAP_LANE_EQUIV = 1.0
+
+# Yaw deflection (degrees) applied to a vehicle captured mid-turn at a junction.
+# Static reconstruction has no continuous trajectory, so a turning actor is
+# rendered as its straight-lane heading rotated by this fixed amount toward the
+# branch it is entering. ~45 deg reads as "clearly mid-maneuver" without snapping
+# the actor fully perpendicular (which would look like the turn already finished).
+TURN_INTENT_YAW_DEG = 45.0
 
 BACKGROUND_DENSITY_DEFAULTS = {
-    "curbside_row": 3,
+    "curbside_row": 5,
     "sidewalk_group": 2,
     "opposing_flow": 2,
     "sparse_filler": 1,
 }
 
-BACKGROUND_MAX_ACTORS = 6
+BACKGROUND_MAX_ACTORS = 8
 
 CANONICAL_COLOR_MAP = {
     "white": "white",
@@ -95,7 +108,6 @@ VEHICLE_CATEGORIES = {
     "bus",
     "motorcycle",
     "bicycle",
-    "parked_vehicle",
 }
 
 STATIC_CATEGORIES = {
@@ -114,46 +126,92 @@ CANONICAL_CATEGORY_MAP = {
     "motor_scooter_with_rider_and_passenger": "motorcycle",
     "motorbike": "motorcycle",
     "bike": "bicycle",
-    "parked_vehicle": "parked_vehicle",
-    "parked_motorcycle": "parked_vehicle",
-    "parked_scooter": "parked_vehicle",
-    "parked_motor_scooter": "parked_vehicle",
-    "curbside_motorcycle": "parked_vehicle",
-    "curbside_scooter": "parked_vehicle",
-    "parked_two_wheeler": "parked_vehicle",
-    "parked_two_wheeler_group": "parked_vehicle",
-    "parked_vehicle_row": "parked_vehicle",
-    "parked_car_row": "parked_vehicle",
-    "car_row": "parked_vehicle",
-    "curbside_car_row": "parked_vehicle",
-    "curbside_parked_car_row": "parked_vehicle",
-    "parked_cars": "parked_vehicle",
-    "parked_vehicle_partial": "parked_vehicle",
-    "partial_parked_vehicle": "parked_vehicle",
-    "partially_visible_parked_vehicle": "parked_vehicle",
+    "parked_vehicle": "car",
+    "parked_motorcycle": "motorcycle",
+    "parked_scooter": "motorcycle",
+    "parked_motor_scooter": "motorcycle",
+    "curbside_motorcycle": "motorcycle",
+    "curbside_scooter": "motorcycle",
+    "parked_two_wheeler": "motorcycle",
+    "parked_two_wheeler_group": "motorcycle",
+    "parked_vehicle_row": "car",
+    "parked_car_row": "car",
+    "car_row": "car",
+    "curbside_car_row": "car",
+    "curbside_parked_car_row": "car",
+    "parked_cars": "car",
+    "parked_vehicle_partial": "car",
+    "partial_parked_vehicle": "car",
+    "partially_visible_parked_vehicle": "car",
     "opposing_vehicle": "car",
     "vehicle": "car",
+    "moving_vehicle": "car",
+    "moving_car": "car",
     "sidewalk_pedestrian_group": "pedestrian",
     "pedestrian_group": "pedestrian",
+    "traffic_cone": "cone_group",
     "traffic_cones": "cone_group",
+    "cone": "cone_group",
+    "cone_row": "cone_group",
+    "construction_cone": "cone_group",
+    "constructioncone": "cone_group",
     "cones": "cone_group",
     "barriers": "barrier_group",
 }
 
 CANONICAL_LANE_SIDE_MAP = {
+    # left_lane variants
     "center_left": "left_lane",
     "left_of_center": "left_lane",
-    "center_right": "right_lane",
-    "right_of_center": "right_lane",
-    "left_sidewalk": "sidewalk_left",
-    "right_sidewalk": "sidewalk_right",
-    "curbside_right": "right_edge",
-    "curbside_left": "left_edge",
+    "left_of_ego": "left_lane",
+    "left_of_ego_center": "left_lane",
+    "left_front": "left_lane",
+    "left_rear": "left_lane",
+    "oncoming_lane": "left_lane",
+    "opposing_lane": "left_lane",
     "opposing_center_left": "left_lane",
     "opposing_left": "left_lane",
+    "opposing_side": "left_lane",
+    # right_lane variants
+    "center_right": "right_lane",
+    "right_of_center": "right_lane",
+    "right_of_ego": "right_lane",
+    "right_front": "right_lane",
+    "right_rear": "right_lane",
     "opposing_center_right": "right_lane",
     "opposing_right": "right_lane",
-    "opposing_side": "left_lane",
+    # Parking / curbside vehicle variants are normalized to adjacent lanes.
+    "curbside_right": "right_lane",
+    "right_curb": "right_lane",
+    "right_curbside": "right_lane",
+    "right_curbside_parking_lane": "right_lane",
+    "right_curbside_row": "right_lane",
+    "right_parking_lane": "right_lane",
+    "right_parking": "right_lane",
+    "parking_right": "right_lane",
+    "curbside_parking_right": "right_lane",
+    "near_right_edge": "right_lane",
+    "far_right_edge": "right_lane",
+    "right_edge": "right_lane",
+    "right_shoulder": "right_lane",
+    "curbside_left": "left_lane",
+    "left_curb": "left_lane",
+    "left_curbside": "left_lane",
+    "left_curbside_parking_lane": "left_lane",
+    "left_curbside_row": "left_lane",
+    "left_parking_lane": "left_lane",
+    "left_parking": "left_lane",
+    "parking_left": "left_lane",
+    "curbside_parking_left": "left_lane",
+    "near_left_edge": "left_lane",
+    "far_left_edge": "left_lane",
+    "left_edge": "left_lane",
+    "left_shoulder": "left_lane",
+    # sidewalk variants
+    "left_sidewalk": "sidewalk_left",
+    "sidewalk_left_side": "sidewalk_left",
+    "right_sidewalk": "sidewalk_right",
+    "sidewalk_right_side": "sidewalk_right",
 }
 
 
@@ -188,16 +246,105 @@ def _normalize_entity_id(prefix: str, index: int) -> str:
 def _canonical_category(value: Any, subtype: Any = None) -> str:
     normalized = _slugify(value)
     subtype_normalized = _slugify(subtype)
-    if normalized in CANONICAL_CATEGORY_MAP and CANONICAL_CATEGORY_MAP[normalized] == "parked_vehicle":
-        return "parked_vehicle"
     if subtype_normalized in CANONICAL_CATEGORY_MAP:
         return CANONICAL_CATEGORY_MAP[subtype_normalized]
     return CANONICAL_CATEGORY_MAP.get(normalized, normalized or "car")
 
 
+def _canonical_entity_category(entity: Dict[str, Any]) -> str:
+    return _canonical_category(entity.get("category"), entity.get("subtype"))
+
+
+def _canonical_subtype(entity: Dict[str, Any], category: str) -> str:
+    raw_subtype = str(entity.get("subtype") or entity.get("category") or category or "unknown")
+    normalized = _slugify(raw_subtype)
+    if normalized in {
+        "parked_vehicle",
+        "parked_vehicle_row",
+        "parked_car_row",
+        "car_row",
+        "curbside_car_row",
+        "curbside_parked_car_row",
+        "parked_cars",
+        "parked_vehicle_partial",
+        "partial_parked_vehicle",
+        "partially_visible_parked_vehicle",
+        "moving_vehicle",
+        "opposing_vehicle",
+    }:
+        return category
+    if normalized in {"parked_scooter", "parked_motor_scooter", "curbside_scooter"}:
+        return "motor_scooter"
+    if normalized in {"parked_motorcycle", "curbside_motorcycle", "parked_two_wheeler"}:
+        return "motorcycle"
+    return raw_subtype
+
+
 def _canonical_lane_side(value: Any) -> str:
     normalized = _slugify(value)
     return CANONICAL_LANE_SIDE_MAP.get(normalized, normalized or "same_lane")
+
+
+def _lane_index_from_relation(value: Any) -> Optional[int]:
+    normalized = _slugify(value)
+    if not normalized:
+        return 0
+    if normalized in {"same_lane", "ego_lane", "center_lane", "crosswalk"}:
+        return 0
+    if "right" in normalized:
+        return 1
+    if (
+        "left" in normalized
+        or "opposing" in normalized
+        or "oncoming" in normalized
+    ):
+        return -1
+    return None
+
+
+def _canonical_lane_index(value: Any, lane_side_relation: Any = None) -> int:
+    try:
+        return int(float(value))
+    except (TypeError, ValueError):
+        inferred = _lane_index_from_relation(lane_side_relation)
+        return 0 if inferred is None else inferred
+
+
+def _lane_side_from_index(lane_index: int, fallback: Any = None) -> str:
+    fallback_relation = _canonical_lane_side(fallback)
+    if fallback_relation in {"sidewalk_left", "sidewalk_right", "crosswalk"}:
+        return fallback_relation
+    if lane_index > 0:
+        return "right_lane"
+    if lane_index < 0:
+        return "left_lane"
+    return "same_lane"
+
+
+def _correct_lane_index_for_heading(
+    lane_index: int,
+    heading: str,
+    opposing_lane_count: int,
+) -> int:
+    """Enforce the constraint that opposite_direction actors occupy opposing lanes.
+
+    In right-hand traffic the opposing lane is always to the LEFT of ego
+    (negative lane_index).  When the VLM assigns a positive lane_index to an
+    opposite_direction actor — a common perspective error on curved roads where
+    the oncoming car appears to the right in the image — clamp it into the
+    valid opposing range [-opposing_lane_count, -1].
+    """
+    if heading == "opposite_direction" and lane_index > 0:
+        return -min(lane_index, max(1, opposing_lane_count))
+    return lane_index
+
+
+def _normalize_lane_fields(entity: Dict[str, Any], category: str) -> Tuple[str, int]:
+    lane_side = _canonical_lane_side(entity.get("lane_side_relation"))
+    lane_index = _canonical_lane_index(entity.get("lane_index_relation"), lane_side)
+    if category in VEHICLE_CATEGORIES:
+        lane_side = _lane_side_from_index(lane_index, lane_side)
+    return lane_side, lane_index
 
 
 def _canonical_distance_band(value: Any) -> str:
@@ -235,6 +382,62 @@ def _canonical_heading(value: Any) -> str:
     if normalized in {"uncertain"}:
         return "unknown"
     return "unknown"
+
+
+def _canonical_turn_intent(value: Any) -> str:
+    """Normalize a vehicle's junction turn maneuver to one of the canonical values.
+
+    Returns one of ``left``, ``right``, ``through``, ``none``. ``none`` means no
+    turning maneuver is asserted (steady lane following or simply unknown), so the
+    actor keeps its straight-lane heading.
+    """
+    normalized = _slugify(value)
+    if normalized in {"left", "right", "through", "none"}:
+        return normalized
+    if normalized in {"turn_left", "left_turn", "turning_left", "left_turning"}:
+        return "left"
+    if normalized in {"turn_right", "right_turn", "turning_right", "right_turning"}:
+        return "right"
+    if normalized in {"straight", "ahead", "go_straight", "through_movement"}:
+        return "through"
+    return "none"
+
+
+def _canonical_flow_compliance(value: Any) -> str:
+    """Normalize an actor's against-vs-with lane-flow label.
+
+    Returns one of ``legal``, ``wrong_way``, ``unknown``. ``wrong_way`` means the
+    actor travels against the legal flow of the lane band it physically occupies
+    (a true wrong-way actor, common for motorcycles) -- distinct from a normal
+    oncoming vehicle in the opposing carriageway, which is ``legal``. This label
+    only controls heading (a 180 flip downstream); it never moves the actor to a
+    different lane band.
+    """
+    normalized = _slugify(value)
+    if normalized in {"wrong_way", "wrongway", "against_flow", "against_traffic",
+                      "counterflow", "counter_flow", "ghost", "salmoning", "reverse_flow"}:
+        return "wrong_way"
+    if normalized in {"legal", "with_flow", "compliant", "normal", "lawful"}:
+        return "legal"
+    if normalized in {"unknown", "", "none"}:
+        return "unknown"
+    return "legal"
+
+
+def _apply_turn_intent(yaw: float, turn_intent: Any) -> float:
+    """Deflect a base lane yaw toward the actor's junction turn maneuver.
+
+    Direction is the actor's own driving perspective and applies after any
+    opposite-direction flip, so it is uniform regardless of absolute heading. In
+    CARLA's coordinate frame (x=east, y=south, yaw clockwise) the driver's right
+    is yaw+90, so a left turn decreases yaw and a right turn increases it.
+    """
+    intent = _canonical_turn_intent(turn_intent)
+    if intent == "left":
+        return float(yaw) - TURN_INTENT_YAW_DEG
+    if intent == "right":
+        return float(yaw) + TURN_INTENT_YAW_DEG
+    return float(yaw)
 
 
 def _canonical_road_type(value: Any) -> str:
@@ -397,29 +600,49 @@ def normalize_scene_understanding(payload: Dict[str, Any]) -> Tuple[Optional[Dic
         "traffic_subjects": [],
         "background_traffic": [],
         "road_network": {},
+        "actor_layout": _coerce_dict(payload.get("actor_layout")),
         "general_environment": {},
         "metadata": _coerce_dict(payload.get("metadata")),
         "key_pairwise_relations": _normalize_key_pairwise_relations(payload),
     }
 
+    # Read opposing lane count from the raw payload so we can enforce the
+    # heading ↔ lane_index semantic constraint during entity normalization,
+    # before road_network normalization happens below.
+    _raw_lane_groups = _coerce_list(_coerce_dict(payload.get("road_network")).get("lane_groups"))
+    _raw_primary_group = _raw_lane_groups[0] if _raw_lane_groups else {}
+    _opposing_lane_count = max(1, int(_raw_primary_group.get("opposing_lane_count", 1)))
+
     for index, entity in enumerate(_coerce_list(payload.get("traffic_subjects"))):
         if not isinstance(entity, dict):
             return None, f"traffic_subjects[{index}] must be an object."
-        category = _canonical_category(entity.get("category"), entity.get("subtype"))
+        category = _canonical_entity_category(entity)
+        lane_side_relation, lane_index_relation = _normalize_lane_fields(entity, category)
+        heading = _canonical_heading(entity.get("heading_relation_to_ego"))
+        if category in VEHICLE_CATEGORIES:
+            lane_index_relation = _correct_lane_index_for_heading(
+                lane_index_relation, heading, _opposing_lane_count
+            )
+            lane_side_relation = _lane_side_from_index(lane_index_relation, lane_side_relation)
         normalized["traffic_subjects"].append(
             {
                 "id": str(entity.get("id") or _normalize_entity_id("subject", index)),
                 "category": category,
-                "subtype": str(entity.get("subtype") or entity.get("category") or category or "unknown"),
+                "subtype": _canonical_subtype(entity, category),
                 "visual_confidence": str(entity.get("visual_confidence") or "medium"),
                 "motion_state": _canonical_motion_state(entity.get("motion_state")),
-                "heading_relation_to_ego": _canonical_heading(entity.get("heading_relation_to_ego")),
-                "lane_side_relation": _canonical_lane_side(entity.get("lane_side_relation")),
+                "turn_intent": _canonical_turn_intent(entity.get("turn_intent")),
+                "heading_relation_to_ego": heading,
+                "flow_compliance": _canonical_flow_compliance(entity.get("flow_compliance")),
+                "lane_side_relation": lane_side_relation,
+                "lane_index_relation": lane_index_relation,
                 "longitudinal_relation": str(entity.get("longitudinal_relation") or "ahead"),
                 "longitudinal_proximity": _canonical_distance_band(entity.get("longitudinal_proximity")),
                 "count": max(1, int(entity.get("count", 1))),
                 "evidence": str(entity.get("evidence") or ""),
                 "must_reconstruct": True,
+                "layout_anchor_id": str(entity.get("layout_anchor_id") or "").strip(),
+                "anchor_relation": _coerce_dict(entity.get("anchor_relation")),
                 "appearance": _normalize_appearance(entity, category),
             }
         )
@@ -427,47 +650,47 @@ def normalize_scene_understanding(payload: Dict[str, Any]) -> Tuple[Optional[Dic
     for index, entity in enumerate(_coerce_list(payload.get("background_traffic"))):
         if not isinstance(entity, dict):
             return None, f"background_traffic[{index}] must be an object."
-        category = _canonical_category(entity.get("category"), entity.get("subtype"))
+        category = _canonical_entity_category(entity)
         density_role = _canonical_density_role(entity.get("density_role"))
         default_count = BACKGROUND_DENSITY_DEFAULTS.get(density_role, 1)
-        normalized["background_traffic"].append(
+        lane_side_relation, lane_index_relation = _normalize_lane_fields(entity, category)
+        bg_heading = _canonical_heading(entity.get("heading_relation_to_ego"))
+        if category in VEHICLE_CATEGORIES:
+            lane_index_relation = _correct_lane_index_for_heading(
+                lane_index_relation, bg_heading, _opposing_lane_count
+            )
+            lane_side_relation = _lane_side_from_index(lane_index_relation, lane_side_relation)
+        representative_count = _clamp_int(
+            entity.get("representative_count", default_count),
+            1,
+            BACKGROUND_MAX_ACTORS,
+            default_count,
+        )
+        normalized["traffic_subjects"].append(
             {
                 "id": str(entity.get("id") or _normalize_entity_id("background", index)),
                 "category": category,
-                "subtype": str(entity.get("subtype") or entity.get("category") or category or "unknown"),
-                "source": str(entity.get("source") or "inferred"),
-                "representative_count": _clamp_int(
-                    entity.get("representative_count", default_count),
-                    1,
-                    3,
-                    default_count,
-                ),
-                "lane_side_relation": _canonical_lane_side(entity.get("lane_side_relation")),
-                "longitudinal_band": _canonical_distance_band(entity.get("longitudinal_band")),
-                "motion_bias": _canonical_motion_state(entity.get("motion_bias")),
-                "heading_relation_to_ego": _canonical_heading(entity.get("heading_relation_to_ego")),
-                "density_role": density_role,
-                "confidence": str(entity.get("confidence") or "medium"),
-                "spawn_priority": "low",
+                "subtype": _canonical_subtype(entity, category),
+                "visual_confidence": str(entity.get("confidence") or "medium"),
+                "motion_state": "unknown",
+                "turn_intent": _canonical_turn_intent(entity.get("turn_intent")),
+                "heading_relation_to_ego": bg_heading,
+                "flow_compliance": _canonical_flow_compliance(entity.get("flow_compliance")),
+                "lane_side_relation": lane_side_relation,
+                "lane_index_relation": lane_index_relation,
+                "longitudinal_relation": str(entity.get("longitudinal_relation") or "ahead"),
+                "longitudinal_proximity": _canonical_distance_band(entity.get("longitudinal_band")),
+                "count": representative_count,
+                "evidence": str(entity.get("source") or entity.get("evidence") or ""),
+                "must_reconstruct": True,
+                "layout_anchor_id": str(entity.get("layout_anchor_id") or "").strip(),
+                "anchor_relation": _coerce_dict(entity.get("anchor_relation")),
                 "appearance": _normalize_appearance(entity, category),
+                "density_role": density_role,
             }
         )
 
     road_network = _coerce_dict(payload.get("road_network"))
-    required_road_keys = (
-        "road_type",
-        "directionality",
-        "road_segments",
-        "lane_groups",
-        "lane_markings",
-        "special_road_areas",
-        "junctions",
-        "roadside_boundaries",
-        "control_elements",
-    )
-    missing_road_keys = [key for key in required_road_keys if key not in road_network]
-    if missing_road_keys:
-        return None, f"road_network is missing required keys: {', '.join(missing_road_keys)}"
 
     normalized_road_segments = []
     for road_index, segment in enumerate(_coerce_list(road_network.get("road_segments"))):
@@ -529,8 +752,33 @@ def normalize_scene_understanding(payload: Dict[str, Any]) -> Tuple[Optional[Dic
                 "id": str(lane_group.get("id") or f"lane_group_{lane_index}"),
             }
         )
-    if not normalized_lane_groups:
-        normalized_lane_groups = [
+    normalized_road_network = {}
+    map_matching = _coerce_dict(road_network.get("map_matching"))
+    if map_matching:
+        normalized_road_network["map_matching"] = map_matching
+    if "road_type" in road_network:
+        normalized_road_network["road_type"] = _canonical_road_type(
+            road_network.get("road_type")
+        )
+    if "directionality" in road_network:
+        normalized_road_network["directionality"] = str(
+            road_network.get("directionality") or "two_way"
+        )
+    if normalized_road_segments:
+        normalized_road_network["road_segments"] = normalized_road_segments
+    elif not map_matching:
+        normalized_road_network["road_segments"] = [
+            {
+                "id": "road_segment_0",
+                "geometry_type": "straight",
+                "curvature_hint": "straight",
+                "relative_length": "medium",
+            }
+        ]
+    if normalized_lane_groups:
+        normalized_road_network["lane_groups"] = normalized_lane_groups
+    elif not map_matching:
+        normalized_road_network["lane_groups"] = [
             {
                 "forward_lane_count": 1,
                 "opposing_lane_count": 1,
@@ -543,22 +791,22 @@ def normalize_scene_understanding(payload: Dict[str, Any]) -> Tuple[Optional[Dic
                 "id": "lane_group_0",
             }
         ]
-
-    normalized["road_network"] = {
-        "road_type": _canonical_road_type(road_network.get("road_type")),
-        "directionality": str(road_network.get("directionality") or "two_way"),
-        "road_segments": normalized_road_segments,
-        "lane_groups": normalized_lane_groups,
-        "lane_markings": _coerce_dict(road_network.get("lane_markings")),
-        "special_road_areas": _coerce_list(road_network.get("special_road_areas")),
-        "junctions": _coerce_list(road_network.get("junctions")),
-        "roadside_boundaries": _coerce_dict(road_network.get("roadside_boundaries")),
-        "control_elements": _coerce_list(road_network.get("control_elements")),
-    }
-    if not normalized["road_network"]["road_segments"]:
-        return None, "road_network.road_segments must not be empty."
-    if not normalized["road_network"]["lane_groups"]:
-        return None, "road_network.lane_groups must not be empty."
+    lane_markings = _coerce_dict(road_network.get("lane_markings"))
+    if lane_markings:
+        normalized_road_network["lane_markings"] = lane_markings
+    special_road_areas = _coerce_list(road_network.get("special_road_areas"))
+    if special_road_areas:
+        normalized_road_network["special_road_areas"] = special_road_areas
+    junctions = _coerce_list(road_network.get("junctions"))
+    if junctions:
+        normalized_road_network["junctions"] = junctions
+    roadside_boundaries = _coerce_dict(road_network.get("roadside_boundaries"))
+    if roadside_boundaries:
+        normalized_road_network["roadside_boundaries"] = roadside_boundaries
+    control_elements = _coerce_list(road_network.get("control_elements"))
+    if control_elements:
+        normalized_road_network["control_elements"] = control_elements
+    normalized["road_network"] = normalized_road_network
 
     general_environment = _coerce_dict(payload.get("general_environment"))
     normalized["general_environment"] = {
@@ -627,28 +875,6 @@ def _inject_inferred_obstacle_subjects(scene_understanding: Dict[str, Any]) -> N
         break
 
 
-def build_road_generation_request(scene_understanding: Dict[str, Any]) -> str:
-    road_network = scene_understanding.get("road_network", {})
-    general_environment = scene_understanding.get("general_environment", {})
-    metadata = scene_understanding.get("metadata", {})
-    return (
-        "Generate an OpenDRIVE Road DSL from the structured scene understanding below.\n"
-        "Use only the `road_network` section as geometry truth.\n"
-        "Do not place traffic actors in the road DSL.\n"
-        "Determine lane count from lane-first evidence: visible ground markings, lane separators, parking-lane separators, edge lines, and roadside boundaries.\n"
-        "Treat `lane_markings`, `lane_groups`, and `roadside_boundaries` as the primary lane-count evidence.\n"
-        "Do not reduce lane count just because vehicle placement looks sparse or ambiguous.\n"
-        "When `left_parking_lane_count` or `right_parking_lane_count` is greater than zero, generate explicit `parking` lanes in the DSL rather than collapsing them into assumptions or `special_road_areas`.\n"
-        "Treat `special_road_areas` parking hints as secondary support only; they must not override explicit lane counts.\n"
-        "Within each side of a lane section, list lanes from the road center outward.\n"
-        "Prefer the simplest valid OpenDRIVE geometry that preserves visible drivable space.\n"
-        "Treat control elements and roadside boundaries as road-layout hints only.\n\n"
-        f"Metadata:\n{json.dumps(metadata, indent=2, sort_keys=True)}\n\n"
-        f"Road network:\n{json.dumps(road_network, indent=2, sort_keys=True)}\n\n"
-        f"General environment context:\n{json.dumps(general_environment, indent=2, sort_keys=True)}"
-    )
-
-
 def _fallback_anchor_lane() -> Dict[str, Any]:
     return {
         "road_id": 1,
@@ -668,8 +894,17 @@ def select_anchor_lane(spawn_context: Optional[Dict[str, Any]]) -> Dict[str, Any
     return _fallback_anchor_lane()
 
 
-def _lane_anchor_for_relation(lane_side_relation: str, category: str) -> Tuple[str, int, str]:
+def _lane_anchor_for_relation(
+    lane_side_relation: str,
+    category: str,
+    lane_index_relation: Any = None,
+) -> Tuple[str, int, str]:
     relation = str(lane_side_relation or "same_lane")
+    lane_index = _canonical_lane_index(lane_index_relation, relation)
+    if category in VEHICLE_CATEGORIES:
+        if lane_index == 0:
+            return "center_of_lane", 0, "same_lane"
+        return "lane_center", lane_index, "relative_lane"
     mapping = {
         "same_lane": ("center_of_lane", 0, "same_lane"),
         "left_lane": ("left_lane_center", -1, "adjacent_left"),
@@ -691,8 +926,6 @@ def _lane_anchor_for_relation(lane_side_relation: str, category: str) -> Tuple[s
     anchor, lane_offset, lateral_mode = mapping.get(
         relation, ("center_of_lane", 0, "same_lane")
     )
-    if category in STATIC_CATEGORIES and relation == "left_edge":
-        return "left_curbside", -1, "road_edge_left"
     return anchor, lane_offset, lateral_mode
 
 
@@ -727,6 +960,8 @@ def _expected_longitudinal_scalar(entity: Dict[str, Any]) -> float:
 def _expected_lateral_band(entity: Dict[str, Any]) -> float:
     lane_anchor = str(entity.get("lane_anchor") or "")
     lane_index = float(entity.get("lane_index_relation") or 0.0)
+    if lane_anchor == "lane_center":
+        return lane_index
     mapping = {
         "sidewalk_band": -3.0 if "left" in str(entity.get("lane_side_relation") or "") else 3.0,
         "left_curbside": -2.0,
@@ -916,6 +1151,40 @@ def build_pairwise_relations(
     return pairwise_relations
 
 
+def _scene_has_center_median(scene_understanding: Dict[str, Any]) -> bool:
+    """Detect a physical center divider from the scene understanding.
+
+    A median pushes the opposing carriageway laterally away from ego; opposite
+    -direction actors must clear it (see _opposing_carriageway_offset).
+    """
+    road_network = _coerce_dict(scene_understanding.get("road_network"))
+    directionality = str(road_network.get("directionality") or "").lower()
+    if any(
+        token in directionality
+        for token in (
+            "not_median",
+            "not median",
+            "no_median",
+            "no median",
+            "without_median",
+            "without median",
+            "lane_markings_not_median",
+            "markings_not_median",
+            "painted_only",
+        )
+    ):
+        return False
+    if "divided" in directionality:
+        return True
+    for area in _coerce_list(road_network.get("special_road_areas")):
+        area_dict = _coerce_dict(area)
+        if area_dict.get("presence") is False or area_dict.get("visible") is False:
+            continue
+        if "median" in str(area_dict.get("type") or "").lower():
+            return True
+    return False
+
+
 def _lane_context(scene_understanding: Dict[str, Any], anchor_lane: Dict[str, Any]) -> Dict[str, Any]:
     lane_groups = _coerce_list(scene_understanding.get("road_network", {}).get("lane_groups"))
     lane_group = lane_groups[0] if lane_groups else {}
@@ -923,16 +1192,12 @@ def _lane_context(scene_understanding: Dict[str, Any], anchor_lane: Dict[str, An
     opposing_lane_count = int(lane_group.get("opposing_lane_count", 1))
     left_parking_lane_count = int(lane_group.get("left_parking_lane_count", 0) or 0)
     right_parking_lane_count = int(lane_group.get("right_parking_lane_count", 0) or 0)
-    left_edge_role = "parking" if left_parking_lane_count > 0 else "parking_or_edge"
-    right_edge_role = "parking" if right_parking_lane_count > 0 else "parking_or_edge"
     return {
         "ego_lane_id": int(anchor_lane.get("lane_id", -1)),
         "lane_catalog": {
             "same_lane": {"role": "driving", "relative_index": 0},
             "left_lane": {"role": "driving", "relative_index": -1},
             "right_lane": {"role": "driving", "relative_index": 1},
-            "left_edge": {"role": left_edge_role, "relative_index": -2},
-            "right_edge": {"role": right_edge_role, "relative_index": 2},
             "sidewalk_left": {"role": "sidewalk", "relative_index": -3},
             "sidewalk_right": {"role": "sidewalk", "relative_index": 3},
             "crosswalk": {"role": "crosswalk", "relative_index": 0},
@@ -943,18 +1208,17 @@ def _lane_context(scene_understanding: Dict[str, Any], anchor_lane: Dict[str, An
             "opposing_lane_count": opposing_lane_count,
             "left_parking_lane_count": left_parking_lane_count,
             "right_parking_lane_count": right_parking_lane_count,
+            "has_center_median": _scene_has_center_median(scene_understanding),
         },
         "lane_adjacency": {
             "same_lane": ["left_lane", "right_lane"],
-            "left_lane": ["same_lane", "left_edge", "sidewalk_left"],
-            "right_lane": ["same_lane", "right_edge", "sidewalk_right"],
-            "left_edge": ["left_lane", "sidewalk_left"],
-            "right_edge": ["right_lane", "sidewalk_right"],
+            "left_lane": ["same_lane", "sidewalk_left"],
+            "right_lane": ["same_lane", "sidewalk_right"],
         },
         "allowed_actor_types": {
             "driving": ["car", "truck", "bus", "motorcycle", "bicycle"],
-            "parking": ["parked_vehicle", "cone_group", "barrier_group"],
-            "parking_or_edge": ["parked_vehicle", "cone_group", "barrier_group"],
+            "parking": ["car", "truck", "bus", "motorcycle", "bicycle", "cone_group", "barrier_group"],
+            "parking_or_edge": ["car", "truck", "bus", "motorcycle", "bicycle", "cone_group", "barrier_group"],
             "sidewalk": ["pedestrian"],
             "crosswalk": ["pedestrian"],
         },
@@ -986,10 +1250,10 @@ def _iter_expanded_entities(scene_understanding: Dict[str, Any]) -> Iterable[Dic
         total_background += count
         for instance_index in range(count):
             expanded = _deep_copy(entity)
-            expanded["_source_key"] = "background_traffic"
+            expanded["_source_key"] = "traffic_subjects"
             expanded["_instance_index"] = instance_index
             expanded["_instance_total"] = count
-            expanded["_priority"] = "background"
+            expanded["_priority"] = "subject"
             expanded["_expanded_id"] = (
                 expanded["id"]
                 if count == 1
@@ -1059,11 +1323,21 @@ def build_relation_dsl(
         instance_total = expanded.pop("_instance_total")
         expanded_id = expanded.pop("_expanded_id")
 
-        category = str(expanded.get("category") or "car")
+        category = _canonical_entity_category(expanded)
         subtype = str(expanded.get("subtype") or category)
-        lane_anchor, lane_index_relation, lateral_mode = _lane_anchor_for_relation(
+        lane_index_relation = _canonical_lane_index(
+            expanded.get("lane_index_relation"),
             expanded.get("lane_side_relation"),
+        )
+        lane_side_relation = (
+            _lane_side_from_index(lane_index_relation, expanded.get("lane_side_relation"))
+            if category in VEHICLE_CATEGORIES
+            else str(expanded.get("lane_side_relation") or "same_lane")
+        )
+        lane_anchor, lane_index_relation, lateral_mode = _lane_anchor_for_relation(
+            lane_side_relation,
             category,
+            lane_index_relation,
         )
         distance_band = _distance_band_for_entity(expanded, source_key)
         order_relation = _order_relation_for_entity(expanded, source_key)
@@ -1073,8 +1347,18 @@ def build_relation_dsl(
         spawn_kind, blueprint_name = _spawn_blueprint_for_category(category, subtype)
 
         spacing_m = 0.0
-        if category == "parked_vehicle" or expanded.get("density_role") == "curbside_row":
-            spacing_m = 6.0
+        sub = _slugify(subtype)
+        if (
+            expanded.get("density_role") == "curbside_row"
+            or "row" in sub
+            or sub in {"parked_cars", "parked_vehicle", "parked_vehicle_partial", "partial_parked_vehicle"}
+        ):
+            if sub in {"motorcycle", "motor_scooter", "scooter", "motorbike", "two_wheeler"}:
+                spacing_m = 2.5
+            elif sub in {"bicycle", "bike"}:
+                spacing_m = 1.5
+            else:
+                spacing_m = 6.0
         elif category == "pedestrian" and source_key == "background_traffic":
             spacing_m = 3.0
         elif category in STATIC_CATEGORIES:
@@ -1084,7 +1368,7 @@ def build_relation_dsl(
             {
                 "entity_id": expanded_id,
                 "group_id": expanded.get("id", expanded_id),
-                "source": "traffic_subject" if priority == "subject" else "background_traffic",
+                "source": "traffic_subject",
                 "priority": priority,
                 "category": category,
                 "subtype": subtype,
@@ -1099,8 +1383,12 @@ def build_relation_dsl(
                 "distance_band": distance_band,
                 "distance_order_rank": distance_order_rank,
                 "heading_relation": str(expanded.get("heading_relation_to_ego") or "unknown"),
-                "lane_side_relation": str(expanded.get("lane_side_relation") or "same_lane"),
+                "flow_compliance": _canonical_flow_compliance(expanded.get("flow_compliance")),
+                "lane_side_relation": lane_side_relation,
                 "motion_state": str(expanded.get("motion_state") or expanded.get("motion_bias") or "unknown"),
+                "turn_intent": _canonical_turn_intent(expanded.get("turn_intent")),
+                "layout_anchor_id": str(expanded.get("layout_anchor_id") or "").strip(),
+                "anchor_relation": _deep_copy(_coerce_dict(expanded.get("anchor_relation"))),
                 "group_instance_index": instance_index,
                 "group_instance_total": instance_total,
                 "group_spacing_m": spacing_m,
@@ -1146,6 +1434,8 @@ import os
 
 DISTANCE_BAND_METERS = {DISTANCE_BAND_METERS!r}
 LANE_WIDTH_METERS = {LANE_WIDTH_METERS!r}
+PARKING_LANE_WIDTH_METERS = {PARKING_LANE_WIDTH_METERS!r}
+TURN_INTENT_YAW_DEG = {TURN_INTENT_YAW_DEG!r}
 
 RELATION_DSL_PATH = {os.path.basename(relation_dsl_path)!r}
 OUTPUT_PATH = {os.path.basename(output_path)!r}
@@ -1155,6 +1445,15 @@ def _lane_width_for_class(name):
     return float(LANE_WIDTH_METERS.get(str(name or "standard"), 3.5))
 
 
+def _apply_turn_intent(yaw, turn_intent):
+    intent = str(turn_intent or "none").strip().lower()
+    if intent in ("left", "turn_left", "left_turn"):
+        return yaw - TURN_INTENT_YAW_DEG
+    if intent in ("right", "turn_right", "right_turn"):
+        return yaw + TURN_INTENT_YAW_DEG
+    return yaw
+
+
 def _normalize(vx, vy):
     length = math.hypot(vx, vy)
     if length <= 1e-6:
@@ -1162,19 +1461,72 @@ def _normalize(vx, vy):
     return vx / length, vy / length
 
 
-def _lane_anchor_offset(entity, lane_width):
+def _relation_side_sign(lane_side_relation):
+    return -1.0 if "left" in str(lane_side_relation or "") else 1.0
+
+
+def _parking_lane_count_for_relation(lane_side_relation, lane_context):
+    lane_roles = (lane_context or {{}}).get("lane_roles") or {{}}
+    relation = str(lane_side_relation or "")
+    if "left" in relation:
+        return int(lane_roles.get("left_parking_lane_count", 0) or 0)
+    if "right" in relation:
+        return int(lane_roles.get("right_parking_lane_count", 0) or 0)
+    return 0
+
+
+def _lane_index_from_relation(value):
+    relation = str(value or "").lower()
+    if relation in {{"", "same_lane", "crosswalk"}}:
+        return 0
+    if "right" in relation:
+        return 1
+    if "left" in relation or "opposing" in relation or "oncoming" in relation:
+        return -1
+    return 0
+
+
+def _canonical_lane_index(value, fallback_relation=None):
+    try:
+        return int(float(value))
+    except Exception:
+        return _lane_index_from_relation(fallback_relation)
+
+
+def _curbside_offset_for_lane_context(lane_side_relation, lane_width, lane_context=None):
+    side_sign = _relation_side_sign(lane_side_relation)
+    parking_lane_count = _parking_lane_count_for_relation(lane_side_relation, lane_context or {{}})
+    if parking_lane_count > 0:
+        return side_sign * (lane_width * 0.5 + PARKING_LANE_WIDTH_METERS * 0.5)
+    return side_sign * (lane_width * 0.5)
+
+
+def _lane_anchor_offset(entity, lane_width, lane_context=None):
     anchor = entity.get("lane_anchor")
-    lane_index = int(entity.get("lane_index_relation", 0))
+    lane_index = _canonical_lane_index(
+        entity.get("lane_index_relation"),
+        entity.get("lane_side_relation"),
+    )
     if anchor == "center_of_lane":
+        return lane_index * lane_width
+    if anchor == "lane_center":
         return lane_index * lane_width
     if anchor == "left_lane_center":
         return -lane_width + lane_index * lane_width
     if anchor == "right_lane_center":
         return lane_width + lane_index * lane_width
     if anchor == "left_curbside":
-        return -(lane_width * 1.5)
+        return _curbside_offset_for_lane_context(
+            entity.get("lane_side_relation") or "left_edge",
+            lane_width,
+            lane_context,
+        )
     if anchor == "right_curbside":
-        return lane_width * 1.5
+        return _curbside_offset_for_lane_context(
+            entity.get("lane_side_relation") or "right_edge",
+            lane_width,
+            lane_context,
+        )
     if anchor == "crosswalk_band":
         return 0.0
     if anchor == "sidewalk_band":
@@ -1220,11 +1572,12 @@ def main():
     anchor_x = float(start["x"])
     anchor_y = float(start["y"])
     anchor_z = float(start.get("z", 0.0))
+    lane_context = relation_dsl.get("lane_context") or {{}}
 
     entities = []
     for entity in relation_dsl.get("ego_relations") or relation_dsl.get("entities", []):
         longitudinal = _longitudinal_distance(entity)
-        lateral = _lane_anchor_offset(entity, lane_width)
+        lateral = _lane_anchor_offset(entity, lane_width, lane_context)
         base_x = anchor_x + forward_x * longitudinal + right_x * lateral
         base_y = anchor_y + forward_y * longitudinal + right_y * lateral
         heading_relation = str(entity.get("heading_relation") or "unknown")
@@ -1233,6 +1586,7 @@ def main():
             yaw = anchor_yaw + 180.0
         elif heading_relation == "crossing":
             yaw = anchor_yaw + 90.0
+        yaw = _apply_turn_intent(yaw, entity.get("turn_intent"))
 
         category = str(entity.get("category") or "car")
         if category in ("pedestrian",):
@@ -1256,6 +1610,8 @@ def main():
                 "lane_side_relation": entity.get("lane_side_relation"),
                 "heading_relation": heading_relation,
                 "road_id": entity.get("road_id"),
+                "layout_anchor_id": entity.get("layout_anchor_id"),
+                "anchor_relation": entity.get("anchor_relation"),
                 "appearance": entity.get("appearance"),
                 "location": {{"x": base_x, "y": base_y, "z": z}},
                 "rotation": {{"pitch": 0.0, "yaw": yaw, "roll": 0.0}},
@@ -1283,19 +1639,52 @@ def _initial_lane_width_for_class(name: Any) -> float:
     return float(LANE_WIDTH_METERS.get(str(name or "standard"), 3.5))
 
 
-def _initial_lane_anchor_offset(entity: Dict[str, Any], lane_width: float) -> float:
+def _curbside_offset_for_lane_context(
+    lane_side_relation: Any,
+    lane_width: float,
+    lane_context: Optional[Dict[str, Any]] = None,
+) -> float:
+    side_sign = _relation_side_sign(str(lane_side_relation or ""))
+    parking_lane_count = (
+        _parking_lane_count_for_relation(str(lane_side_relation or ""), lane_context or {})
+        if lane_context
+        else 0
+    )
+    if parking_lane_count > 0:
+        return side_sign * (lane_width * 0.5 + PARKING_LANE_WIDTH_METERS * 0.5)
+    return side_sign * (lane_width * 0.5)
+
+
+def _initial_lane_anchor_offset(
+    entity: Dict[str, Any],
+    lane_width: float,
+    lane_context: Optional[Dict[str, Any]] = None,
+) -> float:
     anchor = entity.get("lane_anchor")
-    lane_index = int(entity.get("lane_index_relation", 0))
+    lane_index = _canonical_lane_index(
+        entity.get("lane_index_relation"),
+        entity.get("lane_side_relation"),
+    )
     if anchor == "center_of_lane":
+        return lane_index * lane_width
+    if anchor == "lane_center":
         return lane_index * lane_width
     if anchor == "left_lane_center":
         return -lane_width + lane_index * lane_width
     if anchor == "right_lane_center":
         return lane_width + lane_index * lane_width
     if anchor == "left_curbside":
-        return -(lane_width * 1.5)
+        return _curbside_offset_for_lane_context(
+            entity.get("lane_side_relation") or "left_edge",
+            lane_width,
+            lane_context,
+        )
     if anchor == "right_curbside":
-        return lane_width * 1.5
+        return _curbside_offset_for_lane_context(
+            entity.get("lane_side_relation") or "right_edge",
+            lane_width,
+            lane_context,
+        )
     if anchor == "crosswalk_band":
         return 0.0
     if anchor == "sidewalk_band":
@@ -1332,6 +1721,7 @@ def generate_initial_coordinates_from_relation_dsl(
     start = _coerce_dict(anchor.get("start"))
     end = _coerce_dict(anchor.get("end"))
     lane_width = _initial_lane_width_for_class(relation_dsl.get("lane_width_class"))
+    lane_context = _coerce_dict(relation_dsl.get("lane_context"))
     forward_x, forward_y = _normalize_vector(
         float(end.get("x", 0.0)) - float(start.get("x", 0.0)),
         float(end.get("y", 0.0)) - float(start.get("y", 0.0)),
@@ -1346,15 +1736,23 @@ def generate_initial_coordinates_from_relation_dsl(
         relation_dsl.get("ego_relations") or relation_dsl.get("entities")
     ):
         longitudinal = _initial_longitudinal_distance(entity)
-        lateral = _initial_lane_anchor_offset(entity, lane_width)
+        heading_relation = str(entity.get("heading_relation") or "unknown")
+        if heading_relation == "opposite_direction" and _is_vehicle_like(
+            str(entity.get("category") or "")
+        ):
+            lateral = _opposing_carriageway_offset(
+                entity.get("lane_index_relation"), lane_width, lane_context
+            )
+        else:
+            lateral = _initial_lane_anchor_offset(entity, lane_width, lane_context)
         base_x = anchor_x + forward_x * longitudinal + right_x * lateral
         base_y = anchor_y + forward_y * longitudinal + right_y * lateral
-        heading_relation = str(entity.get("heading_relation") or "unknown")
         yaw = anchor_yaw
         if heading_relation == "opposite_direction":
             yaw = anchor_yaw + 180.0
         elif heading_relation == "crossing":
             yaw = anchor_yaw + 90.0
+        yaw = _apply_turn_intent(yaw, entity.get("turn_intent"))
 
         category = str(entity.get("category") or "car")
         if category in ("pedestrian",):
@@ -1375,9 +1773,16 @@ def generate_initial_coordinates_from_relation_dsl(
                 "spawn_kind": entity.get("spawn_kind"),
                 "blueprint_name": entity.get("blueprint_name"),
                 "motion_state": entity.get("motion_state"),
+                "turn_intent": _canonical_turn_intent(entity.get("turn_intent")),
+                "lane_anchor": entity.get("lane_anchor"),
+                "lane_index_relation": entity.get("lane_index_relation", 0),
                 "lane_side_relation": entity.get("lane_side_relation"),
                 "heading_relation": heading_relation,
+                "flow_compliance": _canonical_flow_compliance(entity.get("flow_compliance")),
+                "longitudinal_m": longitudinal,
                 "road_id": entity.get("road_id"),
+                "layout_anchor_id": entity.get("layout_anchor_id"),
+                "anchor_relation": _deep_copy(_coerce_dict(entity.get("anchor_relation"))),
                 "appearance": _deep_copy(entity.get("appearance")),
                 "location": {"x": base_x, "y": base_y, "z": z},
                 "rotation": {"pitch": 0.0, "yaw": yaw, "roll": 0.0},
@@ -1569,6 +1974,90 @@ def _project_point_to_segment(
     return sx + t * dx, sy + t * dy, t
 
 
+def _build_dense_waypoint_index(
+    dense_waypoints: List[Dict[str, Any]],
+) -> Dict[Tuple[int, int], List[Dict[str, Any]]]:
+    """Group dense waypoints by (road_id, lane_id) for O(1) lane lookup."""
+    index: Dict[Tuple[int, int], List[Dict[str, Any]]] = {}
+    for wp in dense_waypoints:
+        key = (int(wp.get("road_id", 0) or 0), int(wp.get("lane_id", 0) or 0))
+        index.setdefault(key, []).append(wp)
+    return index
+
+
+def _snap_entity_to_dense_waypoints(
+    entity: Dict[str, Any],
+    dense_index: Dict[Tuple[int, int], List[Dict[str, Any]]],
+    max_snap_distance_m: float = 8.0,
+) -> Dict[str, Any]:
+    """Snap z/yaw (and x/y for driving-lane entities) to the nearest dense waypoint.
+
+    Edge/sidewalk entities keep their offset-applied x/y but receive the road
+    surface z.  Driving-lane entities are moved to the nearest road point so
+    that curve geometry is respected.
+    """
+    projected_lane = entity.get("projected_lane") or {}
+    road_id = projected_lane.get("road_id")
+    lane_id = projected_lane.get("lane_id")
+    lane_side = str(entity.get("lane_side_relation") or "same_lane")
+    ex = float((entity.get("location") or {}).get("x", 0.0))
+    ey = float((entity.get("location") or {}).get("y", 0.0))
+
+    # Prefer exact road+lane match, then road-only, then all waypoints.
+    key = (int(road_id or 0), int(lane_id or 0))
+    candidates: List[Dict[str, Any]] = dense_index.get(key) or []
+    exact_lane_candidates = bool(candidates)
+    if not candidates and road_id is not None:
+        rid = int(road_id)
+        candidates = [wp for (r, _), wps in dense_index.items() if r == rid for wp in wps]
+    if not candidates:
+        candidates = [wp for wps in dense_index.values() for wp in wps]
+
+    best: Optional[Dict[str, Any]] = None
+    best_dist = float("inf")
+    for wp in candidates:
+        dist = math.sqrt((wp["x"] - ex) ** 2 + (wp["y"] - ey) ** 2)
+        if dist < best_dist:
+            best_dist = dist
+            best = wp
+
+    if best is None or best_dist > max_snap_distance_m:
+        return entity
+
+    snapped = dict(entity)
+    loc = dict(entity.get("location") or {})
+    rot = dict(entity.get("rotation") or {})
+
+    is_offset_entity = lane_side in {
+        "left_edge", "right_edge", "sidewalk_left", "sidewalk_right",
+    }
+    lane_index = _canonical_lane_index(
+        entity.get("lane_index_relation"),
+        entity.get("lane_side_relation"),
+    )
+    if lane_index != 0 and not exact_lane_candidates:
+        is_offset_entity = True
+    loc["z"] = max(float(best.get("z") or 0.3), 0.3)
+
+    if not is_offset_entity:
+        loc["x"] = float(best["x"])
+        loc["y"] = float(best["y"])
+        heading_relation = str(entity.get("heading_relation") or "unknown")
+        projected_lane = _coerce_dict(entity.get("projected_lane"))
+        lane_reversed = bool(projected_lane.get("reversed_to_anchor"))
+        road_yaw = float(best.get("yaw") or rot.get("yaw") or 0.0)
+        rot["yaw"] = _yaw_for_heading_relation(
+            road_yaw,
+            heading_relation,
+            lane_reversed=lane_reversed,
+            turn_intent=entity.get("turn_intent"),
+        )
+
+    snapped["location"] = loc
+    snapped["rotation"] = rot
+    return snapped
+
+
 def _entity_min_distance(entity: Dict[str, Any]) -> float:
     category = str(entity.get("category") or "")
     if category == "pedestrian":
@@ -1654,23 +2143,24 @@ def _vehicle_lateral_offset(
     entity: Dict[str, Any],
     lane_width: float,
     lane_context: Dict[str, Any],
-    topology_has_multiple_lanes: bool,
 ) -> float:
     lane_side_relation = str(entity.get("lane_side_relation") or "")
     if lane_side_relation in {"", "same_lane", "crosswalk"}:
         return 0.0
+
+    lane_index = _canonical_lane_index(
+        entity.get("lane_index_relation"),
+        entity.get("lane_side_relation"),
+    )
+    if _is_vehicle_like(str(entity.get("category") or "")):
+        return lane_index * lane_width
 
     side_sign = _relation_side_sign(lane_side_relation)
     parking_lane_count = _parking_lane_count_for_relation(lane_side_relation, lane_context)
     category = str(entity.get("category") or "")
 
     if lane_side_relation in {"left_edge", "right_edge"}:
-        if category == "parked_vehicle":
-            # Keep parked vehicles near the drivable edge instead of the geometric
-            # parking-lane center. In CARLA OpenDRIVE worlds, conservative edge
-            # placement is more stable than pushing them fully into the outer lane.
-            magnitude = lane_width * 0.5
-        elif parking_lane_count > 0:
+        if parking_lane_count > 0:
             magnitude = lane_width * 0.5 + PARKING_LANE_WIDTH_METERS * 0.5
         else:
             magnitude = lane_width * 0.5
@@ -1683,18 +2173,30 @@ def _vehicle_lateral_offset(
         magnitude += SIDEWALK_BUFFER_METERS
         return side_sign * magnitude
 
-    if topology_has_multiple_lanes:
-        return 0.0
-
     if lane_side_relation in {"left_lane", "right_lane"} or "opposing" in lane_side_relation:
         return side_sign * lane_width
+
+    # Fallback: any unrecognized curbside/parking relation still gets edge placement.
+    # This handles LLM-generated variants not yet in CANONICAL_LANE_SIDE_MAP.
+    if "curbside" in lane_side_relation or (
+        "parking" in lane_side_relation and lane_side_relation not in {"same_lane"}
+    ):
+        magnitude = lane_width * 0.5
+        return side_sign * magnitude
 
     return 0.0
 
 
 def _lane_is_reversed(lane: Dict[str, Any], anchor_lane: Dict[str, Any]) -> bool:
-    lane_yaw = float((_coerce_dict(lane.get("start"))).get("yaw", 0.0) or 0.0)
-    anchor_yaw = float((_coerce_dict(anchor_lane.get("start"))).get("yaw", 0.0) or 0.0)
+    """Return True when lane travels in roughly the opposite direction to anchor_lane.
+
+    Used to detect when an entity has been placed on an opposing lane whose yaw is
+    already reversed relative to the ego direction.  In that case the
+    heading_relation_to_ego must be interpreted in the frame of that lane, not the
+    anchor frame, to avoid a double 180° flip.
+    """
+    lane_yaw = float((lane.get("start") or {}).get("yaw", 0.0) or 0.0)
+    anchor_yaw = float((anchor_lane.get("start") or {}).get("yaw", 0.0) or 0.0)
     diff = abs(((lane_yaw - anchor_yaw + 180.0) % 360.0) - 180.0)
     return diff > 90.0
 
@@ -1704,18 +2206,59 @@ def _yaw_for_heading_relation(
     heading_relation: Any,
     *,
     lane_reversed: bool = False,
+    turn_intent: Any = None,
 ) -> float:
+    """Resolve actor yaw in the selected lane's frame.
+
+    If the selected lane already points opposite the ego lane, its waypoint yaw
+    already represents oncoming traffic.  Applying another 180 degree turn would
+    flip the actor back to ego direction.
+
+    A ``turn_intent`` (left/right) further deflects the resolved heading toward
+    the junction branch the actor is entering, so a vehicle captured mid-turn no
+    longer renders as if it were following its lane straight through.
+    """
     relation = str(heading_relation or "unknown")
     yaw = float(road_yaw)
     if relation == "crossing":
-        return yaw + 90.0
+        return _apply_turn_intent(yaw + 90.0, turn_intent)
     if lane_reversed:
         if relation == "same_direction":
-            return yaw + 180.0
-        return yaw
+            return _apply_turn_intent(yaw + 180.0, turn_intent)
+        return _apply_turn_intent(yaw, turn_intent)
     if relation == "opposite_direction":
-        return yaw + 180.0
-    return yaw
+        return _apply_turn_intent(yaw + 180.0, turn_intent)
+    return _apply_turn_intent(yaw, turn_intent)
+
+
+def _opposing_carriageway_offset(
+    lane_index: Any,
+    lane_width: float,
+    lane_context: Optional[Dict[str, Any]] = None,
+) -> float:
+    """Lateral offset (road frame, left negative) onto the opposing carriageway.
+
+    Oncoming vehicles must clear *all* of ego's same-direction lanes plus the
+    center median before landing in the opposing lanes, otherwise a naive
+    ``lane_index * lane_width`` offset leaves them in an adjacent same-direction
+    lane. We deliberately cross the full forward-lane count (worst case: ego in
+    the rightmost forward lane) so the seed is always on the far side of the
+    divider; runtime lane projection then snaps to the nearest real opposing
+    lane. ``lane_index`` selects which opposing lane (clamped to the count).
+    """
+    roles = _coerce_dict((lane_context or {}).get("lane_roles"))
+    forward_lane_count = max(1, int(roles.get("forward_lane_count", 1) or 1))
+    opposing_lane_count = max(1, int(roles.get("opposing_lane_count", 1) or 1))
+    has_center_median = bool(roles.get("has_center_median"))
+    opposing_index = min(max(1, abs(_canonical_lane_index(lane_index)) or 1), opposing_lane_count)
+    if has_center_median:
+        # Divided road: clear every same-direction lane (worst case: ego in the
+        # rightmost forward lane) plus the median before entering the opposing lanes.
+        steps = forward_lane_count + MEDIAN_GAP_LANE_EQUIV + (opposing_index - 0.5)
+    else:
+        # Undivided road: the opposing lanes sit directly to ego's left.
+        steps = opposing_index
+    return -steps * float(lane_width)
 
 
 def _project_vehicle_entity(
@@ -1723,7 +2266,6 @@ def _project_vehicle_entity(
     lane: Dict[str, Any],
     lane_width: float,
     lane_context: Dict[str, Any],
-    topology_has_multiple_lanes: bool,
     anchor_lane: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     projected = _deep_copy(entity)
@@ -1740,17 +2282,44 @@ def _project_vehicle_entity(
         road_yaw,
         heading_relation,
         lane_reversed=lane_reversed,
+        turn_intent=entity.get("turn_intent"),
     )
 
-    offset = _vehicle_lateral_offset(
-        entity,
-        lane_width,
-        lane_context,
-        topology_has_multiple_lanes,
+    # Prefer lane_anchor-based offset (same formula used in initial coordinate
+    # generation) so the two stages stay consistent. Fall back to the
+    # lane_side_relation heuristic when lane_anchor was not propagated.
+    if entity.get("lane_anchor"):
+        offset = _initial_lane_anchor_offset(entity, lane_width, lane_context)
+    else:
+        offset = _vehicle_lateral_offset(entity, lane_width, lane_context)
+    lane_index = _canonical_lane_index(
+        entity.get("lane_index_relation"),
+        entity.get("lane_side_relation"),
     )
+    if (
+        _is_vehicle_like(str(entity.get("category") or ""))
+        and lane_index != 0
+        and int(lane.get("lane_id", 0) or 0)
+        != int((anchor_lane or {}).get("lane_id", 0) or 0)
+    ):
+        offset = 0.0
+    # Oncoming vehicle that fell back to the ego-lane frame (no real opposing lane
+    # in the topology sample): push it across the median onto the opposing
+    # carriageway. When a real opposing lane was selected instead, lane_id differs
+    # from the anchor and the offset is already zeroed just above. lane_reversed is
+    # False here (lane == anchor), so _yaw_for_heading_relation keeps the flip.
+    if (
+        heading_relation == "opposite_direction"
+        and _is_vehicle_like(str(entity.get("category") or ""))
+        and int(lane.get("lane_id", 0) or 0)
+        == int((anchor_lane or {}).get("lane_id", 0) or 0)
+    ):
+        offset = _opposing_carriageway_offset(lane_index, lane_width, lane_context)
     if abs(offset) > 1e-6:
         # Keep lane-side semantics in the road frame rather than the actor frame.
         # Otherwise an oncoming vehicle would flip left/right when its yaw is reversed.
+        # road_yaw + 90 is the rightward perpendicular in CARLA's coordinate system
+        # (x=east, y=south, yaw clockwise): right = (-sin yaw, cos yaw) = yaw+90 direction.
         normal_yaw = math.radians(road_yaw + 90.0)
         px += math.cos(normal_yaw) * offset
         py += math.sin(normal_yaw) * offset
@@ -1791,7 +2360,8 @@ def _project_static_entity(entity: Dict[str, Any], lane: Dict[str, Any], lane_wi
     )[:2]
     side = -1.0 if "left" in str(entity.get("lane_side_relation") or "") else 1.0
     normal_yaw = math.radians(float(lane["start"].get("yaw", 0.0)) + 90.0)
-    offset = side * (lane_width * 0.9)
+    # Use 1.5× lane_width so cones land at the road edge/shoulder, not inside the adjacent lane.
+    offset = side * (lane_width * 1.5)
     px += math.cos(normal_yaw) * offset
     py += math.sin(normal_yaw) * offset
     projected["location"] = {"x": px, "y": py, "z": 0.5}
@@ -1948,6 +2518,8 @@ def validate_pairwise_relations(
 def _lane_legality_for_entity(entity: Dict[str, Any], lane_context: Dict[str, Any]) -> Tuple[bool, str]:
     category = str(entity.get("category") or "")
     relation = str(entity.get("lane_side_relation") or "")
+    if category in VEHICLE_CATEGORIES:
+        return True, "driving"
     allowed_actor_types = _coerce_dict(lane_context.get("allowed_actor_types"))
     lane_catalog = _coerce_dict(lane_context.get("lane_catalog"))
     catalog_entry = _coerce_dict(lane_catalog.get(relation))
@@ -1956,36 +2528,213 @@ def _lane_legality_for_entity(entity: Dict[str, Any], lane_context: Dict[str, An
     return category in allowed, role
 
 
-def project_entities_to_xodr(
+def _enrich_topology_sample(
+    topology_sample: List[Dict[str, Any]],
+    anchor_lane: Dict[str, Any],
+    lane_width: float,
+) -> List[Dict[str, Any]]:
+    """Append synthetic opposing and right-adjacent lane entries derived from anchor_lane.
+
+    These are only used when no real topology segment matches an entity's semantic lane.
+    Entries are tagged with _synthetic=True for debugging transparency.
+    """
+    anchor_road_id = int(anchor_lane.get("road_id", 0) or 0)
+    anchor_lane_id = int(anchor_lane.get("lane_id", -1) or -1)
+    existing_ids = {
+        (int(l.get("road_id", 0) or 0), int(l.get("lane_id", 0) or 0))
+        for l in topology_sample
+    }
+
+    start = _coerce_dict(anchor_lane.get("start"))
+    end = _coerce_dict(anchor_lane.get("end"))
+    yaw = float(start.get("yaw", 0.0) or 0.0)
+    normal_rad = math.radians(yaw + 90.0)
+    nx = math.cos(normal_rad)
+    ny = math.sin(normal_rad)
+
+    result = list(topology_sample)
+
+    def add_synthetic_lane(lane_id: int, lateral_steps: int, yaw_value: float, reverse: bool = False) -> None:
+        if (anchor_road_id, lane_id) in existing_ids:
+            return
+        start_base = end if reverse else start
+        end_base = start if reverse else end
+        result.append({
+            "road_id": anchor_road_id,
+            "lane_id": lane_id,
+            "start": {
+                "x": float(start_base.get("x", 0.0)) + nx * lane_width * lateral_steps,
+                "y": float(start_base.get("y", 0.0)) + ny * lane_width * lateral_steps,
+                "z": float(start_base.get("z", 0.0)),
+                "yaw": yaw_value,
+                "is_junction": False,
+            },
+            "end": {
+                "x": float(end_base.get("x", 0.0)) + nx * lane_width * lateral_steps,
+                "y": float(end_base.get("y", 0.0)) + ny * lane_width * lateral_steps,
+                "z": float(end_base.get("z", 0.0)),
+                "yaw": yaw_value,
+                "is_junction": False,
+            },
+            "_synthetic": True,
+        })
+
+    opposing_lane_id = -anchor_lane_id
+    if (anchor_road_id, opposing_lane_id) not in existing_ids:
+        opp_yaw = (yaw + 180.0) % 360.0
+        add_synthetic_lane(opposing_lane_id, -1, opp_yaw, reverse=True)
+
+    right_lane_id = anchor_lane_id + (-1 if anchor_lane_id < 0 else 1)
+    if (anchor_road_id, right_lane_id) not in existing_ids:
+        add_synthetic_lane(right_lane_id, 1, yaw)
+
+    return result
+
+
+def _target_lane_id_for_index(anchor_lane_id: int, lane_index: int) -> int:
+    if lane_index == 0:
+        return anchor_lane_id
+    anchor_sign = -1 if anchor_lane_id < 0 else 1
+    if lane_index > 0:
+        return anchor_lane_id + anchor_sign * lane_index
+    opposite_sign = -anchor_sign
+    return opposite_sign * (abs(lane_index) or 1)
+
+
+def _select_semantic_lane(
+    entity: Dict[str, Any],
+    topology_sample: List[Dict[str, Any]],
+    anchor_lane: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Return the topology segment best matching the entity's lane_side_relation.
+
+    Prefers a real segment from topology_sample (including synthetic entries added by
+    _enrich_topology_sample) over pure geometric nearest-neighbour selection.
+    Falls back to anchor_lane when no semantic match is found; the lateral offset from
+    _vehicle_lateral_offset then handles the correct lateral displacement.
+    """
+    lane_side = str(entity.get("lane_side_relation") or "same_lane")
+    lane_index = _canonical_lane_index(
+        entity.get("lane_index_relation"),
+        lane_side,
+    )
+    anchor_road_id = int(anchor_lane.get("road_id", 0) or 0)
+    anchor_lane_id = int(anchor_lane.get("lane_id", -1) or -1)
+
+    # Drop lanes that are implausibly far from the anchor (e.g. the synthetic
+    # fallback lane at the map origin that can leak into a real topology_sample).
+    # Matching an actor to such a lane teleports it ~100m+ off the scene; the
+    # anchor itself is always retained so callers still have a safe default.
+    anchor_start = _coerce_dict(anchor_lane.get("start"))
+    ax = float(anchor_start.get("x", 0.0) or 0.0)
+    ay = float(anchor_start.get("y", 0.0) or 0.0)
+
+    def _is_local_lane(lane: Dict[str, Any]) -> bool:
+        s = _coerce_dict(lane.get("start"))
+        return (
+            math.hypot(float(s.get("x", 0.0) or 0.0) - ax, float(s.get("y", 0.0) or 0.0) - ay)
+            <= MAX_LOCAL_LANE_DISTANCE_M
+        )
+
+    topology_sample = [
+        lane for lane in topology_sample if lane is anchor_lane or _is_local_lane(lane)
+    ]
+
+    # Entities that stay on the ego lane use the anchor directly.
+    if lane_side in {"crosswalk", "", "sidewalk_left", "sidewalk_right"}:
+        return anchor_lane
+    if lane_index == 0:
+        return anchor_lane
+    # Oncoming vehicles: prefer a real opposing (reversed) lane from topology when
+    # one is known. Otherwise fall back to the ego-lane frame so
+    # _project_vehicle_entity can push the seed across the median onto the opposing
+    # carriageway and let runtime lane projection snap it to a real lane. The
+    # fallback is essential on divided roads where the opposing carriageway is a
+    # separate road that never appears in the local topology sample.
+    if (
+        str(entity.get("heading_relation") or "") == "opposite_direction"
+        and _is_vehicle_like(str(entity.get("category") or ""))
+    ):
+        anchor_yaw = float(_coerce_dict(anchor_lane.get("start")).get("yaw", 0.0) or 0.0)
+        for lane in topology_sample:
+            if lane.get("_synthetic"):
+                continue
+            r = int(lane.get("road_id", -9999) or -9999)
+            l = int(lane.get("lane_id", 0) or 0)
+            if l == 0:
+                continue
+            ly = float(_coerce_dict(lane.get("start")).get("yaw", 0.0) or 0.0)
+            reversed_heading = abs(((ly - anchor_yaw + 180.0) % 360.0) - 180.0) > 135.0
+            same_road_opposite_sign = r == anchor_road_id and l * anchor_lane_id < 0
+            if same_road_opposite_sign or reversed_heading:
+                return lane
+        return anchor_lane
+
+    target_id = _target_lane_id_for_index(anchor_lane_id, lane_index)
+    for lane in topology_sample:
+        r = int(lane.get("road_id", -9999) or -9999)
+        l = int(lane.get("lane_id", 0) or 0)
+        if r == anchor_road_id and l == target_id:
+            return lane
+
+    # Opposing or left_lane: look for opposite-sign lane_id on the same road first,
+    # then fall back to a heading-based search (>135° yaw difference).
+    if lane_index == -1 and ("opposing" in lane_side or lane_side == "left_lane"):
+        for lane in topology_sample:
+            r = int(lane.get("road_id", -9999) or -9999)
+            l = int(lane.get("lane_id", 0) or 0)
+            if r == anchor_road_id and l != 0 and l * anchor_lane_id < 0:
+                return lane
+        anchor_yaw = float((anchor_lane.get("start") or {}).get("yaw", 0.0) or 0.0)
+        for lane in topology_sample:
+            if lane is anchor_lane:
+                continue
+            ly = float((lane.get("start") or {}).get("yaw", 0.0) or 0.0)
+            if abs(((ly - anchor_yaw + 180) % 360) - 180) > 135:
+                return lane
+        return anchor_lane
+
+    # Right adjacent lane: same road, lane_id one step more negative.
+    if lane_index == 1 and lane_side == "right_lane":
+        target_id = _target_lane_id_for_index(anchor_lane_id, lane_index)
+        for lane in topology_sample:
+            r = int(lane.get("road_id", -9999) or -9999)
+            l = int(lane.get("lane_id", 0) or 0)
+            if r == anchor_road_id and l == target_id:
+                return lane
+        return anchor_lane
+
+    return anchor_lane
+
+
+def project_entities_to_carla_context(
     raw_coordinates: Dict[str, Any],
     scene_understanding: Dict[str, Any],
     spawn_context: Optional[Dict[str, Any]],
 ) -> Dict[str, Any]:
+    # Prefer dense local waypoints pre-sampled after map matching (higher accuracy).
+    # Fall back to the coarse topology_sample when dense data is not available.
+    dense_local_waypoints = _coerce_list(
+        (spawn_context or {}).get("dense_local_waypoints")
+    )
     topology_sample = _coerce_list((spawn_context or {}).get("topology_sample"))
     fallback_lane = select_anchor_lane(spawn_context)
     lane_context = _lane_context(scene_understanding, fallback_lane)
     lane_groups = _coerce_list(scene_understanding.get("road_network", {}).get("lane_groups"))
     lane_width_class = str((lane_groups[0] if lane_groups else {}).get("lane_width_class") or "standard")
     lane_width = float(LANE_WIDTH_METERS.get(lane_width_class, 3.5))
-    topology_has_multiple_lanes = _topology_has_multiple_lanes(topology_sample)
+    topology_sample = _enrich_topology_sample(topology_sample, fallback_lane, lane_width)
 
     projected_entities = []
     for entity in _coerce_list(raw_coordinates.get("entities")):
-        lane = _closest_lane(entity.get("location", {}), topology_sample, fallback_lane)
+        lane = _select_semantic_lane(entity, topology_sample, fallback_lane)
         category = str(entity.get("category") or "")
         if category == "pedestrian":
             projected = _project_pedestrian_entity(entity, lane, lane_width)
         elif category in STATIC_CATEGORIES:
             projected = _project_static_entity(entity, lane, lane_width)
         else:
-            projected = _project_vehicle_entity(
-                entity,
-                lane,
-                lane_width,
-                lane_context,
-                topology_has_multiple_lanes,
-                fallback_lane,
-            )
+            projected = _project_vehicle_entity(entity, lane, lane_width, lane_context, fallback_lane)
         projected["projected_lane"] = {
             "road_id": lane.get("road_id"),
             "lane_id": lane.get("lane_id"),
@@ -1993,17 +2742,30 @@ def project_entities_to_xodr(
             "reversed_to_anchor": bool(
                 fallback_lane and _lane_is_reversed(lane, fallback_lane)
             ),
+            "_synthetic": bool(lane.get("_synthetic")),
         }
         projected_entities.append(projected)
 
     projected_entities = _resolve_collisions(projected_entities)
+
+    # Post-processing: snap z/yaw (and x/y for driving-lane entities) to the
+    # nearest dense waypoint so that road surface height and curve tangent
+    # direction are accurate.
+    if dense_local_waypoints:
+        dense_index = _build_dense_waypoint_index(dense_local_waypoints)
+        projected_entities = [
+            _snap_entity_to_dense_waypoints(e, dense_index)
+            for e in projected_entities
+        ]
+
     return {
         "selected_anchor_lane": raw_coordinates.get("selected_anchor_lane", fallback_lane),
         "entities": projected_entities,
         "metadata": {
             **_coerce_dict(raw_coordinates.get("metadata")),
-            "projection_version": "xodr-projection-v1",
+            "projection_version": "carla-context-projection-v2",
             "coordinate_stage": "projected",
+            "dense_waypoints_used": bool(dense_local_waypoints),
         },
     }
 
@@ -2115,6 +2877,8 @@ def validate_relation_layout(
         or relation_dsl.get("selected_anchor_lane")
     )
     lane_context = _coerce_dict(relation_dsl.get("lane_context"))
+    lane_width_class = str(relation_dsl.get("lane_width_class") or "standard")
+    lane_width_m = float(LANE_WIDTH_METERS.get(lane_width_class, LANE_WIDTH_METERS["standard"]))
 
     ego_results = []
     lane_results = []
@@ -2128,19 +2892,27 @@ def validate_relation_layout(
         longitudinal, lateral = _relative_metrics(entity, anchor_lane)
         expected_longitudinal = _expected_longitudinal_scalar(ego_relation)
         expected_lateral_band = _expected_lateral_band(ego_relation)
+        expected_lateral_m = expected_lateral_band * lane_width_m
+        lateral_error_m = lateral - expected_lateral_m
         longitudinal_ok = abs(longitudinal - expected_longitudinal) <= max(
             2.5,
             float(ego_relation.get("group_spacing_m") or 0.0) + 1.0,
         )
-        lateral_ok = abs((lateral / 3.5) - expected_lateral_band) <= 0.8
+        lateral_ok = abs(lateral_error_m) <= max(1.0, lane_width_m * 0.8)
         ego_results.append(
             {
                 "entity_id": ego_relation.get("entity_id"),
                 "status": "pass" if longitudinal_ok and lateral_ok else "fail",
+                "lane_side_relation": ego_relation.get("lane_side_relation"),
+                "lane_index_relation": ego_relation.get("lane_index_relation"),
                 "longitudinal_check": longitudinal_ok,
                 "lateral_check": lateral_ok,
                 "actual_longitudinal_m": round(longitudinal, 3),
                 "expected_longitudinal_m": round(expected_longitudinal, 3),
+                "actual_lateral_m": round(lateral, 3),
+                "expected_lateral_band": round(expected_lateral_band, 3),
+                "expected_lateral_m": round(expected_lateral_m, 3),
+                "lateral_error_m": round(lateral_error_m, 3),
             }
         )
         lane_ok, role = _lane_legality_for_entity(entity, lane_context)
@@ -2175,8 +2947,11 @@ def validate_relation_layout(
         "pairwise_results": pairwise_validation["pairwise_results"],
         "lane_results": lane_results,
         "unresolved_conflicts": unresolved_conflicts,
+        "lane_context": lane_context,
+        "lane_width_m": lane_width_m,
         "metadata": {
             "validation_version": "relation-layout-validation-v1",
+            "lane_width_class": lane_width_class,
         },
     }
 
@@ -2203,30 +2978,779 @@ def preferred_vehicle_color(entity: Dict[str, Any]) -> Optional[str]:
     return None
 
 
+def _anchor_frame_from_coordinates(
+    projected_coordinates: Dict[str, Any],
+) -> Optional[Tuple[float, float, float, float, float]]:
+    anchor_lane = _coerce_dict(projected_coordinates.get("selected_anchor_lane"))
+    start = _coerce_dict(anchor_lane.get("start"))
+    end = _coerce_dict(anchor_lane.get("end"))
+    if not start or not end:
+        return None
+    sx = float(start.get("x", 0.0) or 0.0)
+    sy = float(start.get("y", 0.0) or 0.0)
+    ex = float(end.get("x", sx) or sx)
+    ey = float(end.get("y", sy) or sy)
+    fx, fy = _normalize_vector(ex - sx, ey - sy)
+    yaw = math.degrees(math.atan2(fy, fx))
+    return fx, fy, -fy, fx, yaw
+
+
+def _apply_curb_row_alignment(projected_coordinates: Dict[str, Any]) -> Dict[str, Any]:
+    """Keep representative curbside rows parallel to the road edge."""
+    updated = _deep_copy(projected_coordinates)
+    frame = _anchor_frame_from_coordinates(updated)
+    if frame is None:
+        return updated
+    forward_x, forward_y, right_x, right_y, anchor_yaw = frame
+    entities = _coerce_list(updated.get("entities"))
+    groups: Dict[Tuple[str, str], List[Dict[str, Any]]] = {}
+    for entity in entities:
+        if not _is_vehicle_like(str(entity.get("category") or "")):
+            continue
+        lane_index = int(entity.get("lane_index_relation", 0) or 0)
+        if lane_index == 0:
+            continue
+        group_id = str(entity.get("group_id") or entity.get("source_id") or entity.get("id") or "")
+        group_key = group_id.rsplit("_", 1)[0] if "_" in group_id else group_id
+        groups.setdefault((group_key, str(lane_index)), []).append(entity)
+
+    for (_group_key, _lane_index), row_entities in groups.items():
+        if len(row_entities) < 2:
+            continue
+        row_entities.sort(
+            key=lambda item: (
+                float(_coerce_dict(item.get("location")).get("x", 0.0)) * forward_x
+                + float(_coerce_dict(item.get("location")).get("y", 0.0)) * forward_y
+            )
+        )
+        first_location = _coerce_dict(row_entities[0].get("location"))
+        base_x = float(first_location.get("x", 0.0) or 0.0)
+        base_y = float(first_location.get("y", 0.0) or 0.0)
+        lateral_values = [
+            float(_coerce_dict(item.get("location")).get("x", 0.0)) * right_x
+            + float(_coerce_dict(item.get("location")).get("y", 0.0)) * right_y
+            for item in row_entities
+        ]
+        lateral_center = sum(lateral_values) / len(lateral_values)
+        base_longitudinal = base_x * forward_x + base_y * forward_y
+        base_lateral = (
+            base_x * right_x + base_y * right_y
+            if abs(lateral_center) <= 1e-6
+            else lateral_center
+        )
+        for index, entity in enumerate(row_entities):
+            sub = _slugify(str(entity.get("subtype") or ""))
+            row_spacing = (
+                2.5 if sub in {"motorcycle", "motor_scooter", "scooter", "motorbike", "two_wheeler"}
+                else 1.5 if sub in {"bicycle", "bike"}
+                else 5.5
+            )
+            longitudinal = base_longitudinal + index * row_spacing
+            location = entity.setdefault("location", {})
+            location["x"] = forward_x * longitudinal + right_x * base_lateral
+            location["y"] = forward_y * longitudinal + right_y * base_lateral
+            rotation = entity.setdefault("rotation", {})
+            rotation["pitch"] = float(rotation.get("pitch", 0.0) or 0.0)
+            projected_lane = _coerce_dict(entity.get("projected_lane"))
+            road_yaw = float(projected_lane.get("yaw", anchor_yaw) or anchor_yaw)
+            rotation["yaw"] = _yaw_for_heading_relation(
+                road_yaw,
+                entity.get("heading_relation"),
+                lane_reversed=bool(projected_lane.get("reversed_to_anchor")),
+                turn_intent=entity.get("turn_intent"),
+            )
+            rotation["roll"] = float(rotation.get("roll", 0.0) or 0.0)
+    return updated
+
+
+# ---------------------------------------------------------------------------
+# Ego lane indexing helpers
+# ---------------------------------------------------------------------------
+
+_GORE_KEYWORDS = ("gore", "shoulder", "merge", "ramp", "diverge", "buffer")
+
+
+def _scene_has_center_median(scene_understanding: Dict[str, Any]) -> bool:
+    """True when a reliable left boundary (center median / divider) is present.
+
+    A center median makes the left side of ego's carriageway a hard boundary,
+    so the left-neighbour count is the trustworthy anchor for ego's lane.
+    """
+    road_network = _coerce_dict(scene_understanding.get("road_network"))
+    directionality = str(road_network.get("directionality") or "").lower()
+    if any(
+        token in directionality
+        for token in (
+            "not_median",
+            "not median",
+            "no_median",
+            "no median",
+            "without_median",
+            "without median",
+            "lane_markings_not_median",
+            "markings_not_median",
+            "painted_only",
+        )
+    ):
+        return False
+    if "divided" in directionality:
+        return True
+    for area in _coerce_list(road_network.get("special_road_areas")):
+        if not isinstance(area, dict):
+            continue
+        if area.get("presence") is False or area.get("visible") is False:
+            continue
+        area_type = str(area.get("type") or "").lower()
+        if any(token in area_type for token in ("median", "divider", "barrier")):
+            return True
+    cues = _coerce_dict(_coerce_dict(scene_understanding.get("metadata")).get("decisive_map_matching_cues"))
+    return cues.get("has_center_median") is True
+
+
+def _scene_forward_lane_count(scene_understanding: Dict[str, Any]) -> int:
+    lane_groups = _coerce_list(
+        _coerce_dict(scene_understanding.get("road_network")).get("lane_groups")
+    )
+    if not lane_groups:
+        return 0
+    try:
+        return int(_coerce_dict(lane_groups[0]).get("forward_lane_count", 0) or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _is_gore_subject(entity: Dict[str, Any]) -> bool:
+    """True for subjects in gore/shoulder/merge/ramp areas that report phantom outer lanes."""
+    text = " ".join(
+        str(entity.get(key) or "") for key in ("lane_side_relation", "evidence")
+    ).lower()
+    return any(keyword in text for keyword in _GORE_KEYWORDS)
+
+
+def _infer_ego_lane_offset(
+    scene_understanding: Dict[str, Any],
+    forward_lane_count: Optional[int] = None,
+) -> int:
+    """Return how many same-direction driving lanes are to ego's right.
+
+    In CARLA right-hand traffic lane_id=-1 is the innermost forward lane (next
+    to the centre line); magnitude grows toward the curb, so the rightmost
+    driving lane has the LARGEST |lane_id| (-2, -3, …).  This value is fed to
+    ``_find_lane_in_dense`` where offset 0 selects the rightmost (largest |id|)
+    lane and offset N-1 the leftmost (|id|=1) forward lane.
+
+    Rather than blindly taking the maximum positive ``lane_index_relation``
+    (which a single gore/merge-area actor can inflate, pushing ego an entire
+    lane off — see results/auto_result_20260617_220440), the offset is
+    reconciled with the forward lane count and the left/right neighbour counts:
+
+    * Only same-direction subjects count — opposing traffic sits across the
+      median and must never inflate the lane span.
+    * Subjects in gore / shoulder / merge / ramp areas (or longitudinally
+      "alongside") are dropped — they routinely report phantom outer lanes.
+    * When a center median bounds ego on the left, the left-neighbour count L
+      is the reliable anchor: ``offset = (N - 1) - L``. Otherwise the
+      right-neighbour count R is used. Both are clamped into ``[0, N-1]``.
+    * When the forward lane count is unknown, fall back to the legacy
+      max-right behaviour (clamped only at 0).
+    """
+    if forward_lane_count is None:
+        forward_lane_count = _scene_forward_lane_count(scene_understanding)
+    n = int(forward_lane_count or 0)
+
+    max_left = 0
+    max_right = 0
+    for entity in _coerce_list(scene_understanding.get("traffic_subjects")):
+        if not isinstance(entity, dict):
+            continue
+        heading = str(entity.get("heading_relation_to_ego") or "").lower()
+        if heading and heading != "same_direction":
+            continue
+        if entity.get("longitudinal_relation") == "alongside":
+            continue
+        if _is_gore_subject(entity):
+            continue
+        try:
+            idx = int(entity.get("lane_index_relation"))
+        except (TypeError, ValueError):
+            continue
+        if idx > max_right:
+            max_right = idx
+        if -idx > max_left:
+            max_left = -idx
+
+    if n <= 0:
+        # No reliable lane count — preserve legacy behaviour.
+        heuristic = max(0, max_right)
+    else:
+        offset = (
+            (n - 1) - max_left
+            if _scene_has_center_median(scene_understanding)
+            else max_right
+        )
+        heuristic = max(0, min(n - 1, offset))
+
+    # Prefer an explicit VLM/map ego-lane estimate when present. The
+    # same-direction-only heuristic is still useful as a fallback, but in sparse
+    # junction images there may be no same-direction actors to support the ego
+    # lane, and forcing min(explicit, heuristic) collapses ego back to the
+    # rightmost lane even when the scene understanding says otherwise.
+    explicit = _coerce_dict(
+        _coerce_dict(scene_understanding.get("metadata")).get("ego_localization")
+    ).get("ego_lane_from_right")
+    if explicit is None:
+        explicit = _coerce_dict(
+            _coerce_dict(scene_understanding.get("road_network")).get("map_matching")
+        ).get("ego_lane_from_right")
+    if explicit is not None:
+        try:
+            explicit_offset = int(explicit)
+        except (TypeError, ValueError):
+            explicit_offset = None
+        if explicit_offset is not None and explicit_offset >= 0:
+            if n > 0:
+                explicit_offset = max(0, min(n - 1, explicit_offset))
+            return explicit_offset
+
+    return heuristic
+
+
+def _find_lane_in_dense(
+    candidate_lane: Dict[str, Any],
+    lane_offset: int,
+    dense_wps: List[Dict[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    """Find the waypoint for ego's target lane within dense_local_waypoints.
+
+    Filters to the same carriageway (same lane_id sign as the anchor) on
+    candidate_lane's road, de-duplicates by lane_id keeping the waypoint closest
+    to candidate_lane.start, then selects the lane at position lane_offset from
+    the rightmost — the lane with the LARGEST |lane_id| (curb side), not -1.
+
+    Returns a waypoint dict {x, y, z, yaw, road_id, lane_id, ...} or None.
+    """
+    road_id = candidate_lane.get("road_id")
+    start = candidate_lane.get("start") or {}
+    cx = float(start.get("x", 0.0))
+    cy = float(start.get("y", 0.0))
+
+    # Ego must stay on the SAME carriageway the matcher chose as the anchor.
+    # CARLA lane_id sign encodes driving direction, but which sign is the
+    # driving direction depends on the road's reference-line orientation: it is
+    # NOT always negative. Filtering on a hard-coded ``lane_id < 0`` flips ego
+    # 180° (and onto the opposing carriageway) whenever the matcher anchored on
+    # a positive-id lane — the junction then ends up behind ego. Derive the
+    # driving-direction sign from the anchor lane instead.
+    try:
+        anchor_lane_id = int(candidate_lane.get("lane_id"))
+    except (TypeError, ValueError):
+        anchor_lane_id = -1  # legacy default: driving lanes are negative ids
+    anchor_sign = 1 if anchor_lane_id > 0 else -1
+
+    # Keep only same-direction (same lane_id sign as the anchor) lanes on this
+    # road. dense_local_waypoints is BFS-sampled over Driving lanes only, so no
+    # shoulder/parking lane can slip in here.
+    same_road = [
+        wp for wp in dense_wps
+        if wp.get("road_id") == road_id and isinstance(wp.get("lane_id"), int)
+        and wp["lane_id"] != 0
+        and (1 if wp["lane_id"] > 0 else -1) == anchor_sign
+    ]
+    if not same_road:
+        return None
+
+    # De-duplicate: for each lane_id keep the closest waypoint to current start.
+    best_by_lane: Dict[int, Dict[str, Any]] = {}
+    for wp in same_road:
+        lid = wp["lane_id"]
+        dx = wp.get("x", 0.0) - cx
+        dy = wp.get("y", 0.0) - cy
+        dist = math.hypot(dx, dy)
+        if lid not in best_by_lane or dist < math.hypot(
+            best_by_lane[lid].get("x", 0.0) - cx,
+            best_by_lane[lid].get("y", 0.0) - cy,
+        ):
+            best_by_lane[lid] = wp
+
+    # Sort rightmost-first. In OpenDRIVE/CARLA lane_id magnitude grows OUTWARD
+    # from the reference line: |id|=1 is the innermost lane (next to the centre /
+    # opposing traffic) and the largest |id| is the curb/rightmost lane. This
+    # holds for both carriageway signs (negatives: -3 > -2 > -1 toward the curb;
+    # positives: 3 > 2 > 1), so descending |lane_id| puts the rightmost lane at
+    # offset 0. (Sorting by raw -lane_id instead would put lane -1 — the LEFT
+    # lane — at offset 0 on a negative carriageway.)
+    sorted_lanes = sorted(best_by_lane.values(), key=lambda w: -abs(w["lane_id"]))
+
+    if lane_offset >= len(sorted_lanes):
+        return None
+    return sorted_lanes[lane_offset]
+
+
+def _select_sibling_lane_cache_only(
+    candidate_lane: Dict[str, Any],
+    lane_offset: int,
+) -> Optional[Dict[str, Any]]:
+    """Cache-only analogue of ``_find_lane_in_dense``.
+
+    Uses the sibling-lane geometry baked into
+    ``candidate_lane['same_direction_lane_evidence']['inspected_lanes']`` (each
+    accepted same-direction Driving lane carries a ``start`` {x, y, z, yaw}) to
+    pick the lane at position ``lane_offset`` from the rightmost (offset 0),
+    matching ``_find_lane_in_dense``'s descending-|lane_id| ordering.
+
+    Returns ``{road_id, lane_id, start{...}}`` for the target lane, or ``None``
+    when the geometry is unavailable (older cache without baked geometry), only
+    the anchor lane exists, or the offset is out of range.
+    """
+    evidence = candidate_lane.get("same_direction_lane_evidence") or {}
+    inspected = evidence.get("inspected_lanes") or []
+
+    lanes: Dict[int, Dict[str, Any]] = {}
+    for entry in inspected:
+        if not entry.get("accepted"):
+            continue
+        lane_id = entry.get("lane_id")
+        start = entry.get("start")
+        if not isinstance(lane_id, int) or not isinstance(start, dict):
+            continue
+        lanes[lane_id] = {
+            "road_id": entry.get("road_id", candidate_lane.get("road_id")),
+            "lane_id": lane_id,
+            "start": start,
+        }
+
+    # The anchor lane carries no baked geometry (its start IS the candidate
+    # start); seed it so it participates in the rightmost-first ordering.
+    try:
+        anchor_lane_id = int(candidate_lane.get("lane_id"))
+    except (TypeError, ValueError):
+        return None
+    anchor_start = candidate_lane.get("start")
+    if isinstance(anchor_start, dict):
+        lanes.setdefault(
+            anchor_lane_id,
+            {
+                "road_id": candidate_lane.get("road_id"),
+                "lane_id": anchor_lane_id,
+                "start": anchor_start,
+            },
+        )
+
+    if len(lanes) <= 1:
+        return None
+
+    # Rightmost-first: descending |lane_id|. Magnitude grows outward from the
+    # reference line, so the largest |id| is the curb/rightmost lane for both
+    # signs (negatives: -3 > -2 > -1; positives: 3 > 2 > 1). offset 0 is the
+    # rightmost driving lane. (Raw -lane_id would mis-rank lane -1 — the LEFT
+    # lane — as rightmost on a negative carriageway.)
+    ordered = sorted(lanes.values(), key=lambda lane: -abs(lane["lane_id"]))
+    if lane_offset < 0 or lane_offset >= len(ordered):
+        return None
+    return ordered[lane_offset]
+
+
+def _next_wp_along_lane(
+    wp: Dict[str, Any],
+    dense_wps: List[Dict[str, Any]],
+    lookahead_m: float = 20.0,
+) -> Dict[str, Any]:
+    """Return the dense waypoint ~lookahead_m ahead of wp on the same lane.
+
+    Falls back to wp itself when no suitable candidate is found.
+    """
+    road_id = wp.get("road_id")
+    lane_id = wp.get("lane_id")
+    wx, wy = float(wp.get("x", 0.0)), float(wp.get("y", 0.0))
+
+    candidates = [
+        w for w in dense_wps
+        if w.get("road_id") == road_id and w.get("lane_id") == lane_id
+    ]
+    if not candidates:
+        return wp
+
+    # Forward direction from wp's yaw.
+    yaw_rad = math.radians(float(wp.get("yaw", 0.0)))
+    fw_x, fw_y = math.cos(yaw_rad), math.sin(yaw_rad)
+
+    best = None
+    best_diff = float("inf")
+    for cand in candidates:
+        dx = float(cand.get("x", 0.0)) - wx
+        dy = float(cand.get("y", 0.0)) - wy
+        longitudinal = dx * fw_x + dy * fw_y
+        if longitudinal <= 0:
+            continue
+        diff = abs(longitudinal - lookahead_m)
+        if diff < best_diff:
+            best_diff = diff
+            best = cand
+    return best if best is not None else wp
+
+
+# A forward reference is only usable for geometric ego placement when the matcher
+# can resolve its position on the map. Today that means the junction ahead (and
+# the signal / stop line co-located with it). Other landmarks are advisory only.
+_MAPPABLE_FORWARD_REFERENCES = (
+    "junction", "intersection", "traffic_light", "signal", "stop_line", "crosswalk",
+)
+# Keep ego at least this far from the junction stop line when sliding forward.
+MIN_JUNCTION_CLEARANCE_M = 6.0
+# Ignore sub-threshold slides (placement noise) and cap absurd ones.
+MIN_EGO_SLIDE_M = 5.0
+MAX_EGO_SLIDE_M = 70.0
+
+
+def _ego_forward_reference_distance(
+    metadata: Dict[str, Any],
+    map_matching: Optional[Dict[str, Any]] = None,
+) -> Optional[float]:
+    """Return a VLM-estimated ego→forward-reference distance in metres, or None.
+
+    Reads the optional ``metadata.ego_localization`` block. Accepts either a
+    direct ``ego_to_junction_distance_m`` or a ``forward_reference`` of a
+    map-anchorable type carrying ``distance_m``. Non-mappable landmarks (e.g. a
+    storefront) are deliberately ignored: the matcher has no coordinate for them,
+    so their distance cannot position ego.
+    """
+    ego_loc = _coerce_dict(metadata.get("ego_localization"))
+
+    def _coerce_distance(value: Any) -> Optional[float]:
+        try:
+            dist = float(value)
+        except (TypeError, ValueError):
+            return None
+        if dist < 0:
+            return None
+        return dist
+
+    direct = _coerce_distance(ego_loc.get("ego_to_junction_distance_m"))
+    if direct is not None:
+        return direct
+
+    direct = _coerce_distance(_coerce_dict(map_matching).get("ego_to_junction_distance_m"))
+    if direct is not None:
+        return direct
+
+    ref = _coerce_dict(ego_loc.get("forward_reference"))
+    ref_type = str(ref.get("type") or "").lower()
+    if any(tok in ref_type for tok in _MAPPABLE_FORWARD_REFERENCES):
+        return _coerce_distance(ref.get("distance_m"))
+    return None
+
+
+def _normalize_vector_2d(dx: float, dy: float) -> Tuple[float, float]:
+    norm = math.hypot(dx, dy)
+    if norm <= 1e-9:
+        return 0.0, 0.0
+    return dx / norm, dy / norm
+
+
+def compute_cache_longitudinal_slide(
+    distance_to_junction_ahead: Optional[float],
+    target_m: float,
+    *,
+    min_clearance: float = MIN_JUNCTION_CLEARANCE_M,
+    min_abs: float = MIN_EGO_SLIDE_M,
+    max_abs: float = MAX_EGO_SLIDE_M,
+) -> float:
+    """Metres to slide ego forward (toward the junction) in cache-only mode.
+
+    Positive slides move ego forward (closer to the junction). Returns 0.0 when
+    no candidate junction distance is known, when the adjustment is below
+    ``min_abs`` (noise), or when sliding would overshoot the stop line.
+    """
+    if not isinstance(distance_to_junction_ahead, (int, float)):
+        return 0.0
+    actual = float(distance_to_junction_ahead)
+    if actual < 0:
+        return 0.0
+    slide = actual - float(target_m)
+    # Never push ego into or past the junction.
+    upper = max(0.0, actual - min_clearance)
+    slide = max(-max_abs, min(slide, upper, max_abs))
+    if abs(slide) < min_abs:
+        return 0.0
+    return slide
+
+
+def slide_anchor_along_segment(
+    start: Dict[str, Any], end: Dict[str, Any], slide_m: float
+) -> Dict[str, Any]:
+    """Translate ``start`` by ``slide_m`` along the start→end forward direction.
+
+    CARLA-free linear extrapolation used when dense waypoints are unavailable.
+    Returns a new start dict; yaw / is_junction are preserved from ``start``.
+    """
+    sx, sy = float(start.get("x", 0.0)), float(start.get("y", 0.0))
+    ex, ey = float(end.get("x", sx)), float(end.get("y", sy))
+    fx, fy = _normalize_vector_2d(ex - sx, ey - sy)
+    return {
+        "x": sx + fx * slide_m,
+        "y": sy + fy * slide_m,
+        "z": float(start.get("z", 0.0)),
+        "yaw": float(start.get("yaw", 0.0)),
+        "is_junction": bool(start.get("is_junction", False)),
+    }
+
+
+def _infer_ego_junction_target(
+    scene_understanding: Dict[str, Any],
+) -> Tuple[bool, float]:
+    """Infer whether to constrain ego's distance to the nearest forward junction.
+
+    Returns (constrain, target_m):
+      - (False, 0.0) – no visible junction; skip longitudinal adjustment.
+      - (True, target_m) – ego should be ~target_m ahead of the junction.
+
+    Distance mapping (qualitative location field → metres):
+      immediate / at / entering  →  8 m
+      close / near / approaching → 18 m
+      (no qualifier)             → 28 m
+    """
+    road_network = scene_understanding.get("road_network") or {}
+    metadata = scene_understanding.get("metadata") or {}
+    cues = metadata.get("decisive_map_matching_cues") or {}
+    map_matching = _coerce_dict(road_network.get("map_matching"))
+
+    map_topology = str(map_matching.get("topology_type") or "").lower()
+    map_junction_visible = map_matching.get("junction_visible")
+    map_matching_says_no_junction = (
+        map_junction_visible is False
+        or map_topology in {"straight_road", "straight_two_way", "curve"}
+    )
+
+    # If the direct map-matching contract says this is not a junction target,
+    # ignore any stray ego_to_junction_distance_m emitted by the VLM.
+    if map_matching_says_no_junction:
+        return False, 0.0
+
+    # Highest priority: an explicit VLM metric estimate of ego's distance to the
+    # forward reference. Only references the matcher can geometrically anchor to
+    # (the junction / its stop line / signal) can drive the longitudinal slide;
+    # arbitrary landmarks have no CARLA coordinate and are ignored here.
+    target_m = _ego_forward_reference_distance(metadata, map_matching)
+    if target_m is not None:
+        return True, target_m
+
+    # Explicit override from decisive cues.
+    junction_visible_cue = cues.get("junction_visible")
+    if isinstance(junction_visible_cue, bool) and not junction_visible_cue:
+        return False, 0.0
+
+    _NEGATIVE = ("far", "distant", "not visible", "not_visible", "background", "offscreen")
+    _IMMEDIATE = ("immediate", "at junction", "at_junction", "entering", "in junction")
+    _CLOSE     = ("close", "near", "approaching", "just ahead", "right ahead")
+
+    for junction in (road_network.get("junctions") or []):
+        if not isinstance(junction, dict):
+            continue
+
+        # Skip low-confidence or far junctions.
+        confidence = junction.get("confidence")
+        if str(confidence).lower() == "low":
+            continue
+        try:
+            if float(confidence) < 0.5:
+                continue
+        except (TypeError, ValueError):
+            pass
+
+        location = str(junction.get("location") or junction.get("position") or "").lower()
+        if any(tok in location for tok in _NEGATIVE):
+            continue
+
+        # Junction is visible – determine distance from location hint.
+        if any(tok in location for tok in _IMMEDIATE):
+            return True, 8.0
+        if any(tok in location for tok in _CLOSE):
+            return True, 18.0
+        return True, 28.0
+
+    # Fall back to explicit decisive cue if no junction objects provided distance.
+    if junction_visible_cue is True:
+        return True, 28.0
+
+    return False, 0.0
+
+
+def _measure_forward_junction_distance(
+    start: Dict[str, Any],
+    end: Dict[str, Any],
+    dense_wps: List[Dict[str, Any]],
+) -> Optional[float]:
+    """Measure the longitudinal distance from start to the nearest forward junction.
+
+    Uses the forward direction implied by start → end.
+    Returns None when no junction waypoints are found ahead of start.
+    """
+    sx, sy = float(start.get("x", 0.0)), float(start.get("y", 0.0))
+    ex, ey = float(end.get("x", sx)), float(end.get("y", sy))
+    dx, dy = ex - sx, ey - sy
+    length = math.hypot(dx, dy)
+    if length < 1e-6:
+        yaw_rad = math.radians(float(start.get("yaw", 0.0)))
+        fw_x, fw_y = math.cos(yaw_rad), math.sin(yaw_rad)
+    else:
+        fw_x, fw_y = dx / length, dy / length
+
+    min_dist: Optional[float] = None
+    for wp in dense_wps:
+        if not wp.get("is_junction"):
+            continue
+        long = (float(wp.get("x", 0.0)) - sx) * fw_x + (float(wp.get("y", 0.0)) - sy) * fw_y
+        if long <= 0:
+            continue
+        if min_dist is None or long < min_dist:
+            min_dist = long
+    return min_dist
+
+
+def _slide_along_dense_waypoints(
+    start: Dict[str, Any],
+    end: Dict[str, Any],
+    slide_m: float,
+    dense_wps: List[Dict[str, Any]],
+    candidate_lane: Dict[str, Any],
+    min_junction_clearance_m: float = 5.0,
+) -> Optional[Dict[str, Any]]:
+    """Return a new start-point after sliding ego by slide_m along the lane.
+
+    slide_m > 0  →  move ego forward (closer to junction).
+    slide_m < 0  →  move ego backward (farther from junction).
+
+    Filters to the same road_id + lane_id as candidate_lane, computes the
+    signed longitudinal displacement of each waypoint from start, picks the
+    one closest to slide_m, and enforces a minimum clearance from any forward
+    junction.
+
+    Returns a waypoint dict or None when no suitable point is found.
+    """
+    road_id = candidate_lane.get("road_id")
+    lane_id = candidate_lane.get("lane_id")
+
+    sx, sy = float(start.get("x", 0.0)), float(start.get("y", 0.0))
+    ex, ey = float(end.get("x", sx)), float(end.get("y", sy))
+    ddx, ddy = ex - sx, ey - sy
+    length = math.hypot(ddx, ddy)
+    if length < 1e-6:
+        yaw_rad = math.radians(float(start.get("yaw", 0.0)))
+        fw_x, fw_y = math.cos(yaw_rad), math.sin(yaw_rad)
+    else:
+        fw_x, fw_y = ddx / length, ddy / length
+
+    # Pre-compute forward junction distance from the *target* position for
+    # clearance enforcement.
+    junction_long: Optional[float] = _measure_forward_junction_distance(start, end, dense_wps)
+
+    same_lane = [
+        wp for wp in dense_wps
+        if wp.get("road_id") == road_id and wp.get("lane_id") == lane_id
+    ]
+    if not same_lane:
+        return None
+
+    best: Optional[Dict[str, Any]] = None
+    best_diff = float("inf")
+    for wp in same_lane:
+        long = (float(wp.get("x", 0.0)) - sx) * fw_x + (float(wp.get("y", 0.0)) - sy) * fw_y
+        # Enforce minimum clearance from junction.
+        if junction_long is not None:
+            new_dist_to_junction = junction_long - long
+            if new_dist_to_junction < min_junction_clearance_m:
+                continue
+        diff = abs(long - slide_m)
+        if diff < best_diff:
+            best_diff = diff
+            best = wp
+    return best
+
+
+# ---------------------------------------------------------------------------
+
+def _min_opposing_abs_lane_index(entities: List[Dict[str, Any]]) -> int:
+    """Smallest |lane_index| among oncoming vehicles.
+
+    The nearest oncoming vehicle sits in the opposing lane closest to the median,
+    so its |lane_index| marks where the opposing carriageway begins in the VLM's
+    ego-relative lane count. Used to map each oncoming vehicle to a 1-based
+    opposing-lane ordinal counted from the median.
+    """
+    indices = [
+        abs(int(entity.get("lane_index_relation", 0) or 0))
+        for entity in entities
+        if str(entity.get("heading_relation") or "") == "opposite_direction"
+        and _is_vehicle_like(str(entity.get("category") or ""))
+    ]
+    return min(indices) if indices else 1
+
+
+def _should_project_to_junction_lane(entity: Dict[str, Any]) -> bool:
+    if str(entity.get("junction_placement") or "").lower() != "frame":
+        return False
+    projected_lane = _coerce_dict(entity.get("projected_lane"))
+    if str(projected_lane.get("source") or "").lower() != "junction_leg":
+        return False
+    direction = str(entity.get("junction_direction") or "").lower()
+    if direction in {"left", "right"}:
+        return True
+    anchor = str(entity.get("layout_anchor_id") or "").lower()
+    if anchor in {"left_arm", "right_arm"}:
+        return True
+    leg = str(entity.get("junction_leg") or "").lower()
+    return leg in {"left", "right"}
+
+
 def build_projected_spawn_payload(projected_coordinates: Dict[str, Any]) -> Dict[str, Any]:
     payload = {"entities": []}
-    for entity in _coerce_list(projected_coordinates.get("entities")):
+    aligned_coordinates = _apply_curb_row_alignment(projected_coordinates)
+    aligned_entities = _coerce_list(aligned_coordinates.get("entities"))
+    min_opposing_abs = _min_opposing_abs_lane_index(aligned_entities)
+    for entity in aligned_entities:
         spawn_kind = str(entity.get("spawn_kind") or "vehicle")
         category = str(entity.get("category") or "car")
-        placement_mode = "direct" if category == "parked_vehicle" else "project_to_lane"
+        lane_side = str(entity.get("lane_side_relation") or "")
+        lane_index = int(entity.get("lane_index_relation", 0) or 0)
+        heading_relation = str(entity.get("heading_relation") or "unknown")
+        opposing_lane_from_median = None
+        placement_mode = "project_to_lane"
+        if category in {"cone_group", "barrier_group"}:
+            placement_mode = "direct"
+        elif spawn_kind == "vehicle" and _should_project_to_junction_lane(entity):
+            placement_mode = "project_to_junction_lane"
+        elif spawn_kind == "vehicle" and heading_relation == "opposite_direction":
+            # Cross-median seed lands somewhere on the opposing carriageway; runtime
+            # then walks the lane graph to the median-adjacent opposing lane. The
+            # nearest oncoming vehicle maps to lane 1 (closest to the median).
+            placement_mode = "project_to_opposing_lane"
+            opposing_lane_from_median = max(1, abs(lane_index) - min_opposing_abs + 1)
+        elif spawn_kind == "vehicle" and lane_index != 0:
+            placement_mode = "preserve_xy"
         explicit_color = preferred_vehicle_color(entity)
-        payload["entities"].append(
-            {
-                "id": entity["id"],
-                "spawn_kind": spawn_kind,
-                "blueprint_name": entity.get("blueprint_name"),
-                "category": category,
-                "lane_side_relation": str(entity.get("lane_side_relation") or ""),
-                "heading_relation": str(entity.get("heading_relation") or "unknown"),
-                "motion_state": str(entity.get("motion_state") or "unknown"),
-                "projected_lane": _coerce_dict(entity.get("projected_lane")),
-                "location": entity["location"],
-                "rotation": entity["rotation"],
-                "color": None
-                if spawn_kind != "vehicle"
-                else (explicit_color or color_for_entity(entity["id"], category)),
-                "placement_mode": placement_mode,
-                "appearance": _coerce_dict(entity.get("appearance")),
-            }
-        )
+        payload_entity = {
+            "id": entity["id"],
+            "spawn_kind": spawn_kind,
+            "blueprint_name": entity.get("blueprint_name"),
+            "category": category,
+            "lane_side_relation": lane_side,
+            "lane_index_relation": lane_index,
+            "heading_relation": str(entity.get("heading_relation") or "unknown"),
+            "motion_state": str(entity.get("motion_state") or "unknown"),
+            "projected_lane": _coerce_dict(entity.get("projected_lane")),
+            "junction_direction": str(entity.get("junction_direction") or ""),
+            "junction_leg": str(entity.get("junction_leg") or ""),
+            "junction_motion": str(entity.get("junction_motion") or ""),
+            "junction_distance_m": entity.get("junction_distance_m"),
+            "location": entity["location"],
+            "rotation": entity["rotation"],
+            "color": None
+            if spawn_kind != "vehicle"
+            else (explicit_color or color_for_entity(entity["id"], category)),
+            "placement_mode": placement_mode,
+            "appearance": _coerce_dict(entity.get("appearance")),
+        }
+        if opposing_lane_from_median is not None:
+            payload_entity["opposing_lane_from_median"] = opposing_lane_from_median
+        payload["entities"].append(payload_entity)
     return payload

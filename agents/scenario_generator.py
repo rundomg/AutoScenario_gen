@@ -297,6 +297,7 @@ class ScenarioGenerator(TaskAgent):
                 [
                     "",
                     SCENE_ACTIVATION_MARKER,
+                    "_autoscenario_helpers_module._autoscenario_init(world, blueprint_library)",
                     "spawn_static_prop = _autoscenario_spawn_static_prop",
                     "spawn_vehicle = _autoscenario_spawn_vehicle",
                     "spawn_pedestrian = _autoscenario_spawn_pedestrian",
@@ -308,6 +309,7 @@ class ScenarioGenerator(TaskAgent):
             lines[insert_index:insert_index] = [
                 "",
                 f"{indent}{SCENE_ACTIVATION_MARKER}",
+                f"{indent}_autoscenario_helpers_module._autoscenario_init(world, blueprint_library)",
                 f"{indent}spawn_static_prop = _autoscenario_spawn_static_prop",
                 f"{indent}spawn_vehicle = _autoscenario_spawn_vehicle",
                 f"{indent}spawn_pedestrian = _autoscenario_spawn_pedestrian",
@@ -337,6 +339,44 @@ class ScenarioGenerator(TaskAgent):
 
     @staticmethod
     def _build_scene_helper_block() -> str:
+        return (
+            f"{SCENE_HELPER_MARKER}\n"
+            "import sys as _autoscenario_sys\n"
+            "import os as _autoscenario_os\n"
+            "_autoscenario_helper_dir = _autoscenario_os.path.dirname(\n"
+            "    _autoscenario_os.path.abspath(__file__)\n"
+            ")\n"
+            "while True:\n"
+            "    _autoscenario_helper_path = _autoscenario_os.path.join(\n"
+            "        _autoscenario_helper_dir, 'autoscenario_scene_helpers.py'\n"
+            "    )\n"
+            "    if _autoscenario_os.path.exists(_autoscenario_helper_path):\n"
+            "        if _autoscenario_helper_dir not in _autoscenario_sys.path:\n"
+            "            _autoscenario_sys.path.insert(0, _autoscenario_helper_dir)\n"
+            "        break\n"
+            "    _autoscenario_parent_dir = _autoscenario_os.path.dirname(\n"
+            "        _autoscenario_helper_dir\n"
+            "    )\n"
+            "    if _autoscenario_parent_dir == _autoscenario_helper_dir:\n"
+            "        raise ModuleNotFoundError(\n"
+            "            'Could not locate autoscenario_scene_helpers.py from generated scene script'\n"
+            "        )\n"
+            "    _autoscenario_helper_dir = _autoscenario_parent_dir\n"
+            "from autoscenario_scene_helpers import *\n"
+            "import autoscenario_scene_helpers as _autoscenario_helpers_module\n"
+            "globals().update(\n"
+            "    {\n"
+            "        _autoscenario_name: getattr(\n"
+            "            _autoscenario_helpers_module, _autoscenario_name\n"
+            "        )\n"
+            "        for _autoscenario_name in dir(_autoscenario_helpers_module)\n"
+            "        if _autoscenario_name.startswith('_autoscenario_')\n"
+            "    }\n"
+            ")"
+        )
+
+    @staticmethod
+    def _build_scene_helper_block_LEGACY() -> str:
         return textwrap.dedent(
             f"""
             {SCENE_HELPER_MARKER}
