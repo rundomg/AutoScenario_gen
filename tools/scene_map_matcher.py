@@ -9,6 +9,7 @@ from collections import deque
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
+from tools.map_matcher_v2 import score_candidate_v2, summarize_entry
 from tools.utils import extract_text_section, read_file, write_to_file
 
 
@@ -214,6 +215,7 @@ class SceneMapMatcher:
         auxiliary_weight: float = 0.10,
         blacklist_radius_m: float = 35.0,
         topology_cache_dir: Optional[str] = None,
+        legacy_map_match: bool = False,
     ):
         self.host = host
         self.port = port
@@ -233,6 +235,7 @@ class SceneMapMatcher:
         self.auxiliary_weight = auxiliary_weight
         self.blacklist_radius_m = blacklist_radius_m
         self.topology_cache_dir = topology_cache_dir
+        self.legacy_map_match = legacy_map_match
 
     def analyze_scene_assets(self, scene_id: str, output_folder: str) -> str:
         paths = self._build_source_paths(scene_id, output_folder)
@@ -867,6 +870,20 @@ class SceneMapMatcher:
             merged["ego_to_junction_distance_m"] = ego_distance
 
         branches = map_matching.get("junction_branches")
+        if isinstance(branches, (list, tuple, set)):
+            branch_tokens = {
+                str(item or "").strip().lower().replace("-", "_").replace(" ", "_")
+                for item in branches
+            }
+            branches = {
+                "ahead": bool(
+                    branch_tokens
+                    & {"ahead", "ahead_arm", "straight", "through", "oncoming", "oncoming_arm"}
+                ),
+                "left": bool(branch_tokens & {"left", "left_arm", "left_branch"}),
+                "right": bool(branch_tokens & {"right", "right_arm", "right_branch"}),
+                "known": bool(branch_tokens),
+            }
         if isinstance(branches, dict):
             merged["junction_branches"] = {
                 "ahead": bool(branches.get("ahead", merged.get("junction_visible", False))),
@@ -2115,11 +2132,13 @@ class SceneMapMatcher:
         global_best_score = -1.0
         global_best_world: Optional[str] = None
 
-        fallback_best: Optional[Dict[str, Any]] = None
-        fallback_best_score = -1.0
-        fallback_best_world: Optional[str] = None
+        best_rejected: Optional[Dict[str, Any]] = None
+        best_rejected_score = -1.0
+        best_rejected_world: Optional[str] = None
 
         top_candidates_summary: List[Dict[str, Any]] = []
+        accepted_summary: List[Dict[str, Any]] = []
+        rejected_summary: List[Dict[str, Any]] = []
         # Full per-map best entries, kept so an optional LLM re-ranker can choose
         # among a closed set without re-loading caches.
         map_best_entries: List[Dict[str, Any]] = []
@@ -2144,21 +2163,47 @@ class SceneMapMatcher:
 
             map_best: Optional[Dict[str, Any]] = None
             map_best_score = -1.0
+            map_best_accepted: Optional[Dict[str, Any]] = None
+            map_best_accepted_score = -1.0
+            map_best_rejected: Optional[Dict[str, Any]] = None
+            map_best_rejected_score = -1.0
 
             for candidate in candidates:
                 loc = candidate.get("location") or {}
-                if self._cache_is_blacklisted(loc, blacklist_locations):
-                    continue
-                score, details = self._score_candidate_features(candidate, scene_features)
+                blacklisted = self._cache_is_blacklisted(loc, blacklist_locations)
+                if (
+                    scene_features.get("road_topology_signature")
+                    and not self.legacy_map_match
+                ):
+                    score, details = score_candidate_v2(
+                        scene_features.get("road_topology_signature") or {},
+                        candidate,
+                        blacklisted=blacklisted,
+                    )
+                else:
+                    if blacklisted:
+                        continue
+                    score, details = self._score_candidate_features(candidate, scene_features)
                 details["blacklisted"] = False
+                if blacklisted:
+                    details["blacklisted"] = True
                 hard_reject = bool(details.get("hard_reject"))
+                reject_reasons = details.get("reject_reasons") or []
+                reject_reason = (
+                    "; ".join(str(item) for item in reject_reasons)
+                    if reject_reasons
+                    else details.get("reject_reason")
+                )
 
                 entry = {
                     "score": score,
                     "score_details": details,
                     "hard_reject": hard_reject,
-                    "reject_reason": details.get("reject_reason"),
-                    "search_strategy": "cache",
+                    "reject_reason": reject_reason,
+                    "search_strategy": "cache_v2"
+                    if scene_features.get("road_topology_signature")
+                    and not self.legacy_map_match
+                    else "cache",
                     "location": loc,
                     "yaw": candidate.get("yaw", 0.0),
                     "candidate_lane": candidate.get("candidate_lane", {}),
@@ -2167,64 +2212,81 @@ class SceneMapMatcher:
                     "_world_name": world_name,
                 }
 
-                # Track global fallback (best score regardless of hard_reject)
-                if score > fallback_best_score:
-                    fallback_best_score = score
-                    fallback_best = entry
-                    fallback_best_world = world_name
-
                 # Track per-map best (non-hard-reject preferred)
                 if score > map_best_score:
                     map_best_score = score
                     map_best = entry
+                if hard_reject:
+                    if score > map_best_rejected_score:
+                        map_best_rejected_score = score
+                        map_best_rejected = entry
+                elif score > map_best_accepted_score:
+                    map_best_accepted_score = score
+                    map_best_accepted = entry
 
                 # Track global best (non-hard-reject only)
                 if not hard_reject and score > global_best_score:
                     global_best_score = score
                     global_best = entry
                     global_best_world = world_name
+                elif hard_reject and score > best_rejected_score:
+                    best_rejected_score = score
+                    best_rejected = entry
+                    best_rejected_world = world_name
 
             if map_best:
-                top_candidates_summary.append({
-                    "world": world_name,
-                    "score": map_best_score,
-                    "hard_reject": map_best.get("hard_reject"),
-                    "candidate_topology_type": map_best.get("candidate_topology_type"),
-                    "environment_context": self._environment_debug_summary(
-                        map_best.get("environment_context")
-                    ),
-                })
+                top_candidates_summary.append(summarize_entry(map_best))
                 map_best_entries.append(map_best)
-
-        # If all candidates were hard-rejected, use the best-scoring one anyway
-        if global_best is None and fallback_best is not None:
-            global_best = fallback_best
-            global_best_score = fallback_best_score
-            global_best_world = fallback_best_world
+            if map_best_accepted:
+                accepted_summary.append(summarize_entry(map_best_accepted))
+            if map_best_rejected:
+                rejected_summary.append(summarize_entry(map_best_rejected))
 
         if global_best is None:
             return {
-                "status": "no_candidates",
+                "status": "unmatched" if best_rejected is not None else "no_candidates",
                 "world_name": None,
-                "candidate_summary": {"top_candidates": top_candidates_summary},
-                "candidate_debug": {"top_candidates": top_candidates_summary,
-                                    "blacklist_locations": blacklist_locations or []},
-                "reason": "No candidates found across all cached maps.",
+                "candidate_summary": {
+                    "accepted": accepted_summary[:20],
+                    "rejected": rejected_summary[:20],
+                    "top_candidates": top_candidates_summary,
+                },
+                "candidate_debug": {
+                    "accepted": accepted_summary[:50],
+                    "rejected": rejected_summary[:50],
+                    "top_candidates": top_candidates_summary,
+                    "best_rejected_candidate": self._assemble_cache_best_match(best_rejected)
+                    if best_rejected is not None
+                    else None,
+                    "blacklist_locations": blacklist_locations or [],
+                },
+                "best_match": None,
+                "projected_layout": {},
+                "reason": "No candidates satisfied v2 topology gates."
+                if best_rejected is not None
+                else "No candidates found across all cached maps.",
             }
 
-        used_rejected = global_best.get("hard_reject", False)
         return {
             "status": "matched",
             "world_name": global_best_world,
             "best_match": self._assemble_cache_best_match(global_best),
             "projected_layout": {},
-            "candidate_summary": {"top_candidates": top_candidates_summary},
-            "candidate_debug": {"top_candidates": top_candidates_summary,
-                                "blacklist_locations": blacklist_locations or []},
-            "reason": (
-                "No CARLA candidates satisfied topology hard constraints across all cached maps; "
-                "continuing with the highest-scoring rejected candidate."
-            ) if used_rejected else None,
+            "candidate_summary": {
+                "accepted": accepted_summary[:20],
+                "rejected": rejected_summary[:20],
+                "top_candidates": top_candidates_summary,
+            },
+            "candidate_debug": {
+                "accepted": accepted_summary[:50],
+                "rejected": rejected_summary[:50],
+                "top_candidates": top_candidates_summary,
+                "best_rejected_candidate": self._assemble_cache_best_match(best_rejected)
+                if best_rejected is not None
+                else None,
+                "blacklist_locations": blacklist_locations or [],
+            },
+            "reason": None,
         }
 
     # Candidate feature keys surfaced in best_match for downstream stages/debug.
@@ -2239,6 +2301,7 @@ class SceneMapMatcher:
         "same_direction_lane_evidence",
         "is_curve", "curve_yaw_delta_deg", "curve_abs_yaw_delta_deg",
         "curve_direction", "curve_score", "curve_sample_distance_m",
+        "left_parking_lane_present", "right_parking_lane_present",
     )
 
     @classmethod
@@ -2247,7 +2310,7 @@ class SceneMapMatcher:
         used_rejected = bool(entry.get("hard_reject"))
         score = float(entry.get("score") or 0.0)
         best_match = {
-            "search_strategy": "cache",
+            "search_strategy": entry.get("search_strategy") or "cache",
             "spawn_point_index": None,
             "location": entry.get("location"),
             "yaw": entry.get("yaw"),
@@ -2261,7 +2324,12 @@ class SceneMapMatcher:
             "layout_penalties": {},
             "used_rejected_candidate": used_rejected,
             "reject_reason": entry.get("reject_reason") if used_rejected else None,
+            "world": entry.get("_world_name"),
         }
+        details = entry.get("score_details") or {}
+        candidate_kind = details.get("candidate_kind")
+        if candidate_kind:
+            best_match["candidate_features"]["candidate_kind"] = candidate_kind
         matched_structure = entry.get("matched_structure")
         if isinstance(matched_structure, dict) and not matched_structure.get("error"):
             best_match["matched_structure"] = matched_structure
@@ -2345,38 +2413,35 @@ class SceneMapMatcher:
                 candidate for candidate in coarse_candidates if not candidate.get("hard_reject")
             ]
             best_candidate = None
-            reason = None
             if accepted_candidates:
                 best_candidate = accepted_candidates[0]
-            elif coarse_candidates:
+            if best_candidate is None:
                 fallback_candidates = [
                     candidate
                     for candidate in coarse_candidates
                     if not (candidate.get("score_details") or {}).get("blacklisted")
                 ] or coarse_candidates
-                best_candidate = max(
+                best_rejected = max(
                     fallback_candidates,
                     key=self._candidate_sort_key,
-                )
-                reason = (
-                    "No CARLA candidates satisfied topology hard constraints; "
-                    "continuing with the highest-scoring rejected candidate."
-                )
-            if best_candidate is None:
+                ) if fallback_candidates else None
+                if best_rejected is not None:
+                    candidate_debug["best_rejected_candidate"] = (
+                        self._build_topology_match_record(best_rejected)
+                    )
                 return {
-                    "status": "no_valid_candidates",
+                    "status": "unmatched",
                     "world_name": world_name,
                     "candidate_summary": candidate_summary,
                     "candidate_debug": candidate_debug,
-                    "reason": "No CARLA candidates satisfied topology hard constraints.",
+                    "best_match": None,
+                    "projected_layout": {},
+                    "reason": "No CARLA candidates satisfied v2 topology gates.",
                 }
             best_match = self._build_topology_match_record(best_candidate)
             best_match["matched_structure"] = self._build_matched_structure(
                 world_map, best_candidate
             )
-            if best_candidate.get("hard_reject"):
-                best_match["used_rejected_candidate"] = True
-                best_match["reject_reason"] = best_candidate.get("reject_reason")
             return {
                 "status": "matched",
                 "world_name": world_name,
@@ -2384,7 +2449,7 @@ class SceneMapMatcher:
                 "candidate_debug": candidate_debug,
                 "best_match": best_match,
                 "projected_layout": {},
-                "reason": reason,
+                "reason": None,
             }
 
         refined_candidates = []
@@ -2495,6 +2560,11 @@ class SceneMapMatcher:
                 "curve_direction": candidate.get("curve_direction"),
                 "curve_score": candidate.get("curve_score"),
                 "curve_sample_distance_m": candidate.get("curve_sample_distance_m"),
+                "left_parking_lane_present": candidate.get("left_parking_lane_present"),
+                "right_parking_lane_present": candidate.get("right_parking_lane_present"),
+                "candidate_kind": (candidate.get("score_details") or {}).get(
+                    "candidate_kind"
+                ),
             },
             "candidate_lane": candidate.get("candidate_lane"),
             "layout_penalties": {},
@@ -2551,18 +2621,35 @@ class SceneMapMatcher:
         scored_candidates = []
         for waypoint in sampled_waypoints:
             candidate = self._extract_candidate_features(sampled_waypoints, waypoint)
-            score, details = self._score_candidate_features(candidate, scene_features)
-            if self._is_blacklisted(waypoint.transform.location, blacklist_locations):
-                details["hard_reject"] = True
-                details["blacklisted"] = True
-                details["reject_reason"] = "Candidate is inside a blacklisted rematch region."
+            blacklisted = self._is_blacklisted(waypoint.transform.location, blacklist_locations)
+            if scene_features.get("road_topology_signature") and not self.legacy_map_match:
+                score, details = score_candidate_v2(
+                    scene_features.get("road_topology_signature") or {},
+                    candidate,
+                    blacklisted=blacklisted,
+                )
+            else:
+                score, details = self._score_candidate_features(candidate, scene_features)
+                if blacklisted:
+                    details["hard_reject"] = True
+                    details["blacklisted"] = True
+                    details["reject_reason"] = "Candidate is inside a blacklisted rematch region."
+            reject_reasons = details.get("reject_reasons") or []
+            reject_reason = (
+                "; ".join(str(item) for item in reject_reasons)
+                if reject_reasons
+                else details.get("reject_reason")
+            )
             scored_candidates.append(
                 {
                     "score": score,
                     "score_details": details,
                     "hard_reject": bool(details.get("hard_reject")),
-                    "reject_reason": details.get("reject_reason"),
-                    "search_strategy": "full_waypoints",
+                    "reject_reason": reject_reason,
+                    "search_strategy": "full_waypoints_v2"
+                    if scene_features.get("road_topology_signature")
+                    and not self.legacy_map_match
+                    else "full_waypoints",
                     "location": {
                         "x": waypoint.transform.location.x,
                         "y": waypoint.transform.location.y,
@@ -2617,18 +2704,35 @@ class SceneMapMatcher:
                 continue
 
             candidate = self._extract_local_candidate_features(world_map, waypoint)
-            score, details = self._score_candidate_features(candidate, scene_features)
-            if self._is_blacklisted(waypoint.transform.location, blacklist_locations):
-                details["hard_reject"] = True
-                details["blacklisted"] = True
-                details["reject_reason"] = "Candidate is inside a blacklisted rematch region."
+            blacklisted = self._is_blacklisted(waypoint.transform.location, blacklist_locations)
+            if scene_features.get("road_topology_signature") and not self.legacy_map_match:
+                score, details = score_candidate_v2(
+                    scene_features.get("road_topology_signature") or {},
+                    candidate,
+                    blacklisted=blacklisted,
+                )
+            else:
+                score, details = self._score_candidate_features(candidate, scene_features)
+                if blacklisted:
+                    details["hard_reject"] = True
+                    details["blacklisted"] = True
+                    details["reject_reason"] = "Candidate is inside a blacklisted rematch region."
+            reject_reasons = details.get("reject_reasons") or []
+            reject_reason = (
+                "; ".join(str(item) for item in reject_reasons)
+                if reject_reasons
+                else details.get("reject_reason")
+            )
             scored_candidates.append(
                 {
                     "score": score,
                     "score_details": details,
                     "hard_reject": bool(details.get("hard_reject")),
-                    "reject_reason": details.get("reject_reason"),
-                    "search_strategy": "spawn_points",
+                    "reject_reason": reject_reason,
+                    "search_strategy": "spawn_points_v2"
+                    if scene_features.get("road_topology_signature")
+                    and not self.legacy_map_match
+                    else "spawn_points",
                     "spawn_point_index": spawn_index,
                     "location": {
                         "x": waypoint.transform.location.x,
@@ -3563,25 +3667,27 @@ class SceneMapMatcher:
                 "Non-highway scene (driving_lane_count≤2) rejects highway-style candidate "
                 "with adjacent Stop/Shoulder lane."
             )
-        if target_topology == "straight_two_way":
+        straight_targets = {"straight_two_way", "straight_road"}
+        candidate_straight_like = candidate_topology in straight_targets
+        if target_topology in straight_targets:
             if heading_clusters > 2 or nearby_roads > 2 or junction_ratio > 0.12:
                 hard_reject = True
                 reject_reason = (
-                    "Straight two-way target rejects complex or junction-like candidate "
+                    "Straight-road target rejects complex or junction-like candidate "
                     f"(heading_cluster_count={heading_clusters}, nearby_road_count={nearby_roads}, "
                     f"junction_waypoint_ratio={junction_ratio:.2f})."
                 )
-            if candidate_driving_lanes > target_driving_lanes + 1:
+            if not hard_reject and candidate_driving_lanes > target_driving_lanes + 1:
                 hard_reject = True
                 reject_reason = (
-                    "Straight two-way target rejects overly wide driving-lane candidate "
+                    "Straight-road target rejects overly wide driving-lane candidate "
                     f"(target_driving_lane_count={target_driving_lanes}, "
                     f"candidate_driving_lane_count={candidate_driving_lanes})."
                 )
-            if candidate_is_curve and candidate_curve_score >= 0.45:
+            if not hard_reject and candidate_is_curve and candidate_curve_score >= 0.45:
                 hard_reject = True
                 reject_reason = (
-                    "Straight two-way target rejects explicit curved-road candidate "
+                    "Straight-road target rejects explicit curved-road candidate "
                     f"(curve_score={candidate_curve_score:.2f})."
                 )
         elif target_topology in {"t_junction", "cross_intersection", "multi_branch"}:
@@ -3606,7 +3712,12 @@ class SceneMapMatcher:
                 topology_score = 0.10
         elif candidate_topology == target_topology:
             topology_score = 1.0
-        elif target_topology == "straight_two_way" and candidate_topology == "curve":
+        elif target_topology in straight_targets and candidate_straight_like:
+            # ``straight_road`` is the compact one-way/unknown-direction contract
+            # emitted by map_matching; cache candidates historically call the
+            # same open-road geometry ``straight_two_way``.
+            topology_score = 1.0
+        elif target_topology in straight_targets and candidate_topology == "curve":
             topology_score = 0.45
         elif target_topology in {"t_junction", "cross_intersection"} and candidate_topology in {
             "t_junction",
@@ -3939,8 +4050,8 @@ class SceneMapMatcher:
         elif lane_delta:
             score *= max(0.35, 1.0 - 0.20 * lane_delta)
 
-        if target_topology == "straight_two_way":
-            if candidate_topology != target_topology:
+        if target_topology in {"straight_two_way", "straight_road"}:
+            if candidate_topology not in {"straight_two_way", "straight_road"}:
                 score *= 0.80
             complexity_delta = max(0, heading_clusters - 2) + max(0, nearby_roads - 2)
             if junction_ratio > 0.12:

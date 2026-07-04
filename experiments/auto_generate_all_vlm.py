@@ -74,7 +74,8 @@ class AutoGenerator:
         self.require_carla_connection = info_dict.get("require_carla_connection", True)
         self.debug_artifacts = info_dict.get("debug_artifacts", False)
         self.merge_user_description = info_dict.get("merge_user_description", True)
-        self.enable_scene_verify = info_dict.get("enable_scene_verify", True)
+        self.enable_scene_verify = info_dict.get("enable_scene_verify", False)
+        self.legacy_actor_layout = bool(info_dict.get("legacy_actor_layout", False))
         self.verify_max_rounds = int(info_dict.get("verify_max_rounds", 2))
         self.verify_min_score = float(info_dict.get("verify_min_score", 0.70))
         self.verify_mode = info_dict.get("verify_mode", "actor_graph")
@@ -120,41 +121,53 @@ class AutoGenerator:
 
     @staticmethod
     def _entity_requires_junction_structure(entity: dict) -> bool:
-        category = str(entity.get("category") or "").strip().lower()
-        if category not in {"car", "truck", "bus", "motorcycle", "bicycle", "vehicle"}:
-            return False
-        layout_anchor = str(entity.get("layout_anchor_id") or "").strip().lower()
-        if layout_anchor in {"right_arm", "left_arm", "oncoming_arm", "ahead_arm"}:
+        """Return true only for actors already expressed in a junction frame.
+
+        A crossing heading or a left/right arm hint from the VLM is not enough to
+        prove the road topology is a junction; accident frames often contain
+        sideways/rotated vehicles on ordinary roads.  Junction structure should
+        be required by road topology evidence, not by actor pose alone.
+        """
+        if entity.get("junction_leg") or entity.get("junction_direction"):
             return True
-        heading = str(
-            entity.get("heading_relation_to_ego")
-            or entity.get("heading_relation")
-            or ""
-        ).strip().lower()
-        return heading == "crossing"
+        return str(entity.get("junction_placement") or "").strip().lower() == "frame"
 
     @classmethod
     def _scene_requires_junction_structure(cls, scene_understanding: dict) -> bool:
         road_network = scene_understanding.get("road_network") or {}
         map_matching = road_network.get("map_matching") or {}
-        if bool(map_matching.get("junction_visible")):
-            return True
-        if str(map_matching.get("topology_type") or "").strip().lower() in {
+        topology_type = str(map_matching.get("topology_type") or "").strip().lower()
+        junction_type = str(map_matching.get("junction_type") or "").strip().lower()
+        strong_junction_types = {
             "junction",
             "multi_branch",
             "t_junction",
+            "cross_intersection",
             "intersection",
             "signalized_intersection",
-        }:
+            "roundabout",
+        }
+        if topology_type in strong_junction_types or junction_type in strong_junction_types:
             return True
+        target_branch_count = map_matching.get("target_branch_count")
+        if isinstance(target_branch_count, (int, float)) and target_branch_count >= 3:
+            return True
+        branches = map_matching.get("junction_branches")
+        if isinstance(branches, dict) and bool(branches.get("known")):
+            visible_branches = sum(
+                1 for key in ("ahead", "left", "right") if bool(branches.get(key))
+            )
+            if visible_branches >= 2 and bool(map_matching.get("junction_visible")):
+                return True
         for area in road_network.get("special_road_areas") or []:
             area_type = str((area or {}).get("type") or "").strip().lower()
-            if area_type in {"right_fork", "left_fork", "junction"}:
-                return True
-        scene_entities = list(scene_understanding.get("traffic_subjects") or [])
-        scene_entities += list(scene_understanding.get("background_traffic") or [])
-        for entity in scene_entities:
-            if cls._entity_requires_junction_structure(entity):
+            if area_type in {
+                "junction",
+                "intersection",
+                "t_junction",
+                "cross_intersection",
+                "multi_branch",
+            }:
                 return True
         return False
 
@@ -586,6 +599,7 @@ class AutoGenerator:
         relation_dsl = build_relation_dsl(
             scene_understanding,
             self.carla_spawn_context,
+            legacy_actor_layout=self.legacy_actor_layout,
         )
         self._write_debug_json(scene_id, "relation_dsl", relation_dsl)
         return relation_dsl
@@ -630,17 +644,16 @@ class AutoGenerator:
         of drifting off a fixed axis, with heading taken from the lane tangent.
         No-op when no structural description was matched.
         """
+        if self.legacy_actor_layout:
+            refined.setdefault("metadata", {})["layout_version"] = "legacy"
+            return refined
         matched_structure = (self.carla_spawn_context or {}).get("matched_structure")
         if not isinstance(matched_structure, dict):
-            if self._coordinates_require_junction_structure(refined):
-                self._require_junction_structure("Junction actor layout")
             return refined
         kind = str(matched_structure.get("kind") or "").lower()
         if kind == "junction":
             print("Re-placing actors in junction reference frame.......")
         elif kind in ("road_segment", "road", "straight", "curve"):
-            if self._coordinates_require_junction_structure(refined):
-                self._require_junction_structure("Junction actor layout")
             print("Re-laying actors along matched road centreline.......")
         else:
             if self._coordinates_require_junction_structure(refined):
@@ -1178,32 +1191,6 @@ class AutoGenerator:
         }
 
     @staticmethod
-    def _is_parking_or_edge_entity(entity: dict) -> bool:
-        text = " ".join(
-            str(entity.get(key) or "").lower()
-            for key in (
-                "lane_side_relation",
-                "placement_mode",
-                "motion_state",
-                "behavior",
-                "role",
-                "description",
-            )
-        )
-        return any(
-            token in text
-            for token in (
-                "parking",
-                "parked",
-                "curb",
-                "curbside",
-                "edge",
-                "shoulder",
-                "sidewalk",
-            )
-        )
-
-    @staticmethod
     def _nearest_dense_waypoint(location: dict, dense_wps: list) -> Optional[dict]:
         if not location or not dense_wps:
             return None
@@ -1241,8 +1228,6 @@ class AutoGenerator:
                 continue
             entity_id = str(actor.get("id") or "")
             entity = entities_by_id.get(entity_id) or actor
-            if self._is_parking_or_edge_entity(entity):
-                continue
             spawn_kind = str(entity.get("spawn_kind") or actor.get("spawn_kind") or "vehicle")
             if spawn_kind != "vehicle":
                 continue
@@ -2699,19 +2684,23 @@ class AutoGenerator:
         refined = self.reproject_junction_step(scene_id, refined)
         self.build_spawn_payload_from_match_or_fallback(scene_id, refined, match_report_path)
         final_scene_path = self.generate_final_scene_script(scene_id, match_report_path)
-        self.verify_and_repair_spawn_layout(
-            scene_id,
-            image_path,
-            user_scene_description,
-            scene_understanding,
-            relation_dsl,
-            validation,
-            match_report_path,
-            final_scene_path,
-        )
+        if self.enable_scene_verify:
+            self.verify_and_repair_spawn_layout(
+                scene_id,
+                image_path,
+                user_scene_description,
+                scene_understanding,
+                relation_dsl,
+                validation,
+                match_report_path,
+                final_scene_path,
+            )
+        else:
+            print("Spawn layout verify-repair skipped.")
         print(f"  Scene match report: {match_report_path}")
         print(f"  Spawn script:       {final_scene_path}")
-        print(f"  Repair summary:     {self._spawn_layout_repair_summary_path(scene_id)}")
+        if self.enable_scene_verify:
+            print(f"  Repair summary:     {self._spawn_layout_repair_summary_path(scene_id)}")
 
     def generate_interpretation(self, user_request, input_dict):
         """
@@ -2740,7 +2729,7 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--image-path",
-        default=os.path.join(os.getcwd(), "data", "start.jpg"),
+        default=os.path.join(os.getcwd(), "data", "0107.jpg"),
         help="Input camera image to reconstruct (default: data/0107.jpg).",
     )
     parser.add_argument(
@@ -2750,7 +2739,7 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--user-input",
-        default="At a signal-controlled intersection featuring a right-hand fork, the ego vehicle has arrived at the junction; an oncoming vehicle has also reached the intersection, and there are several other vehicles on the right-hand fork.",
+        default="",
         help="Optional extra scene description merged into the interpreter request.",
     )
     args = parser.parse_args()
@@ -2771,7 +2760,7 @@ if __name__ == "__main__":
         "require_carla_connection": True,
         "spawn_point_limit": 12,
         "enable_scene_match": True,
-        "enable_scene_verify": True,
+        "enable_scene_verify": False,
         "verify_max_rounds": 2,
         "verify_min_score": 0.70,
         "verify_mode": "actor_graph",

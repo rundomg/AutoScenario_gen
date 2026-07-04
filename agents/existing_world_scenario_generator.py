@@ -787,6 +787,8 @@ class ExistingWorldScenarioGenerator(ScenarioGenerator):
             "def _autoscenario_apply_heading_relation(entity, rotation, ego_yaw):\n"
             "    if ego_yaw is None:\n"
             "        return rotation\n"
+            "    if str(entity.get('flow_compliance') or '').lower() == 'wrong_way':\n"
+            "        return rotation\n"
             "    relation = str(entity.get('heading_relation') or 'unknown')\n"
             "    yaw = float(rotation.yaw)\n"
             "    if relation == 'opposite_direction' and _autoscenario_angle_distance(yaw, ego_yaw) < 90.0:\n"
@@ -1977,18 +1979,6 @@ class ExistingWorldScenarioGenerator(ScenarioGenerator):
             actor_by_id = _autoscenario_spawn_payload_actors(spawn_payload)
             _autoscenario_focus_spectator()
 
-            # VLM-judged motion state per actor (canonical: moving/stopped/parked/unknown).
-            # Used to decide which background vehicles get a flying start: anything not
-            # explicitly parked/stopped is treated as moving (the VLM frequently returns
-            # 'unknown' for traffic that is in fact driving).
-            _autoscenario_motion_by_id = {
-                str(_entity.get('id') or ''): str(_entity.get('motion_state') or 'unknown').strip().lower()
-                for _entity in spawn_payload.get('entities', [])
-            }
-
-            def _autoscenario_is_parked(actor_id):
-                return _autoscenario_motion_by_id.get(str(actor_id)) in ('parked', 'stopped')
-
             def _autoscenario_sampled_flying_speed(actor_id, cruise_speed_mps, low=0.85, high=1.0):
                 # Deterministic per-actor speed in [low, high] x cruise so background
                 # traffic is not a lock-step formation, while runs of the same scene stay
@@ -2097,16 +2087,10 @@ class ExistingWorldScenarioGenerator(ScenarioGenerator):
                 try:
                     if 'vehicle' not in _bg_actor.type_id:
                         continue
-                    # Parked / stopped vehicles stay exactly where the VLM placed
-                    # them: no flying start and no autopilot, so they neither drive
-                    # off nor become moving traffic.
-                    if _autoscenario_is_parked(_bg_id):
-                        _autoscenario_hold_vehicle_stationary(_bg_actor)
-                        continue
-                    # Moving (or motion-unknown) background vehicles get a sampled
-                    # flying start so e.g. a same-lane lead car is already rolling
-                    # instead of being a 0-speed obstacle for the flying-start ego,
-                    # then autopilot keeps them driving.
+                    # Background vehicles get a sampled flying start so e.g. a
+                    # same-lane lead car is already rolling instead of being a
+                    # 0-speed obstacle for the flying-start ego, then autopilot
+                    # keeps them driving.
                     if os.environ.get('AUTOSCENARIO_DISABLE_FLYING_START', '0') == '0':
                         _autoscenario_apply_target_velocity(
                             _bg_actor,

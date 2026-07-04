@@ -33,7 +33,7 @@ from tools.reference_frame import (
 DEFAULT_LANE_WIDTH_M = 3.5
 DEFAULT_EGO_DISTANCE_M = 12.0
 MIN_LEG_DISTANCE_M = 3.0
-MIN_VEHICLE_QUEUE_SPACING_M = 5.5
+MIN_VEHICLE_LEG_SPACING_M = 5.5
 
 
 def _slug(value: Any) -> str:
@@ -105,13 +105,9 @@ def direction_and_motion_for_entity(
         elif travel in {"away_from_junction", "leaving", "outbound", "exiting"}:
             motion = "leaving"
         if motion is None:
-            position = _slug(anchor_relation.get("position_along_anchor"))
-            if position in {"exiting", "far_arm"} and layout_anchor in {"ahead_arm", "left_arm", "right_arm"}:
-                motion = "leaving"
-            elif layout_anchor == "ahead_arm":
-                motion = "leaving"
-            else:
-                motion = "approaching"
+            # Without an explicit travel direction, default an actor on the arm
+            # ahead/across to leaving and any other arm to approaching.
+            motion = "leaving" if layout_anchor == "ahead_arm" else "approaching"
         if direction is not None:
             return direction, motion
 
@@ -161,6 +157,29 @@ def _leg_distance_for_entity(
     floor = max(MIN_LEG_DISTANCE_M, float(clearance_m))
     if is_ego:
         return max(floor, float(ego_distance_m))
+    anchor_relation = entity.get("anchor_relation") or {}
+    if isinstance(anchor_relation, dict):
+        for key in (
+            "distance_to_junction_m",
+            "distance_from_junction_m",
+            "junction_distance_m",
+        ):
+            try:
+                distance = abs(float(anchor_relation.get(key)))
+            except (TypeError, ValueError):
+                continue
+            if distance > 0:
+                return max(floor, distance)
+        position = _slug(
+            anchor_relation.get("position_along_anchor")
+            or anchor_relation.get("position")
+        )
+        if position in {"near_mouth", "entering", "at_mouth", "mouth"}:
+            return max(floor, 6.0)
+        if position in {"mid_arm", "middle", "mid"}:
+            return max(floor, 18.0)
+        if position in {"far_arm", "far"}:
+            return max(floor, 38.0)
     longitudinal = entity.get("longitudinal_m")
     try:
         longitudinal = abs(float(longitudinal))
@@ -171,30 +190,32 @@ def _leg_distance_for_entity(
     return max(floor, float(ego_distance_m))
 
 
-def _lane_from_right_for_entity(entity: Dict[str, Any]) -> int:
-    anchor_relation = entity.get("anchor_relation") or {}
-    if isinstance(anchor_relation, dict):
-        for key in ("lane_from_right", "lane_index_from_right", "lane_index"):
-            try:
-                return max(0, int(anchor_relation.get(key)))
-            except (TypeError, ValueError):
-                pass
-        lateral = _slug(anchor_relation.get("lateral"))
-        if lateral in {"left_lane", "adjacent_left_lane"}:
-            return 1
-        if lateral in {"same_lane", "right_lane", "adjacent_right_lane"}:
-            return 0
-    try:
-        return max(0, abs(int(entity.get("lane_index_relation") or 0)))
-    except (TypeError, ValueError):
-        return 0
-
-
 def _lanes_for_motion(leg: Any, motion: str) -> List[Dict[str, Any]]:
     lanes = leg.lanes_for_motion(motion) if hasattr(leg, "lanes_for_motion") else []
     # OpenDRIVE lane ids grow outward from the reference line.  The rightmost
     # lane on a carriageway is therefore the largest |lane_id|, not lane 1.
     return sorted(lanes, key=lambda lane: -abs(int(lane.get("lane_id", 0) or 0)))
+
+
+def _entity_lane_index(entity: Dict[str, Any]) -> int:
+    try:
+        return int(entity.get("lane_index_relation") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _anchor_lane_from_right(entity: Dict[str, Any]) -> Optional[int]:
+    anchor_relation = entity.get("anchor_relation")
+    if not isinstance(anchor_relation, dict):
+        return None
+    for key in ("lane_from_right", "lane_index_from_right"):
+        try:
+            value = int(anchor_relation.get(key))
+        except (TypeError, ValueError):
+            continue
+        if value >= 0:
+            return value
+    return None
 
 
 def _lateral_for_entity(
@@ -203,62 +224,37 @@ def _lateral_for_entity(
     motion: str,
     lane_width: float,
 ) -> Tuple[float, Optional[Dict[str, Any]], int]:
-    """Lateral offset (right of the leg's outbound direction) placing the actor
-    in the correct travel lane rather than on the road centreline.
+    """Lateral offset placing the actor in its ego-relative lane band.
 
-    ``place`` offsets to the right of the *outbound* heading. For right-hand
-    traffic the proper travel lane is half a lane width to the right of the
-    direction of travel, so an inbound (approaching) actor -- whose travel is
-    opposite the outbound heading -- sits at ``-0.5`` lane widths, and an
-    outbound (leaving) actor at ``+0.5``. Placing on the centreline (0) lets the
-    lane snapper pick the opposing lane, which is what produced 180-degree
-    heading mismatches.
+    The half-lane offset to the correct side of the *outbound* heading is
+    load-bearing for heading fidelity, not a fine placement knob: for right-hand
+    traffic an inbound (approaching) actor -- whose travel is opposite the
+    outbound heading -- sits at ``-0.5`` lane widths and an outbound (leaving)
+    actor at ``+0.5``.  ``lane_index_relation`` is then applied in the actor's
+    travel frame, so right-lane and left-lane image evidence does not collapse
+    onto the same junction leg centreline.
     """
     lanes = _lanes_for_motion(leg, motion)
-    lane_from_right = _lane_from_right_for_entity(entity)
+    explicit_from_right = _anchor_lane_from_right(entity)
+    heading = _slug(entity.get("heading_relation"))
+    lane_index = 0 if heading == "crossing" else _entity_lane_index(entity)
+    lane_slot = explicit_from_right if explicit_from_right is not None else abs(lane_index)
+    spacing_slot = lane_slot if explicit_from_right is not None else lane_index
     if lanes:
-        lane_from_right = min(lane_from_right, len(lanes) - 1)
-        selected_lane = lanes[lane_from_right]
+        selected_lane = lanes[min(max(0, lane_slot), len(lanes) - 1)]
     else:
-        lane_from_right = 0
         selected_lane = None
-    lane_center_offset = (lane_from_right + 0.5) * float(lane_width)
-    if str(motion or "approaching").lower() != "leaving":
-        lane_center_offset = -lane_center_offset
-    return lane_center_offset, selected_lane, lane_from_right
 
-
-def _anchor_distance_for_entity(
-    entity: Dict[str, Any],
-    is_ego: bool,
-    ego_distance_m: float,
-    clearance_m: float,
-) -> float:
-    anchor_relation = entity.get("anchor_relation") or {}
-    if not isinstance(anchor_relation, dict) or is_ego:
-        return _leg_distance_for_entity(entity, is_ego, ego_distance_m, clearance_m)
-    position = _slug(anchor_relation.get("position_along_anchor"))
-    floor = max(MIN_LEG_DISTANCE_M, float(clearance_m))
-    order = None
-    try:
-        order = max(0, int(anchor_relation.get("longitudinal_order_from_junction")))
-    except (TypeError, ValueError):
-        pass
-    if position in {"entering", "inside_junction", "junction_center"}:
-        base_distance = floor
-    elif position in {"near_mouth", "stop_line"}:
-        base_distance = max(floor, 8.0)
-    elif position in {"mid_arm", "middle"}:
-        base_distance = max(floor, 25.0)
-    elif position in {"far_arm", "far"}:
-        base_distance = max(floor, 40.0)
+    lane_center_offset = 0.5 * float(lane_width)
+    if str(motion or "approaching").lower() == "leaving":
+        # Right of travel is right of the outbound leg heading.
+        lane_center_offset += lane_index * float(lane_width)
     else:
-        base_distance = _leg_distance_for_entity(
-            entity, is_ego, ego_distance_m, clearance_m
-        )
-    if order is not None:
-        return base_distance + order * MIN_VEHICLE_QUEUE_SPACING_M
-    return base_distance
+        # Approaching actors travel opposite the outbound leg heading, so their
+        # right side is negative in the leg's outbound-lateral frame.
+        lane_center_offset = -lane_center_offset
+        lane_center_offset -= lane_index * float(lane_width)
+    return lane_center_offset, selected_lane, spacing_slot
 
 
 def _spaced_leg_distance(
@@ -276,8 +272,8 @@ def _spaced_leg_distance(
     key = (str(leg_name), str(motion), int(lane_from_right))
     distance = float(base_distance)
     occupied = slots.setdefault(key, [])
-    while any(abs(distance - other) < MIN_VEHICLE_QUEUE_SPACING_M for other in occupied):
-        distance += MIN_VEHICLE_QUEUE_SPACING_M
+    while any(abs(distance - other) < MIN_VEHICLE_LEG_SPACING_M for other in occupied):
+        distance += MIN_VEHICLE_LEG_SPACING_M
     occupied.append(distance)
     return distance
 
@@ -328,15 +324,15 @@ def reproject_actors_for_junction(
             continue
 
         z = float((entity.get("location") or {}).get("z", 0.3) or 0.3)
-        lateral_m, selected_lane, lane_from_right = _lateral_for_entity(
+        lateral_m, selected_lane, lane_slot = _lateral_for_entity(
             entity, leg, motion, lane_width
         )
         distance_m = _spaced_leg_distance(
-            _anchor_distance_for_entity(entity, is_ego, ego_dist, clearance),
+            _leg_distance_for_entity(entity, is_ego, ego_dist, clearance),
             slots=leg_slots,
             leg_name=leg.name,
             motion=motion,
-            lane_from_right=lane_from_right,
+            lane_from_right=lane_slot,
             is_ego=is_ego,
         )
         placement = frame.place(
@@ -359,8 +355,10 @@ def reproject_actors_for_junction(
         entity["junction_direction"] = direction
         entity["junction_leg"] = leg.name
         entity["junction_motion"] = motion
-        entity["junction_lane_from_right"] = lane_from_right
         entity["junction_distance_m"] = distance_m
+        entity["layout_version"] = entity.get("layout_version") or "v2"
+        entity["layout_scene_kind"] = "junction"
+        entity["placement_reason"] = "junction arm placement"
         if selected_lane is not None:
             entity["projected_lane"] = {
                 "road_id": selected_lane.get("road_id"),
@@ -382,7 +380,8 @@ def reproject_actors_for_junction(
             "leg": leg.name,
             "yaw": round(placement.yaw, 1),
             "ok": ok,
-            "lane_from_right": lane_from_right,
+            "lateral_m": round(lateral_m, 3),
+            "lane_slot": lane_slot,
             "selected_lane": selected_lane,
         })
         assignments.append(record)
@@ -393,6 +392,8 @@ def reproject_actors_for_junction(
         "ego_distance_to_center_m": ego_dist,
         "assignments": assignments,
     }
+    coordinates.setdefault("metadata", {})["layout_version"] = "v2"
+    coordinates.setdefault("metadata", {})["layout_scene_kind"] = "junction"
     return coordinates
 
 
@@ -475,6 +476,9 @@ def reproject_actors_for_road(
         entity["location"] = dict(placement.location)
         entity["rotation"] = {"pitch": 0.0, "yaw": placement.yaw, "roll": 0.0}
         entity["road_placement"] = "frame"
+        entity["layout_version"] = entity.get("layout_version") or "v2"
+        entity["layout_scene_kind"] = "open_road"
+        entity["placement_reason"] = "open-road matched-structure placement"
 
         ok, reason = check_heading_consistency(
             yaw=placement.yaw,
@@ -500,4 +504,6 @@ def reproject_actors_for_road(
         "curved": len(matched_structure.get("curve_samples") or []) > 1,
         "assignments": assignments,
     }
+    coordinates.setdefault("metadata", {})["layout_version"] = "v2"
+    coordinates.setdefault("metadata", {})["layout_scene_kind"] = "open_road"
     return coordinates

@@ -116,7 +116,7 @@ class ReprojectionTests(unittest.TestCase):
         self.assertAlmostEqual(angle_difference(moto["rotation"]["yaw"], ego["rotation"]["yaw"]), 0.0, places=3)
         self.assertEqual(moto["heading_consistency"], "wrong_way_preserved")
 
-    def test_layout_anchor_overrides_ego_relative_guess_and_selects_lane(self):
+    def test_layout_anchor_overrides_ego_relative_guess_and_picks_rightmost_lane(self):
         struct = _cross_structure()
         for leg in struct["legs"]:
             if leg["name"] == "north":
@@ -132,8 +132,6 @@ class ReprojectionTests(unittest.TestCase):
                 "layout_anchor_id": "left_arm",
                 "anchor_relation": {
                     "travel_direction": "toward_junction",
-                    "lane_from_right": 1,
-                    "position_along_anchor": "near_mouth",
                 },
                 "location": {"x": 0, "y": 0, "z": 0.3},
             }
@@ -144,11 +142,35 @@ class ReprojectionTests(unittest.TestCase):
         actor = out["entities"][0]
         self.assertEqual(actor["junction_leg"], "north")
         self.assertEqual(actor["junction_motion"], "approaching")
-        self.assertEqual(actor["junction_lane_from_right"], 1)
-        self.assertEqual(actor["projected_lane"]["lane_id"], -1)
+        # With no explicit lane band, the rightmost travel lane is used.
+        self.assertEqual(actor["projected_lane"]["lane_id"], -2)
         self.assertEqual(actor["projected_lane"]["yaw"], None)
 
-    def test_ego_lane_from_right_zero_selects_outermost_approach_lane(self):
+    def test_junction_lane_index_changes_lateral_band(self):
+        coords = {"entities": [
+            {
+                "id": "left_car",
+                "heading_relation": "same_direction",
+                "lane_index_relation": -1,
+                "location": {"x": 0, "y": 0, "z": 0.3},
+            },
+            {
+                "id": "right_car",
+                "heading_relation": "same_direction",
+                "lane_index_relation": 1,
+                "location": {"x": 0, "y": 0, "z": 0.3},
+            },
+        ]}
+
+        out = reproject_actors_for_junction(coords, _cross_structure())
+
+        left = next(e for e in out["entities"] if e["id"] == "left_car")
+        right = next(e for e in out["entities"] if e["id"] == "right_car")
+        self.assertEqual(left["junction_leg"], right["junction_leg"])
+        self.assertAlmostEqual(left["junction_distance_m"], right["junction_distance_m"])
+        self.assertGreater(abs(left["location"]["y"] - right["location"]["y"]), 6.0)
+
+    def test_picks_rightmost_approach_lane(self):
         struct = _cross_structure()
         for leg in struct["legs"]:
             if leg["name"] == "west":
@@ -161,7 +183,6 @@ class ReprojectionTests(unittest.TestCase):
                 "id": "ego",
                 "priority": "ego",
                 "heading_relation": "same_direction",
-                "anchor_relation": {"lane_from_right": 0},
                 "location": {"x": 0, "y": 0, "z": 0.3},
             }
         ]}
@@ -169,7 +190,6 @@ class ReprojectionTests(unittest.TestCase):
         out = reproject_actors_for_junction(coords, struct)
 
         ego = out["entities"][0]
-        self.assertEqual(ego["junction_lane_from_right"], 0)
         self.assertEqual(ego["projected_lane"]["lane_id"], 2)
 
     def test_same_arm_near_mouth_vehicles_are_queued_not_overlapped(self):
@@ -210,43 +230,11 @@ class ReprojectionTests(unittest.TestCase):
         actors = out["entities"]
         distances = [actor["junction_distance_m"] for actor in actors]
         self.assertEqual([actor["junction_leg"] for actor in actors], ["south", "south", "south"])
-        self.assertEqual(len(set(round(distance, 2) for distance in distances)), 3)
-        for first, second in zip(distances, distances[1:]):
-            self.assertGreaterEqual(second - first, 5.5)
-
-    def test_longitudinal_order_from_junction_controls_right_arm_queue(self):
-        struct = _cross_structure()
-        coords = {"entities": [
-            {
-                "id": "farther",
-                "heading_relation": "crossing",
-                "layout_anchor_id": "right_arm",
-                "anchor_relation": {
-                    "position_along_anchor": "near_mouth",
-                    "travel_direction": "away_from_junction",
-                    "longitudinal_order_from_junction": 1,
-                },
-                "location": {"x": 0, "y": 0, "z": 0.3},
-            },
-            {
-                "id": "closest",
-                "heading_relation": "crossing",
-                "layout_anchor_id": "right_arm",
-                "anchor_relation": {
-                    "position_along_anchor": "near_mouth",
-                    "travel_direction": "away_from_junction",
-                    "longitudinal_order_from_junction": 0,
-                },
-                "location": {"x": 0, "y": 0, "z": 0.3},
-            },
-        ]}
-
-        out = reproject_actors_for_junction(coords, struct)
-
-        by_id = {actor["id"]: actor for actor in out["entities"]}
-        self.assertLess(
-            by_id["closest"]["junction_distance_m"],
-            by_id["farther"]["junction_distance_m"],
+        self.assertGreaterEqual(distances[1] - distances[0], 5.5)
+        self.assertAlmostEqual(distances[2], distances[0])
+        self.assertGreater(
+            abs(actors[2]["location"]["x"] - actors[0]["location"]["x"]),
+            6.0,
         )
 
     def test_missing_leg_left_unassigned(self):

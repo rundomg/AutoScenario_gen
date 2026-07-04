@@ -20,7 +20,6 @@ if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
 from tools import vehicle_detector
-from tools import depth_estimator
 
 
 def _auto_pick_image() -> str | None:
@@ -57,22 +56,27 @@ def main() -> int:
               "install with `pip install ultralytics`).")
         return 0
 
-    depth_estimator.attach_depth(image_path, detections)
-    has_depth = any("depth_m" in d for d in detections)
+    representative = vehicle_detector.select_representative_detections(detections)
+    row_hints = vehicle_detector.infer_row_group_hints(representative)
 
-    print(f"detected {len(detections)} vehicles"
-          f"{' (with depth)' if has_depth else ' (no depth)'}:")
-    print(f"  {'id':<8} {'label':<11} {'conf':>5} {'depth':>8}  {'center (cx,cy)':<16} bbox_norm")
-    for d in detections:
+    print(f"detected {len(detections)} vehicles; "
+          f"{len(representative)} representative boxes after dedupe:")
+    print(f"  {'id':<8} {'label':<11} {'conf':>5}  {'center (cx,cy)':<16} bbox_norm")
+    for d in representative:
         cx, cy = d["center_norm"]
-        depth = f"{d['depth_m']}m" if "depth_m" in d else "-"
-        print(f"  {d['id']:<8} {d['label']:<11} {d['conf']:>5.2f} {depth:>8}  "
+        print(f"  {d['id']:<8} {d['label']:<11} {d['conf']:>5.2f}  "
               f"({cx:.3f}, {cy:.3f})    {d['bbox_norm']}")
+    if row_hints:
+        print("\nrow hints:")
+        print(vehicle_detector.format_row_hints_for_prompt(row_hints))
 
     out_path = args.out or f"{os.path.splitext(image_path)[0]}_detections.jpg"
-    written = vehicle_detector.annotate_image(image_path, detections, out_path)
+    written = vehicle_detector.annotate_image(image_path, representative, out_path)
+    crops = vehicle_detector.write_detection_crops(image_path, representative)
     print(f"\nannotated image -> {written}" if written
           else "\nannotated image not written.")
+    if crops:
+        print(f"vehicle crops -> {len(crops)} files")
     return 0
 
 

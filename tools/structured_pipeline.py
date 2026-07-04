@@ -339,6 +339,64 @@ def _correct_lane_index_for_heading(
     return lane_index
 
 
+def _map_matching_scene_kind(scene_understanding: Dict[str, Any]) -> str:
+    road_network = _coerce_dict(scene_understanding.get("road_network"))
+    map_matching = _coerce_dict(road_network.get("map_matching"))
+    topology_type = _slugify(map_matching.get("topology_type"))
+    junction_type = _slugify(map_matching.get("junction_type"))
+    junction_visible = map_matching.get("junction_visible")
+    junction_topologies = {
+        "junction",
+        "t_junction",
+        "cross_intersection",
+        "multi_branch",
+        "roundabout",
+        "signalized_intersection",
+        "intersection",
+    }
+    open_topologies = {"straight_road", "straight_two_way", "curve", "road_segment"}
+    if junction_visible is True or topology_type in junction_topologies or junction_type in junction_topologies:
+        return "junction"
+    if junction_visible is False and topology_type in open_topologies:
+        return "open_road"
+    branches = _coerce_dict(map_matching.get("junction_branches"))
+    if bool(branches.get("known")) and junction_visible is True:
+        return "junction"
+    return "unknown"
+
+
+def _actor_layout_scene_kind(
+    scene_understanding: Dict[str, Any],
+    spawn_context: Optional[Dict[str, Any]] = None,
+) -> str:
+    matched_structure = _coerce_dict((spawn_context or {}).get("matched_structure"))
+    if str(matched_structure.get("kind") or "").lower() == "junction":
+        return "junction"
+    scene_kind = _map_matching_scene_kind(scene_understanding)
+    return "open_road" if scene_kind == "unknown" else scene_kind
+
+
+def _vehicle_crossing_degraded_on_open_road(
+    entity: Dict[str, Any],
+    heading: str,
+    category: str,
+) -> bool:
+    if category not in VEHICLE_CATEGORIES or heading != "crossing":
+        return False
+    lane_side = _canonical_lane_side(entity.get("lane_side_relation"))
+    layout_anchor = _slugify(entity.get("layout_anchor_id"))
+    anchor_relation = _coerce_dict(entity.get("anchor_relation"))
+    if lane_side == "crosswalk":
+        return False
+    if layout_anchor and (
+        "junction" in layout_anchor
+        or layout_anchor.endswith("_arm")
+        or anchor_relation.get("travel_direction")
+    ):
+        return False
+    return True
+
+
 def _normalize_lane_fields(entity: Dict[str, Any], category: str) -> Tuple[str, int]:
     lane_side = _canonical_lane_side(entity.get("lane_side_relation"))
     lane_index = _canonical_lane_index(entity.get("lane_index_relation"), lane_side)
@@ -453,11 +511,152 @@ def _canonical_road_type(value: Any) -> str:
 def _canonical_density_role(value: Any) -> str:
     normalized = _slugify(value)
     mapping = {
-        "curbside_parking_row": "curbside_row",
         "roadside_activity": "sidewalk_group",
         "sparse_opposing_flow": "opposing_flow",
     }
     return mapping.get(normalized, normalized or "sparse_filler")
+
+
+def _canonical_actor_group_type(value: Any) -> str:
+    normalized = _slugify(value)
+    return "individual_vehicle"
+
+
+def _canonical_group_order_rule(value: Any) -> str:
+    normalized = _slugify(value)
+    if normalized in {
+        "toward_junction",
+        "away_from_junction",
+        "image_left_to_right",
+        "image_bottom_to_top",
+    }:
+        return normalized
+    return ""
+
+
+def _canonical_placement_mode_hint(value: Any, actor_group_type: str) -> str:
+    normalized = _slugify(value)
+    if normalized == "normal_lane_actor":
+        return normalized
+    return "normal_lane_actor"
+
+
+def _canonical_map_topology_type(value: Any, junction_visible: Any, branch_count: Optional[int]) -> str:
+    normalized = _slugify(value)
+    if normalized in {
+        "straight_road",
+        "straight_two_way",
+        "curve",
+        "t_junction",
+        "cross_intersection",
+        "multi_branch",
+        "roundabout",
+        "unknown",
+    }:
+        return normalized
+    if normalized in {"signalized_intersection", "signalized_intersection_approach", "intersection"}:
+        if branch_count and branch_count >= 4:
+            return "cross_intersection"
+        if branch_count == 3:
+            return "t_junction"
+        return "cross_intersection" if junction_visible is True else "unknown"
+    if "cross" in normalized or "four" in normalized:
+        return "cross_intersection"
+    if "t_junction" in normalized or "three" in normalized:
+        return "t_junction"
+    if "multi" in normalized:
+        return "multi_branch"
+    if "roundabout" in normalized:
+        return "roundabout"
+    return normalized or "unknown"
+
+
+def _normalize_junction_branches(value: Any, *, junction_visible: Any = None) -> Dict[str, bool]:
+    if isinstance(value, dict):
+        return {
+            "ahead": bool(value.get("ahead", junction_visible is True)),
+            "left": bool(value.get("left", False)),
+            "right": bool(value.get("right", False)),
+            "known": bool(value.get("known", True)),
+        }
+    if isinstance(value, (list, tuple, set)):
+        tokens = {_slugify(item) for item in value}
+        return {
+            "ahead": bool(tokens & {"ahead", "ahead_arm", "straight", "through", "oncoming", "oncoming_arm"}),
+            "left": bool(tokens & {"left", "left_arm", "left_branch"}),
+            "right": bool(tokens & {"right", "right_arm", "right_branch"}),
+            "known": bool(tokens),
+        }
+    text = _slugify(value)
+    if not text:
+        return {"ahead": False, "left": False, "right": False, "known": False}
+    return {
+        "ahead": "ahead" in text or "through" in text or "oncoming" in text,
+        "left": "left" in text,
+        "right": "right" in text,
+        "known": True,
+    }
+
+
+def _normalize_map_matching_contract(map_matching: Dict[str, Any]) -> Dict[str, Any]:
+    normalized = dict(map_matching)
+    junction_visible = normalized.get("junction_visible")
+    target_branch_count = _optional_int(normalized.get("target_branch_count"))
+    branches = _normalize_junction_branches(
+        normalized.get("junction_branches"),
+        junction_visible=junction_visible,
+    )
+    raw_topology = _slugify(normalized.get("topology_type"))
+    no_visible_side_branch = not bool(branches.get("left")) and not bool(branches.get("right"))
+    straight_or_approach = (
+        "approach" in raw_topology
+        or raw_topology in {
+            "signalized_intersection",
+            "signalized_intersection_approach",
+            "intersection_approach",
+        }
+    )
+    if no_visible_side_branch and straight_or_approach:
+        branches = {"ahead": False, "left": False, "right": False, "known": False}
+        normalized["junction_visible"] = False
+        normalized["junction_type"] = "none"
+        normalized["topology_type"] = "straight_road"
+        normalized["target_branch_count"] = 1
+        normalized["ego_to_junction_distance_m"] = None
+        normalized["junction_branches"] = branches
+        return normalized
+    if branches.get("known"):
+        normalized["junction_branches"] = branches
+        visible_dirs = int(branches["ahead"]) + int(branches["left"]) + int(branches["right"])
+        if target_branch_count is None and visible_dirs > 0:
+            target_branch_count = visible_dirs + 1
+    if target_branch_count is not None:
+        normalized["target_branch_count"] = max(1, target_branch_count)
+    normalized["topology_type"] = _canonical_map_topology_type(
+        normalized.get("topology_type"),
+        junction_visible,
+        target_branch_count,
+    )
+    junction_type = _slugify(normalized.get("junction_type"))
+    if junction_type in {"signalized_intersection", "intersection"}:
+        if normalized.get("topology_type") == "cross_intersection":
+            normalized["junction_type"] = "cross_intersection"
+        elif normalized.get("topology_type") == "t_junction":
+            normalized["junction_type"] = "t_junction"
+    if "left_parking_presence" not in normalized and "left_parking_lane_count" in normalized:
+        normalized["left_parking_presence"] = int(normalized.get("left_parking_lane_count") or 0) > 0
+    if "right_parking_presence" not in normalized and "right_parking_lane_count" in normalized:
+        normalized["right_parking_presence"] = int(normalized.get("right_parking_lane_count") or 0) > 0
+    return normalized
+
+
+def _optional_int(value: Any) -> Optional[int]:
+    if value is None or value == "":
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def _canonical_color_name(value: Any) -> Optional[str]:
@@ -612,6 +811,7 @@ def normalize_scene_understanding(payload: Dict[str, Any]) -> Tuple[Optional[Dic
     _raw_lane_groups = _coerce_list(_coerce_dict(payload.get("road_network")).get("lane_groups"))
     _raw_primary_group = _raw_lane_groups[0] if _raw_lane_groups else {}
     _opposing_lane_count = max(1, int(_raw_primary_group.get("opposing_lane_count", 1)))
+    _layout_scene_kind = _map_matching_scene_kind(payload)
 
     for index, entity in enumerate(_coerce_list(payload.get("traffic_subjects"))):
         if not isinstance(entity, dict):
@@ -619,10 +819,17 @@ def normalize_scene_understanding(payload: Dict[str, Any]) -> Tuple[Optional[Dic
         category = _canonical_entity_category(entity)
         lane_side_relation, lane_index_relation = _normalize_lane_fields(entity, category)
         heading = _canonical_heading(entity.get("heading_relation_to_ego"))
+        actor_group_type = _canonical_actor_group_type(entity.get("actor_group_type"))
+        placement_hint = _canonical_placement_mode_hint(
+            entity.get("placement_mode_hint"),
+            actor_group_type,
+        )
+        motion_state = _canonical_motion_state(entity.get("motion_state"))
         if category in VEHICLE_CATEGORIES:
-            lane_index_relation = _correct_lane_index_for_heading(
-                lane_index_relation, heading, _opposing_lane_count
-            )
+            if _layout_scene_kind != "junction":
+                lane_index_relation = _correct_lane_index_for_heading(
+                    lane_index_relation, heading, _opposing_lane_count
+                )
             lane_side_relation = _lane_side_from_index(lane_index_relation, lane_side_relation)
         normalized["traffic_subjects"].append(
             {
@@ -630,7 +837,7 @@ def normalize_scene_understanding(payload: Dict[str, Any]) -> Tuple[Optional[Dic
                 "category": category,
                 "subtype": _canonical_subtype(entity, category),
                 "visual_confidence": str(entity.get("visual_confidence") or "medium"),
-                "motion_state": _canonical_motion_state(entity.get("motion_state")),
+                "motion_state": motion_state,
                 "turn_intent": _canonical_turn_intent(entity.get("turn_intent")),
                 "heading_relation_to_ego": heading,
                 "flow_compliance": _canonical_flow_compliance(entity.get("flow_compliance")),
@@ -644,6 +851,12 @@ def normalize_scene_understanding(payload: Dict[str, Any]) -> Tuple[Optional[Dic
                 "layout_anchor_id": str(entity.get("layout_anchor_id") or "").strip(),
                 "anchor_relation": _coerce_dict(entity.get("anchor_relation")),
                 "appearance": _normalize_appearance(entity, category),
+                "actor_group_type": actor_group_type,
+                "actor_group_id": str(entity.get("actor_group_id") or entity.get("id") or "").strip(),
+                "group_order_index": _optional_int(entity.get("group_order_index")),
+                "group_order_rule": _canonical_group_order_rule(entity.get("group_order_rule")),
+                "placement_mode_hint": placement_hint,
+                "density_role": _canonical_density_role(entity.get("density_role")),
             }
         )
 
@@ -653,12 +866,18 @@ def normalize_scene_understanding(payload: Dict[str, Any]) -> Tuple[Optional[Dic
         category = _canonical_entity_category(entity)
         density_role = _canonical_density_role(entity.get("density_role"))
         default_count = BACKGROUND_DENSITY_DEFAULTS.get(density_role, 1)
+        actor_group_type = _canonical_actor_group_type(entity.get("actor_group_type"))
+        placement_hint = _canonical_placement_mode_hint(
+            entity.get("placement_mode_hint"),
+            actor_group_type,
+        )
         lane_side_relation, lane_index_relation = _normalize_lane_fields(entity, category)
         bg_heading = _canonical_heading(entity.get("heading_relation_to_ego"))
         if category in VEHICLE_CATEGORIES:
-            lane_index_relation = _correct_lane_index_for_heading(
-                lane_index_relation, bg_heading, _opposing_lane_count
-            )
+            if _layout_scene_kind != "junction":
+                lane_index_relation = _correct_lane_index_for_heading(
+                    lane_index_relation, bg_heading, _opposing_lane_count
+                )
             lane_side_relation = _lane_side_from_index(lane_index_relation, lane_side_relation)
         representative_count = _clamp_int(
             entity.get("representative_count", default_count),
@@ -687,6 +906,11 @@ def normalize_scene_understanding(payload: Dict[str, Any]) -> Tuple[Optional[Dic
                 "anchor_relation": _coerce_dict(entity.get("anchor_relation")),
                 "appearance": _normalize_appearance(entity, category),
                 "density_role": density_role,
+                "actor_group_type": actor_group_type,
+                "actor_group_id": str(entity.get("actor_group_id") or entity.get("id") or "").strip(),
+                "group_order_index": _optional_int(entity.get("group_order_index")),
+                "group_order_rule": _canonical_group_order_rule(entity.get("group_order_rule")),
+                "placement_mode_hint": placement_hint,
             }
         )
 
@@ -755,7 +979,7 @@ def normalize_scene_understanding(payload: Dict[str, Any]) -> Tuple[Optional[Dic
     normalized_road_network = {}
     map_matching = _coerce_dict(road_network.get("map_matching"))
     if map_matching:
-        normalized_road_network["map_matching"] = map_matching
+        normalized_road_network["map_matching"] = _normalize_map_matching_contract(map_matching)
     if "road_type" in road_network:
         normalized_road_network["road_type"] = _canonical_road_type(
             road_network.get("road_type")
@@ -1308,8 +1532,15 @@ def build_relation_dsl(
     scene_understanding: Dict[str, Any],
     spawn_context: Optional[Dict[str, Any]],
     road_artifact: Optional[Dict[str, Any]] = None,
+    *,
+    legacy_actor_layout: bool = False,
 ) -> Dict[str, Any]:
     anchor_lane = select_anchor_lane(spawn_context)
+    layout_scene_kind = (
+        "legacy"
+        if legacy_actor_layout
+        else _actor_layout_scene_kind(scene_understanding, spawn_context)
+    )
     lane_groups = _coerce_list(scene_understanding.get("road_network", {}).get("lane_groups"))
     primary_lane_group = lane_groups[0] if lane_groups else {}
     lane_width_class = str(primary_lane_group.get("lane_width_class") or "standard")
@@ -1325,6 +1556,11 @@ def build_relation_dsl(
 
         category = _canonical_entity_category(expanded)
         subtype = str(expanded.get("subtype") or category)
+        actor_group_type = _canonical_actor_group_type(expanded.get("actor_group_type"))
+        placement_hint = _canonical_placement_mode_hint(
+            expanded.get("placement_mode_hint"),
+            actor_group_type,
+        )
         lane_index_relation = _canonical_lane_index(
             expanded.get("lane_index_relation"),
             expanded.get("lane_side_relation"),
@@ -1344,22 +1580,21 @@ def build_relation_dsl(
         rank_key = (distance_band, lane_anchor)
         distance_order_rank = rank_counters.get(rank_key, 0)
         rank_counters[rank_key] = distance_order_rank + 1
+        explicit_order_index = _optional_int(expanded.get("group_order_index"))
         spawn_kind, blueprint_name = _spawn_blueprint_for_category(category, subtype)
+        heading_relation = str(expanded.get("heading_relation_to_ego") or "unknown")
+        degraded_reason = None
+        if (
+            not legacy_actor_layout
+            and layout_scene_kind == "open_road"
+            and _vehicle_crossing_degraded_on_open_road(expanded, heading_relation, category)
+        ):
+            degraded_reason = "open-road crossing heading degraded to unknown"
+            heading_relation = "unknown"
 
         spacing_m = 0.0
         sub = _slugify(subtype)
-        if (
-            expanded.get("density_role") == "curbside_row"
-            or "row" in sub
-            or sub in {"parked_cars", "parked_vehicle", "parked_vehicle_partial", "partial_parked_vehicle"}
-        ):
-            if sub in {"motorcycle", "motor_scooter", "scooter", "motorbike", "two_wheeler"}:
-                spacing_m = 2.5
-            elif sub in {"bicycle", "bike"}:
-                spacing_m = 1.5
-            else:
-                spacing_m = 6.0
-        elif category == "pedestrian" and source_key == "background_traffic":
+        if category == "pedestrian" and source_key == "background_traffic":
             spacing_m = 3.0
         elif category in STATIC_CATEGORIES:
             spacing_m = 1.2
@@ -1382,13 +1617,22 @@ def build_relation_dsl(
                 "order_relation": order_relation,
                 "distance_band": distance_band,
                 "distance_order_rank": distance_order_rank,
-                "heading_relation": str(expanded.get("heading_relation_to_ego") or "unknown"),
+                "heading_relation": heading_relation,
+                "original_heading_relation": str(
+                    expanded.get("heading_relation_to_ego") or "unknown"
+                ),
                 "flow_compliance": _canonical_flow_compliance(expanded.get("flow_compliance")),
                 "lane_side_relation": lane_side_relation,
                 "motion_state": str(expanded.get("motion_state") or expanded.get("motion_bias") or "unknown"),
                 "turn_intent": _canonical_turn_intent(expanded.get("turn_intent")),
                 "layout_anchor_id": str(expanded.get("layout_anchor_id") or "").strip(),
                 "anchor_relation": _deep_copy(_coerce_dict(expanded.get("anchor_relation"))),
+                "actor_group_type": actor_group_type,
+                "actor_group_id": str(expanded.get("actor_group_id") or expanded.get("id") or expanded_id),
+                "group_order_index": explicit_order_index,
+                "group_order_rule": _canonical_group_order_rule(expanded.get("group_order_rule")),
+                "placement_mode_hint": placement_hint,
+                "density_role": _canonical_density_role(expanded.get("density_role")),
                 "group_instance_index": instance_index,
                 "group_instance_total": instance_total,
                 "group_spacing_m": spacing_m,
@@ -1400,6 +1644,16 @@ def build_relation_dsl(
                     or "medium"
                 ),
                 "appearance": _deep_copy(_coerce_dict(expanded.get("appearance"))),
+                "layout_scene_kind": layout_scene_kind,
+                "layout_version": "legacy" if legacy_actor_layout else "v2",
+                "placement_reason": (
+                    "open-road ego-relative lane/distance placement"
+                    if layout_scene_kind == "open_road"
+                    else "junction arm placement"
+                    if layout_scene_kind == "junction"
+                    else "legacy actor layout"
+                ),
+                "degraded_reason": degraded_reason,
             }
         )
 
@@ -1419,6 +1673,8 @@ def build_relation_dsl(
         "lane_context": _lane_context(scene_understanding, anchor_lane),
         "metadata": {
             "schema_version": "relation-dsl-v1",
+            "layout_version": "legacy" if legacy_actor_layout else "v2",
+            "layout_scene_kind": layout_scene_kind,
             "road_artifact_summary": (road_artifact or {}).get("summary"),
         },
     }
@@ -1609,10 +1865,22 @@ def main():
                 "motion_state": entity.get("motion_state"),
                 "lane_side_relation": entity.get("lane_side_relation"),
                 "heading_relation": heading_relation,
+                "original_heading_relation": entity.get("original_heading_relation"),
+                "flow_compliance": entity.get("flow_compliance"),
                 "road_id": entity.get("road_id"),
                 "layout_anchor_id": entity.get("layout_anchor_id"),
                 "anchor_relation": entity.get("anchor_relation"),
+                "actor_group_type": entity.get("actor_group_type"),
+                "actor_group_id": entity.get("actor_group_id"),
+                "group_order_index": entity.get("group_order_index"),
+                "group_order_rule": entity.get("group_order_rule"),
+                "placement_mode_hint": entity.get("placement_mode_hint"),
+                "density_role": entity.get("density_role"),
                 "appearance": entity.get("appearance"),
+                "layout_version": entity.get("layout_version"),
+                "layout_scene_kind": entity.get("layout_scene_kind"),
+                "placement_reason": entity.get("placement_reason"),
+                "degraded_reason": entity.get("degraded_reason"),
                 "location": {{"x": base_x, "y": base_y, "z": z}},
                 "rotation": {{"pitch": 0.0, "yaw": yaw, "roll": 0.0}},
             }}
@@ -1778,12 +2046,23 @@ def generate_initial_coordinates_from_relation_dsl(
                 "lane_index_relation": entity.get("lane_index_relation", 0),
                 "lane_side_relation": entity.get("lane_side_relation"),
                 "heading_relation": heading_relation,
+                "original_heading_relation": entity.get("original_heading_relation"),
                 "flow_compliance": _canonical_flow_compliance(entity.get("flow_compliance")),
                 "longitudinal_m": longitudinal,
                 "road_id": entity.get("road_id"),
                 "layout_anchor_id": entity.get("layout_anchor_id"),
                 "anchor_relation": _deep_copy(_coerce_dict(entity.get("anchor_relation"))),
+                "actor_group_type": entity.get("actor_group_type"),
+                "actor_group_id": entity.get("actor_group_id"),
+                "group_order_index": entity.get("group_order_index"),
+                "group_order_rule": entity.get("group_order_rule"),
+                "placement_mode_hint": entity.get("placement_mode_hint"),
+                "density_role": entity.get("density_role"),
                 "appearance": _deep_copy(entity.get("appearance")),
+                "layout_version": entity.get("layout_version"),
+                "layout_scene_kind": entity.get("layout_scene_kind"),
+                "placement_reason": entity.get("placement_reason"),
+                "degraded_reason": entity.get("degraded_reason"),
                 "location": {"x": base_x, "y": base_y, "z": z},
                 "rotation": {"pitch": 0.0, "yaw": yaw, "roll": 0.0},
             }
@@ -2764,6 +3043,10 @@ def project_entities_to_carla_context(
         "metadata": {
             **_coerce_dict(raw_coordinates.get("metadata")),
             "projection_version": "carla-context-projection-v2",
+            "layout_version": _coerce_dict(raw_coordinates.get("metadata")).get(
+                "layout_version", "v2"
+            ),
+            "layout_scene_kind": _actor_layout_scene_kind(scene_understanding, spawn_context),
             "coordinate_stage": "projected",
             "dense_waypoints_used": bool(dense_local_waypoints),
         },
@@ -2976,91 +3259,6 @@ def preferred_vehicle_color(entity: Dict[str, Any]) -> Optional[str]:
     if isinstance(raw_color, str) and raw_color.strip():
         return raw_color.strip()
     return None
-
-
-def _anchor_frame_from_coordinates(
-    projected_coordinates: Dict[str, Any],
-) -> Optional[Tuple[float, float, float, float, float]]:
-    anchor_lane = _coerce_dict(projected_coordinates.get("selected_anchor_lane"))
-    start = _coerce_dict(anchor_lane.get("start"))
-    end = _coerce_dict(anchor_lane.get("end"))
-    if not start or not end:
-        return None
-    sx = float(start.get("x", 0.0) or 0.0)
-    sy = float(start.get("y", 0.0) or 0.0)
-    ex = float(end.get("x", sx) or sx)
-    ey = float(end.get("y", sy) or sy)
-    fx, fy = _normalize_vector(ex - sx, ey - sy)
-    yaw = math.degrees(math.atan2(fy, fx))
-    return fx, fy, -fy, fx, yaw
-
-
-def _apply_curb_row_alignment(projected_coordinates: Dict[str, Any]) -> Dict[str, Any]:
-    """Keep representative curbside rows parallel to the road edge."""
-    updated = _deep_copy(projected_coordinates)
-    frame = _anchor_frame_from_coordinates(updated)
-    if frame is None:
-        return updated
-    forward_x, forward_y, right_x, right_y, anchor_yaw = frame
-    entities = _coerce_list(updated.get("entities"))
-    groups: Dict[Tuple[str, str], List[Dict[str, Any]]] = {}
-    for entity in entities:
-        if not _is_vehicle_like(str(entity.get("category") or "")):
-            continue
-        lane_index = int(entity.get("lane_index_relation", 0) or 0)
-        if lane_index == 0:
-            continue
-        group_id = str(entity.get("group_id") or entity.get("source_id") or entity.get("id") or "")
-        group_key = group_id.rsplit("_", 1)[0] if "_" in group_id else group_id
-        groups.setdefault((group_key, str(lane_index)), []).append(entity)
-
-    for (_group_key, _lane_index), row_entities in groups.items():
-        if len(row_entities) < 2:
-            continue
-        row_entities.sort(
-            key=lambda item: (
-                float(_coerce_dict(item.get("location")).get("x", 0.0)) * forward_x
-                + float(_coerce_dict(item.get("location")).get("y", 0.0)) * forward_y
-            )
-        )
-        first_location = _coerce_dict(row_entities[0].get("location"))
-        base_x = float(first_location.get("x", 0.0) or 0.0)
-        base_y = float(first_location.get("y", 0.0) or 0.0)
-        lateral_values = [
-            float(_coerce_dict(item.get("location")).get("x", 0.0)) * right_x
-            + float(_coerce_dict(item.get("location")).get("y", 0.0)) * right_y
-            for item in row_entities
-        ]
-        lateral_center = sum(lateral_values) / len(lateral_values)
-        base_longitudinal = base_x * forward_x + base_y * forward_y
-        base_lateral = (
-            base_x * right_x + base_y * right_y
-            if abs(lateral_center) <= 1e-6
-            else lateral_center
-        )
-        for index, entity in enumerate(row_entities):
-            sub = _slugify(str(entity.get("subtype") or ""))
-            row_spacing = (
-                2.5 if sub in {"motorcycle", "motor_scooter", "scooter", "motorbike", "two_wheeler"}
-                else 1.5 if sub in {"bicycle", "bike"}
-                else 5.5
-            )
-            longitudinal = base_longitudinal + index * row_spacing
-            location = entity.setdefault("location", {})
-            location["x"] = forward_x * longitudinal + right_x * base_lateral
-            location["y"] = forward_y * longitudinal + right_y * base_lateral
-            rotation = entity.setdefault("rotation", {})
-            rotation["pitch"] = float(rotation.get("pitch", 0.0) or 0.0)
-            projected_lane = _coerce_dict(entity.get("projected_lane"))
-            road_yaw = float(projected_lane.get("yaw", anchor_yaw) or anchor_yaw)
-            rotation["yaw"] = _yaw_for_heading_relation(
-                road_yaw,
-                entity.get("heading_relation"),
-                lane_reversed=bool(projected_lane.get("reversed_to_anchor")),
-                turn_intent=entity.get("turn_intent"),
-            )
-            rotation["roll"] = float(rotation.get("roll", 0.0) or 0.0)
-    return updated
 
 
 # ---------------------------------------------------------------------------
@@ -3690,22 +3888,12 @@ def _should_project_to_junction_lane(entity: Dict[str, Any]) -> bool:
     if str(entity.get("junction_placement") or "").lower() != "frame":
         return False
     projected_lane = _coerce_dict(entity.get("projected_lane"))
-    if str(projected_lane.get("source") or "").lower() != "junction_leg":
-        return False
-    direction = str(entity.get("junction_direction") or "").lower()
-    if direction in {"left", "right"}:
-        return True
-    anchor = str(entity.get("layout_anchor_id") or "").lower()
-    if anchor in {"left_arm", "right_arm"}:
-        return True
-    leg = str(entity.get("junction_leg") or "").lower()
-    return leg in {"left", "right"}
+    return str(projected_lane.get("source") or "").lower() == "junction_leg"
 
 
 def build_projected_spawn_payload(projected_coordinates: Dict[str, Any]) -> Dict[str, Any]:
     payload = {"entities": []}
-    aligned_coordinates = _apply_curb_row_alignment(projected_coordinates)
-    aligned_entities = _coerce_list(aligned_coordinates.get("entities"))
+    aligned_entities = _coerce_list(projected_coordinates.get("entities"))
     min_opposing_abs = _min_opposing_abs_lane_index(aligned_entities)
     for entity in aligned_entities:
         spawn_kind = str(entity.get("spawn_kind") or "vehicle")
@@ -3713,20 +3901,23 @@ def build_projected_spawn_payload(projected_coordinates: Dict[str, Any]) -> Dict
         lane_side = str(entity.get("lane_side_relation") or "")
         lane_index = int(entity.get("lane_index_relation", 0) or 0)
         heading_relation = str(entity.get("heading_relation") or "unknown")
+        flow_compliance = _canonical_flow_compliance(entity.get("flow_compliance"))
         opposing_lane_from_median = None
         placement_mode = "project_to_lane"
         if category in {"cone_group", "barrier_group"}:
             placement_mode = "direct"
         elif spawn_kind == "vehicle" and _should_project_to_junction_lane(entity):
             placement_mode = "project_to_junction_lane"
-        elif spawn_kind == "vehicle" and heading_relation == "opposite_direction":
+        elif (
+            spawn_kind == "vehicle"
+            and heading_relation == "opposite_direction"
+            and flow_compliance != "wrong_way"
+        ):
             # Cross-median seed lands somewhere on the opposing carriageway; runtime
             # then walks the lane graph to the median-adjacent opposing lane. The
             # nearest oncoming vehicle maps to lane 1 (closest to the median).
             placement_mode = "project_to_opposing_lane"
             opposing_lane_from_median = max(1, abs(lane_index) - min_opposing_abs + 1)
-        elif spawn_kind == "vehicle" and lane_index != 0:
-            placement_mode = "preserve_xy"
         explicit_color = preferred_vehicle_color(entity)
         payload_entity = {
             "id": entity["id"],
@@ -3736,21 +3927,45 @@ def build_projected_spawn_payload(projected_coordinates: Dict[str, Any]) -> Dict
             "lane_side_relation": lane_side,
             "lane_index_relation": lane_index,
             "heading_relation": str(entity.get("heading_relation") or "unknown"),
+            "original_heading_relation": entity.get("original_heading_relation"),
+            "flow_compliance": flow_compliance,
             "motion_state": str(entity.get("motion_state") or "unknown"),
             "projected_lane": _coerce_dict(entity.get("projected_lane")),
             "junction_direction": str(entity.get("junction_direction") or ""),
             "junction_leg": str(entity.get("junction_leg") or ""),
             "junction_motion": str(entity.get("junction_motion") or ""),
             "junction_distance_m": entity.get("junction_distance_m"),
+            "actor_group_type": _canonical_actor_group_type(entity.get("actor_group_type")),
+            "actor_group_id": entity.get("actor_group_id"),
+            "group_order_index": entity.get("group_order_index"),
+            "group_order_rule": entity.get("group_order_rule"),
+            "placement_mode_hint": _canonical_placement_mode_hint(
+                entity.get("placement_mode_hint"),
+                _canonical_actor_group_type(entity.get("actor_group_type")),
+            ),
+            "density_role": entity.get("density_role"),
+            "longitudinal_relation": entity.get("longitudinal_relation"),
+            "longitudinal_proximity": entity.get("longitudinal_proximity"),
+            "longitudinal_m": entity.get("longitudinal_m"),
             "location": entity["location"],
             "rotation": entity["rotation"],
             "color": None
             if spawn_kind != "vehicle"
             else (explicit_color or color_for_entity(entity["id"], category)),
             "placement_mode": placement_mode,
+            "layout_version": entity.get("layout_version"),
+            "layout_scene_kind": entity.get("layout_scene_kind"),
+            "placement_reason": entity.get("placement_reason"),
+            "degraded_reason": entity.get("degraded_reason"),
             "appearance": _coerce_dict(entity.get("appearance")),
         }
         if opposing_lane_from_median is not None:
             payload_entity["opposing_lane_from_median"] = opposing_lane_from_median
         payload["entities"].append(payload_entity)
+    payload["metadata"] = {
+        **_coerce_dict(projected_coordinates.get("metadata")),
+        "layout_version": _coerce_dict(projected_coordinates.get("metadata")).get(
+            "layout_version", "v2"
+        ),
+    }
     return payload

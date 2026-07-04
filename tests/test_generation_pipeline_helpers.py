@@ -25,10 +25,13 @@ from agents.obstacle_generator import ObstacleGenerator
 from agents import task_agent as task_agent_module
 from agents.task_agent import TaskAgent
 from agents.scene_understanding_interpreter import SceneUnderstandingInterpreter
+from agents.vehicle_orientation_interpreter import VehicleOrientationInterpreter
 from agents.scene_verification_agent import SceneVerificationAgent
 from experiments.auto_generate_all_vlm import AutoGenerator
 from tools import cache_map_topology
 from tools.scene_map_matcher import SceneMapMatcher
+from tools.map_matcher_v2 import score_candidate_v2
+from tools import vehicle_detector
 from tools.structured_pipeline import (
     build_relation_dsl,
     build_projected_spawn_payload,
@@ -41,6 +44,7 @@ from tools.structured_pipeline import (
     _apply_turn_intent,
     _yaw_for_heading_relation,
 )
+from tools.junction_placement import reproject_actors_for_junction
 
 
 SPLIT_TEXT = """## Road Net Description:
@@ -111,6 +115,359 @@ class _EchoTaskAgent(TaskAgent):
 
 
 class TestGenerationPipelineHelpers(unittest.TestCase):
+    def test_vehicle_detector_dedupes_overlapping_boxes_and_keeps_row_hint(self):
+        detections = [
+            {
+                "id": "raw_1",
+                "label": "car",
+                "conf": 0.9,
+                "bbox_xyxy": [10, 10, 110, 110],
+                "bbox_norm": [0.1, 0.1, 0.3, 0.3],
+                "center_norm": [0.2, 0.2],
+            },
+            {
+                "id": "raw_2",
+                "label": "car",
+                "conf": 0.8,
+                "bbox_xyxy": [12, 12, 108, 108],
+                "bbox_norm": [0.105, 0.105, 0.295, 0.295],
+                "center_norm": [0.2, 0.2],
+            },
+            {
+                "id": "raw_3",
+                "label": "truck",
+                "conf": 0.7,
+                "bbox_xyxy": [180, 12, 260, 108],
+                "bbox_norm": [0.55, 0.11, 0.75, 0.29],
+                "center_norm": [0.65, 0.2],
+            },
+        ]
+
+        selected = vehicle_detector.select_representative_detections(detections)
+        row_hints = vehicle_detector.infer_row_group_hints(selected)
+
+        self.assertEqual(len(selected), 2)
+        self.assertEqual([det["id"] for det in selected], ["det_1", "det_2"])
+        self.assertTrue(row_hints)
+        self.assertEqual(row_hints[0]["det_ids"], ["det_1", "det_2"])
+
+    def test_orientation_response_parser_normalizes_hints(self):
+        response = json.dumps(
+            {
+                "vehicle_orientation_hints": [
+                    {
+                        "det_id": "det_1",
+                        "visible_end": "rear",
+                        "front_points_image_direction": "toward_camera",
+                        "vehicle_region_hint": "ahead_arm",
+                        "junction_center_relative_to_vehicle": "behind",
+                        "heading_relation_to_ego": "opposite_direction",
+                        "junction_travel_direction": "away_from_junction",
+                        "motion_state_hint": "stopped",
+                        "confidence": "high",
+                        "evidence": "rear lights visible",
+                    }
+                ]
+            }
+        )
+
+        hints = VehicleOrientationInterpreter.extract_orientation_hints(response)
+
+        self.assertEqual(hints[0]["det_id"], "det_1")
+        self.assertEqual(hints[0]["junction_travel_direction"], "away_from_junction")
+        self.assertEqual(hints[0]["heading_relation_to_ego"], "opposite_direction")
+        self.assertEqual(hints[0]["front_points_image_direction"], "toward_camera")
+        self.assertEqual(hints[0]["vehicle_region_hint"], "ahead_arm")
+
+    def test_orientation_prompt_explains_full_image_and_crop_roles(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            image_path = str(Path(tmp) / "scene.jpg")
+            crop_path = str(Path(tmp) / "det_1_crop.jpg")
+            Path(image_path).write_bytes(b"fake")
+            Path(crop_path).write_bytes(b"fake")
+            with mock.patch(
+                "agents.vehicle_orientation_interpreter.VehicleOrientationInterpreter._image_to_base64",
+                return_value="abc",
+            ):
+                content = VehicleOrientationInterpreter().refine_request(
+                    "",
+                    {
+                        "image_path": image_path,
+                        "annotated_path": image_path,
+                        "detections": [
+                            {
+                                "id": "det_1",
+                                "label": "truck",
+                                "conf": 0.9,
+                                "bbox_norm": [0.6, 0.3, 0.9, 0.6],
+                                "crop_path": crop_path,
+                            }
+                        ],
+                    },
+                )
+
+        prompt = content[0]["text"]
+        self.assertIn("The first image is the annotated full image", prompt)
+        self.assertIn("following images are vehicle crops", prompt)
+        self.assertIn("right-side arm", prompt)
+        self.assertIn("front_points_image_direction=right usually means away_from_junction", prompt)
+
+    def test_scene_understanding_detector_prompt_uses_orientation_not_depth(self):
+        detections = [
+            {
+                "id": "det_1",
+                "label": "truck",
+                "conf": 0.91,
+                "bbox_xyxy": [10, 10, 110, 110],
+                "bbox_norm": [0.1, 0.1, 0.3, 0.3],
+                "center_norm": [0.2, 0.2],
+            }
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            image_path = str(Path(tmp) / "scene.jpg")
+            Path(image_path).write_bytes(b"fake")
+            output_path = str(Path(tmp) / "s0000_su.json")
+            with mock.patch(
+                "agents.scene_understanding_interpreter.vehicle_detector.detect_vehicles",
+                return_value=detections,
+            ), mock.patch(
+                "agents.scene_understanding_interpreter.vehicle_detector.select_representative_detections",
+                return_value=detections,
+            ), mock.patch(
+                "agents.scene_understanding_interpreter.vehicle_detector.infer_row_group_hints",
+                return_value=[
+                    {
+                        "id": "row_hint_1",
+                        "det_ids": ["det_1"],
+                        "alignment": "horizontal_image_row",
+                        "order_rule_hint": "image_left_to_right",
+                    }
+                ],
+            ), mock.patch(
+                "agents.scene_understanding_interpreter.vehicle_detector.annotate_image",
+                return_value=str(Path(tmp) / "s0000_detections.jpg"),
+            ), mock.patch(
+                "agents.scene_understanding_interpreter.vehicle_detector.write_detection_crops",
+                return_value=detections,
+            ), mock.patch(
+                "agents.scene_understanding_interpreter.SceneUnderstandingInterpreter._image_to_base64",
+                return_value="abc",
+            ), mock.patch(
+                "agents.scene_understanding_interpreter.SceneUnderstandingInterpreter._build_vehicle_orientation_hints",
+                return_value=[
+                    {
+                        "det_id": "det_1",
+                        "visible_end": "rear",
+                        "heading_relation_to_ego": "opposite_direction",
+                        "junction_travel_direction": "away_from_junction",
+                        "motion_state_hint": "stopped",
+                        "confidence": "high",
+                        "evidence": "rear visible",
+                    }
+                ],
+            ):
+                content = SceneUnderstandingInterpreter().refine_request(
+                    "",
+                    {"image_path": image_path, "output_fn": output_path},
+                )
+
+        prompt = content[0]["text"]
+        self.assertIn("vehicle_orientation_hints", prompt)
+        self.assertIn("actor_group_type=individual_vehicle", prompt)
+        self.assertNotIn("actor_group_type=traffic_queue", prompt)
+        self.assertNotIn("depth≈", prompt)
+        self.assertNotIn("depth_rank", prompt)
+
+    def test_split_scene_agents_merge_road_and_orientation_into_final_su(self):
+        detections = [
+            {
+                "id": "det_1",
+                "label": "truck",
+                "conf": 0.91,
+                "bbox_xyxy": [500, 220, 700, 420],
+                "bbox_norm": [0.65, 0.3, 0.9, 0.58],
+                "center_norm": [0.78, 0.44],
+            },
+            {
+                "id": "det_2",
+                "label": "car",
+                "conf": 0.82,
+                "bbox_xyxy": [510, 430, 690, 590],
+                "bbox_norm": [0.66, 0.59, 0.88, 0.82],
+                "center_norm": [0.77, 0.71],
+            },
+        ]
+        road_payload = {
+            "road_scene_brief": {
+                "scene_kind_observation": "signalized junction with right arm",
+                "junction_evidence": ["traffic light", "right branch"],
+            },
+            "traffic_subjects": [],
+            "key_pairwise_relations": [],
+            "road_network": {
+                "map_matching": {
+                    "topology_type": "t_junction",
+                    "junction_visible": True,
+                    "junction_type": "t_junction",
+                    "junction_branches": {
+                        "ahead": True,
+                        "left": False,
+                        "right": True,
+                        "known": True,
+                    },
+                    "forward_lane_count": 1,
+                    "opposing_lane_count": 1,
+                    "driving_lane_count": 2,
+                    "has_traffic_light": True,
+                    "curve_direction": "straight",
+                }
+            },
+            "actor_layout": {},
+            "general_environment": {},
+            "metadata": {},
+        }
+        orientation_response = json.dumps(
+            {
+                "vehicle_orientation_brief": {
+                    "overall_observation": "right arm vehicles face away from junction"
+                },
+                "vehicle_orientation_hints": [
+                    {
+                        "det_id": "det_1",
+                        "visible_end": "rear",
+                        "heading_relation_to_ego": "crossing",
+                        "junction_travel_direction": "away_from_junction",
+                        "motion_state_hint": "stopped",
+                        "confidence": "high",
+                        "evidence": "rear visible on right arm",
+                    },
+                    {
+                        "det_id": "det_2",
+                        "visible_end": "rear",
+                        "heading_relation_to_ego": "crossing",
+                        "junction_travel_direction": "away_from_junction",
+                        "motion_state_hint": "stopped",
+                        "confidence": "high",
+                        "evidence": "queued behind det_1",
+                    },
+                ],
+            }
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            image_path = str(Path(tmp) / "scene.jpg")
+            output_path = str(Path(tmp) / "s0000_su.json")
+            Path(image_path).write_bytes(b"fake")
+
+            def fake_send_request(_self, _user_request, add_info=None):
+                Path(add_info["output_fn"]).write_text(json.dumps(road_payload))
+                return json.dumps(road_payload)
+
+            with mock.patch(
+                "agents.scene_understanding_interpreter.vehicle_detector.detect_vehicles",
+                return_value=detections,
+            ), mock.patch(
+                "agents.scene_understanding_interpreter.vehicle_detector.select_representative_detections",
+                return_value=detections,
+            ), mock.patch(
+                "agents.scene_understanding_interpreter.vehicle_detector.infer_row_group_hints",
+                return_value=[
+                    {
+                        "id": "row_hint_1",
+                        "det_ids": ["det_1", "det_2"],
+                        "alignment": "same_image_column",
+                        "order_rule_hint": "image_bottom_to_top",
+                    }
+                ],
+            ), mock.patch(
+                "agents.scene_understanding_interpreter.vehicle_detector.annotate_image",
+                return_value=image_path,
+            ), mock.patch(
+                "agents.scene_understanding_interpreter.vehicle_detector.write_detection_crops",
+                return_value=detections,
+            ), mock.patch.object(
+                SceneUnderstandingInterpreter,
+                "send_request",
+                fake_send_request,
+            ), mock.patch(
+                "agents.vehicle_orientation_interpreter.VehicleOrientationInterpreter.send_request",
+                return_value=orientation_response,
+            ):
+                result = SceneUnderstandingInterpreter().call_agent(
+                    "",
+                    {"image_path": image_path, "output_fn": output_path},
+                )
+
+        self.assertEqual(len(result["traffic_subjects"]), 2)
+        first = result["traffic_subjects"][0]
+        self.assertEqual(first["heading_relation_to_ego"], "crossing")
+        self.assertEqual(
+            first["anchor_relation"]["travel_direction"],
+            "away_from_junction",
+        )
+        self.assertEqual(first["actor_group_type"], "individual_vehicle")
+        self.assertEqual(first["layout_anchor_id"], "right_arm")
+        self.assertIn("vehicle_orientation_hints", result["metadata"])
+        self.assertIn("road_scene_brief", result["metadata"])
+
+    def test_road_scene_only_prompt_does_not_request_vehicle_orientation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            image_path = str(Path(tmp) / "scene.jpg")
+            Path(image_path).write_bytes(b"fake")
+            with mock.patch(
+                "agents.scene_understanding_interpreter.SceneUnderstandingInterpreter._image_to_base64",
+                return_value="abc",
+            ):
+                content = SceneUnderstandingInterpreter().refine_request(
+                    "",
+                    {
+                        "image_path": image_path,
+                        "output_fn": str(Path(tmp) / "s0000_road_scene.json"),
+                        "road_scene_only": True,
+                    },
+                )
+
+        prompt = content[0]["text"]
+        self.assertIn("road_scene_brief", prompt)
+        self.assertIn("Do not output vehicle orientation", prompt)
+        self.assertIn("Classify junction only from visible road-geometry branches", prompt)
+        self.assertIn("not upgrade a straight road into a junction", prompt)
+        self.assertIn('"traffic_subjects": []', prompt)
+
+    def test_merge_infers_right_arm_front_right_as_away_from_junction(self):
+        subject = SceneUnderstandingInterpreter._subject_from_detection(
+            {
+                "id": "det_1",
+                "label": "truck",
+                "conf": 0.9,
+                "bbox_norm": [0.65, 0.35, 0.9, 0.6],
+                "center_norm": [0.78, 0.48],
+            },
+            {
+                "visible_end": "side",
+                "front_points_image_direction": "right",
+                "vehicle_region_hint": "right_arm",
+                "junction_travel_direction": "unknown",
+                "heading_relation_to_ego": "crossing",
+                "motion_state_hint": "stopped",
+                "confidence": "high",
+                "evidence": "front points image-right on right arm",
+            },
+            {
+                "actor_group_type": "traffic_queue",
+                "actor_group_id": "traffic_queue_1",
+                "group_order_index": 0,
+                "placement_mode_hint": "queue_on_lane",
+            },
+            is_junction=True,
+        )
+
+        self.assertEqual(subject["layout_anchor_id"], "right_arm")
+        self.assertEqual(
+            subject["anchor_relation"]["travel_direction"],
+            "away_from_junction",
+        )
+
     def test_normalize_accepts_compact_road_network_map_matching(self):
         payload = {
             "traffic_subjects": [],
@@ -138,6 +495,94 @@ class TestGenerationPipelineHelpers(unittest.TestCase):
             normalized["road_network"]["map_matching"]["topology_type"],
             "straight_two_way",
         )
+
+    def test_normalize_map_matching_canonicalizes_branch_list(self):
+        payload = {
+            "traffic_subjects": [],
+            "key_pairwise_relations": [],
+            "road_network": {
+                "map_matching": {
+                    "topology_type": "signalized_intersection_approach",
+                    "junction_visible": True,
+                    "junction_type": "signalized_intersection",
+                    "junction_branches": [
+                        "left_arm",
+                        "right_arm",
+                        "ahead_arm",
+                        "oncoming_arm",
+                    ],
+                    "target_branch_count": 4,
+                    "forward_lane_count": 2,
+                    "opposing_lane_count": 2,
+                    "driving_lane_count": 4,
+                    "has_traffic_light": True,
+                    "has_center_median": False,
+                }
+            },
+            "actor_layout": {},
+            "general_environment": {},
+            "metadata": {},
+        }
+
+        normalized, error = normalize_scene_understanding(payload)
+        self.assertIsNone(error)
+        map_matching = normalized["road_network"]["map_matching"]
+        self.assertEqual(map_matching["topology_type"], "cross_intersection")
+        self.assertEqual(map_matching["junction_type"], "cross_intersection")
+        self.assertEqual(
+            map_matching["junction_branches"],
+            {"ahead": True, "left": True, "right": True, "known": True},
+        )
+
+        signature = SceneMapMatcher.build_road_topology_signature(normalized)
+        self.assertEqual(signature["topology_type"], "cross_intersection")
+        self.assertTrue(signature["junction_branches"]["right"])
+        self.assertEqual(signature["target_branch_count"], 4)
+
+    def test_straight_road_with_only_signal_and_crosswalk_does_not_upgrade_to_junction(self):
+        payload = {
+            "traffic_subjects": [],
+            "key_pairwise_relations": [],
+            "road_network": {
+                "map_matching": {
+                    "topology_type": "straight_urban_road_approaching_a_junction",
+                    "junction_visible": True,
+                    "junction_type": "signalized intersection",
+                    "junction_branches": {
+                        "ahead": True,
+                        "left": False,
+                        "right": False,
+                        "known": True,
+                    },
+                    "target_branch_count": 3,
+                    "forward_lane_count": 1,
+                    "opposing_lane_count": 1,
+                    "driving_lane_count": 2,
+                    "has_traffic_light": True,
+                    "has_crosswalk": True,
+                    "ego_to_junction_distance_m": 45,
+                }
+            },
+            "actor_layout": {},
+            "general_environment": {},
+            "metadata": {},
+        }
+
+        normalized, error = normalize_scene_understanding(payload)
+        self.assertIsNone(error)
+        map_matching = normalized["road_network"]["map_matching"]
+        self.assertEqual(map_matching["topology_type"], "straight_road")
+        self.assertFalse(map_matching["junction_visible"])
+        self.assertEqual(map_matching["junction_type"], "none")
+        self.assertEqual(
+            map_matching["junction_branches"],
+            {"ahead": False, "left": False, "right": False, "known": False},
+        )
+
+        signature = SceneMapMatcher.build_road_topology_signature(normalized)
+        self.assertEqual(signature["topology_type"], "straight_road")
+        self.assertFalse(signature["junction_visible"])
+        self.assertEqual(signature["junction_branches"]["known"], False)
         self.assertNotIn("lane_markings", normalized["road_network"])
         self.assertNotIn("control_elements", normalized["road_network"])
         self.assertNotIn("lane_groups", normalized["road_network"])
@@ -713,7 +1158,7 @@ class TestGenerationPipelineHelpers(unittest.TestCase):
         self.assertEqual(entity["lane_index_relation"], 1)
         self.assertAlmostEqual(entity["location"]["y"], 3.5, places=3)
         payload = build_projected_spawn_payload(projected)
-        self.assertEqual(payload["entities"][0]["placement_mode"], "preserve_xy")
+        self.assertEqual(payload["entities"][0]["placement_mode"], "project_to_lane")
         self.assertEqual(payload["entities"][0]["lane_index_relation"], 1)
         self.assertNotEqual(payload["entities"][0]["category"], "parked_vehicle")
 
@@ -778,7 +1223,468 @@ class TestGenerationPipelineHelpers(unittest.TestCase):
         self.assertEqual(entity["lane_side_relation"], "right_lane")
         self.assertAlmostEqual(entity["location"]["y"], 7.0, places=3)
         payload = build_projected_spawn_payload(projected)
-        self.assertEqual(payload["entities"][0]["placement_mode"], "preserve_xy")
+        self.assertEqual(payload["entities"][0]["placement_mode"], "project_to_lane")
+
+    def test_normal_straight_road_pipeline_projects_regular_vehicles(self):
+        scene_understanding = {
+            "traffic_subjects": [
+                {
+                    "id": "lead",
+                    "category": "car",
+                    "heading_relation_to_ego": "same_direction",
+                    "flow_compliance": "legal",
+                    "lane_index_relation": 0,
+                    "lane_side_relation": "same_lane",
+                    "longitudinal_relation": "ahead",
+                    "longitudinal_proximity": "near",
+                    "count": 1,
+                },
+                {
+                    "id": "right_car",
+                    "category": "car",
+                    "heading_relation_to_ego": "same_direction",
+                    "flow_compliance": "legal",
+                    "lane_index_relation": 1,
+                    "lane_side_relation": "right_lane",
+                    "longitudinal_relation": "ahead",
+                    "longitudinal_proximity": "mid",
+                    "count": 1,
+                },
+                {
+                    "id": "oncoming",
+                    "category": "car",
+                    "heading_relation_to_ego": "opposite_direction",
+                    "flow_compliance": "legal",
+                    "lane_index_relation": -1,
+                    "lane_side_relation": "left_lane",
+                    "longitudinal_relation": "ahead",
+                    "longitudinal_proximity": "mid",
+                    "count": 1,
+                },
+            ],
+            "background_traffic": [],
+            "key_pairwise_relations": [],
+            "road_network": {
+                "map_matching": {
+                    "topology_type": "straight_road",
+                    "junction_visible": False,
+                    "junction_type": "none",
+                    "junction_branches": {
+                        "ahead": False,
+                        "left": False,
+                        "right": False,
+                        "known": False,
+                    },
+                    "forward_lane_count": 2,
+                    "opposing_lane_count": 1,
+                    "driving_lane_count": 3,
+                    "curve_direction": "straight",
+                },
+                "lane_groups": [
+                    {
+                        "forward_lane_count": 2,
+                        "opposing_lane_count": 1,
+                        "lane_width_class": "standard",
+                    }
+                ],
+            },
+            "actor_layout": {},
+            "general_environment": {},
+            "metadata": {},
+        }
+        spawn_context = {
+            "topology_sample": [
+                {
+                    "road_id": 1,
+                    "lane_id": -1,
+                    "start": {"x": 0.0, "y": 0.0, "z": 0.0, "yaw": 0.0},
+                    "end": {"x": 80.0, "y": 0.0, "z": 0.0, "yaw": 0.0},
+                },
+                {
+                    "road_id": 1,
+                    "lane_id": -2,
+                    "start": {"x": 0.0, "y": 3.5, "z": 0.0, "yaw": 0.0},
+                    "end": {"x": 80.0, "y": 3.5, "z": 0.0, "yaw": 0.0},
+                },
+                {
+                    "road_id": 1,
+                    "lane_id": 1,
+                    "start": {"x": 80.0, "y": -3.5, "z": 0.0, "yaw": 180.0},
+                    "end": {"x": 0.0, "y": -3.5, "z": 0.0, "yaw": 180.0},
+                },
+            ],
+            "dense_local_waypoints": [],
+        }
+
+        normalized, error = normalize_scene_understanding(scene_understanding)
+        self.assertIsNone(error)
+        relation_dsl = build_relation_dsl(normalized, spawn_context)
+        raw = generate_initial_coordinates_from_relation_dsl(relation_dsl)
+        projected = project_entities_to_carla_context(raw, normalized, spawn_context)
+        payload = build_projected_spawn_payload(projected)
+        validation = validate_relation_layout(relation_dsl, projected)
+
+        self.assertEqual(relation_dsl["metadata"]["layout_scene_kind"], "open_road")
+        by_id = {entity["id"]: entity for entity in payload["entities"]}
+        self.assertEqual(by_id["lead"]["placement_mode"], "project_to_lane")
+        self.assertEqual(by_id["right_car"]["placement_mode"], "project_to_lane")
+        self.assertEqual(by_id["oncoming"]["placement_mode"], "project_to_opposing_lane")
+        self.assertEqual(by_id["lead"]["actor_group_type"], "individual_vehicle")
+        self.assertEqual(by_id["right_car"]["placement_mode_hint"], "normal_lane_actor")
+        self.assertEqual(by_id["oncoming"]["opposing_lane_from_median"], 1)
+        self.assertEqual(validation["summary"]["ego_consistency"]["failed"], 0)
+        self.assertEqual(validation["summary"]["pairwise_consistency"]["failed"], 0)
+        self.assertEqual(validation["summary"]["lane_legality"]["failed"], 0)
+
+    def test_junction_pipeline_projects_frame_actors_to_junction_lanes(self):
+        scene_understanding = {
+            "traffic_subjects": [
+                {
+                    "id": "right_arm_car",
+                    "category": "car",
+                    "heading_relation_to_ego": "crossing",
+                    "flow_compliance": "legal",
+                    "lane_index_relation": 1,
+                    "lane_side_relation": "right_lane",
+                    "longitudinal_relation": "ahead",
+                    "longitudinal_proximity": "near",
+                    "layout_anchor_id": "right_arm",
+                    "anchor_relation": {"travel_direction": "toward_junction"},
+                    "count": 1,
+                },
+                {
+                    "id": "oncoming",
+                    "category": "car",
+                    "heading_relation_to_ego": "opposite_direction",
+                    "flow_compliance": "legal",
+                    "lane_index_relation": -1,
+                    "lane_side_relation": "left_lane",
+                    "longitudinal_relation": "ahead",
+                    "longitudinal_proximity": "mid",
+                    "layout_anchor_id": "oncoming_arm",
+                    "anchor_relation": {"travel_direction": "toward_junction"},
+                    "count": 1,
+                },
+            ],
+            "background_traffic": [],
+            "key_pairwise_relations": [],
+            "road_network": {
+                "map_matching": {
+                    "topology_type": "cross_intersection",
+                    "junction_visible": True,
+                    "junction_type": "cross_intersection",
+                    "junction_branches": {
+                        "ahead": True,
+                        "left": True,
+                        "right": True,
+                        "known": True,
+                    },
+                    "target_branch_count": 4,
+                    "forward_lane_count": 1,
+                    "opposing_lane_count": 1,
+                    "driving_lane_count": 4,
+                    "curve_direction": "straight",
+                },
+                "lane_groups": [
+                    {
+                        "forward_lane_count": 1,
+                        "opposing_lane_count": 1,
+                        "lane_width_class": "standard",
+                    }
+                ],
+            },
+            "actor_layout": {
+                "global_anchor": {"type": "junction_center", "confidence": "high"},
+                "anchors": [
+                    {"id": "right_arm", "type": "junction_arm", "side": "right"},
+                    {"id": "oncoming_arm", "type": "junction_arm", "side": "oncoming"},
+                ],
+            },
+            "general_environment": {},
+            "metadata": {},
+        }
+        matched_structure = {
+            "kind": "junction",
+            "junction_id": 1,
+            "leg_count": 4,
+            "center": {"x": 100.0, "y": 0.0, "z": 0.0},
+            "ego_approach_heading_deg": 0.0,
+            "ego_distance_to_center_m": 30.0,
+            "legs": [
+                {
+                    "name": "west",
+                    "heading_out_deg": -180.0,
+                    "inbound_lanes": [{"road_id": 10, "lane_id": -1, "role": "inbound"}],
+                },
+                {
+                    "name": "east",
+                    "heading_out_deg": 0.0,
+                    "inbound_lanes": [{"road_id": 20, "lane_id": 1, "role": "inbound"}],
+                },
+                {
+                    "name": "south",
+                    "heading_out_deg": 90.0,
+                    "inbound_lanes": [{"road_id": 30, "lane_id": 1, "role": "inbound"}],
+                },
+                {
+                    "name": "north",
+                    "heading_out_deg": -90.0,
+                    "inbound_lanes": [{"road_id": 40, "lane_id": -1, "role": "inbound"}],
+                },
+            ],
+        }
+        spawn_context = {
+            "topology_sample": [
+                {
+                    "road_id": 10,
+                    "lane_id": -1,
+                    "start": {"x": 70.0, "y": 0.0, "z": 0.0, "yaw": 0.0},
+                    "end": {"x": 100.0, "y": 0.0, "z": 0.0, "yaw": 0.0},
+                }
+            ],
+            "matched_structure": matched_structure,
+        }
+
+        normalized, error = normalize_scene_understanding(scene_understanding)
+        self.assertIsNone(error)
+        relation_dsl = build_relation_dsl(normalized, spawn_context)
+        raw = generate_initial_coordinates_from_relation_dsl(relation_dsl)
+        reprojected = reproject_actors_for_junction(raw, matched_structure)
+        payload = build_projected_spawn_payload(reprojected)
+
+        self.assertEqual(relation_dsl["metadata"]["layout_scene_kind"], "junction")
+        by_id = {entity["id"]: entity for entity in payload["entities"]}
+        self.assertEqual(by_id["right_arm_car"]["placement_mode"], "project_to_junction_lane")
+        self.assertEqual(by_id["oncoming"]["placement_mode"], "project_to_junction_lane")
+        self.assertEqual(by_id["right_arm_car"]["actor_group_type"], "individual_vehicle")
+        self.assertEqual(by_id["oncoming"]["placement_mode_hint"], "normal_lane_actor")
+        self.assertEqual(by_id["right_arm_car"]["junction_leg"], "south")
+        self.assertEqual(by_id["oncoming"]["junction_leg"], "east")
+        self.assertEqual(by_id["oncoming"]["projected_lane"]["source"], "junction_leg")
+        self.assertNotIn("opposing_lane_from_median", by_id["oncoming"])
+
+    def test_open_road_parked_vehicle_uses_normal_lane_projection(self):
+        scene_understanding = {
+            "traffic_subjects": [
+                {
+                    "id": "parked_right",
+                    "category": "car",
+                    "subtype": "parked_car",
+                    "visual_confidence": "high",
+                    "motion_state": "parked",
+                    "heading_relation_to_ego": "same_direction",
+                    "lane_index_relation": 1,
+                    "lane_side_relation": "right_edge",
+                    "longitudinal_relation": "ahead",
+                    "longitudinal_proximity": "near",
+                    "count": 1,
+                    "evidence": "Parked curbside vehicle.",
+                    "must_reconstruct": True,
+                }
+            ],
+            "background_traffic": [],
+            "key_pairwise_relations": [],
+            "road_network": {
+                "map_matching": {
+                    "topology_type": "straight_road",
+                    "junction_visible": False,
+                },
+                "lane_groups": [{"forward_lane_count": 2, "opposing_lane_count": 0}],
+            },
+            "general_environment": {},
+            "metadata": {},
+        }
+        normalized, error = normalize_scene_understanding(scene_understanding)
+        self.assertIsNone(error)
+        spawn_context = {
+            "topology_sample": [
+                {
+                    "road_id": 1,
+                    "lane_id": -1,
+                    "start": {"x": 0.0, "y": 0.0, "z": 0.0, "yaw": 0.0},
+                    "end": {"x": 50.0, "y": 0.0, "z": 0.0, "yaw": 0.0},
+                }
+            ]
+        }
+        relation_dsl = build_relation_dsl(normalized, spawn_context)
+        raw = generate_initial_coordinates_from_relation_dsl(relation_dsl)
+        projected = project_entities_to_carla_context(raw, normalized, spawn_context)
+        payload = build_projected_spawn_payload(projected)
+
+        self.assertEqual(payload["entities"][0]["placement_mode"], "project_to_lane")
+        self.assertEqual(payload["entities"][0]["layout_version"], "v2")
+
+    def test_open_road_crossing_vehicle_is_degraded_to_lane_flow(self):
+        scene_understanding = {
+            "traffic_subjects": [
+                {
+                    "id": "bad_crossing",
+                    "category": "car",
+                    "heading_relation_to_ego": "crossing",
+                    "lane_index_relation": 0,
+                    "lane_side_relation": "same_lane",
+                    "longitudinal_relation": "ahead",
+                    "longitudinal_proximity": "near",
+                }
+            ],
+            "road_network": {
+                "map_matching": {
+                    "topology_type": "straight_road",
+                    "junction_visible": False,
+                },
+                "lane_groups": [{"forward_lane_count": 1, "opposing_lane_count": 0}],
+            },
+            "general_environment": {},
+            "metadata": {},
+        }
+        normalized, error = normalize_scene_understanding(scene_understanding)
+        self.assertIsNone(error)
+        relation_dsl = build_relation_dsl(normalized, {"topology_sample": []})
+        relation = relation_dsl["entities"][0]
+        raw = generate_initial_coordinates_from_relation_dsl(relation_dsl)
+        payload = build_projected_spawn_payload(
+            project_entities_to_carla_context(raw, normalized, {"topology_sample": []})
+        )
+
+        self.assertEqual(relation["original_heading_relation"], "crossing")
+        self.assertEqual(relation["heading_relation"], "unknown")
+        self.assertIn("open-road crossing", relation["degraded_reason"])
+        self.assertEqual(payload["entities"][0]["heading_relation"], "unknown")
+        self.assertEqual(payload["entities"][0]["placement_mode"], "project_to_lane")
+
+    def test_wrong_way_vehicle_stays_out_of_opposing_lane_mode(self):
+        payload = build_projected_spawn_payload(
+            {
+                "metadata": {"layout_version": "v2", "layout_scene_kind": "open_road"},
+                "entities": [
+                    {
+                        "id": "wrong_way_bike",
+                        "spawn_kind": "vehicle",
+                        "category": "motorcycle",
+                        "subtype": "motorcycle",
+                        "lane_side_relation": "same_lane",
+                        "lane_index_relation": 0,
+                        "heading_relation": "opposite_direction",
+                        "flow_compliance": "wrong_way",
+                        "motion_state": "moving",
+                        "location": {"x": 8.0, "y": 0.0, "z": 0.3},
+                        "rotation": {"pitch": 0.0, "yaw": 180.0, "roll": 0.0},
+                    }
+                ],
+            }
+        )
+
+        self.assertEqual(payload["entities"][0]["placement_mode"], "project_to_lane")
+        self.assertEqual(payload["entities"][0]["flow_compliance"], "wrong_way")
+
+    def test_parking_row_fields_do_not_preserve_xy(self):
+        payload = build_projected_spawn_payload(
+            {
+                "metadata": {"layout_version": "v2", "layout_scene_kind": "open_road"},
+                "entities": [
+                    {
+                        "id": "parked_row_0",
+                        "spawn_kind": "vehicle",
+                        "category": "car",
+                        "subtype": "car",
+                        "lane_side_relation": "right_edge",
+                        "lane_index_relation": 1,
+                        "heading_relation": "opposite_direction",
+                        "flow_compliance": "legal",
+                        "motion_state": "parked",
+                        "actor_group_type": "parking_row",
+                        "actor_group_id": "parking_row_right",
+                        "group_order_index": 0,
+                        "placement_mode_hint": "preserve_parking_xy",
+                        "location": {"x": 8.0, "y": 3.0, "z": 0.3},
+                        "rotation": {"pitch": 0.0, "yaw": 180.0, "roll": 0.0},
+                    }
+                ],
+            }
+        )
+
+        entity = payload["entities"][0]
+        self.assertEqual(entity["placement_mode"], "project_to_opposing_lane")
+        self.assertEqual(entity["heading_relation"], "opposite_direction")
+        self.assertEqual(entity["actor_group_type"], "individual_vehicle")
+        self.assertEqual(entity["placement_mode_hint"], "normal_lane_actor")
+
+    def test_junction_traffic_queue_fields_are_canonicalized_but_keep_junction_projection(self):
+        payload = build_projected_spawn_payload(
+            {
+                "metadata": {"layout_version": "v2", "layout_scene_kind": "junction"},
+                "entities": [
+                    {
+                        "id": "queue_0",
+                        "spawn_kind": "vehicle",
+                        "category": "car",
+                        "subtype": "car",
+                        "lane_side_relation": "same_lane",
+                        "lane_index_relation": 0,
+                        "heading_relation": "same_direction",
+                        "flow_compliance": "legal",
+                        "motion_state": "stopped",
+                        "actor_group_type": "traffic_queue",
+                        "actor_group_id": "right_arm_queue",
+                        "group_order_index": 0,
+                        "placement_mode_hint": "queue_on_lane",
+                        "junction_placement": "frame",
+                        "junction_direction": "ego",
+                        "junction_leg": "ego",
+                        "junction_motion": "approaching",
+                        "projected_lane": {"source": "junction_leg", "yaw": 0.0},
+                        "location": {"x": 8.0, "y": 0.0, "z": 0.3},
+                        "rotation": {"pitch": 0.0, "yaw": 0.0, "roll": 0.0},
+                    }
+                ],
+            }
+        )
+
+        entity = payload["entities"][0]
+        self.assertEqual(entity["placement_mode"], "project_to_junction_lane")
+        self.assertEqual(entity["actor_group_type"], "individual_vehicle")
+        self.assertEqual(entity["placement_mode_hint"], "normal_lane_actor")
+
+    def test_parking_row_normalization_uses_standard_heading_correction(self):
+        scene_understanding = {
+            "traffic_subjects": [
+                {
+                    "id": "parked_right",
+                    "category": "car",
+                    "motion_state": "parked",
+                    "heading_relation_to_ego": "opposite_direction",
+                    "lane_index_relation": 1,
+                    "lane_side_relation": "right_lane",
+                    "longitudinal_relation": "ahead",
+                    "longitudinal_proximity": "near",
+                    "actor_group_type": "parking_row",
+                    "actor_group_id": "parking_row_right",
+                    "group_order_index": 0,
+                    "placement_mode_hint": "preserve_parking_xy",
+                }
+            ],
+            "background_traffic": [],
+            "key_pairwise_relations": [],
+            "road_network": {
+                "map_matching": {
+                    "topology_type": "straight_road",
+                    "junction_visible": False,
+                },
+                "lane_groups": [{"forward_lane_count": 2, "opposing_lane_count": 1}],
+            },
+            "general_environment": {},
+            "metadata": {},
+        }
+        normalized, error = normalize_scene_understanding(scene_understanding)
+        self.assertIsNone(error)
+        subject = normalized["traffic_subjects"][0]
+        self.assertEqual(subject["lane_index_relation"], -1)
+        self.assertEqual(subject["actor_group_type"], "individual_vehicle")
+
+        relation_dsl = build_relation_dsl(normalized, {"topology_sample": []})
+        relation = relation_dsl["entities"][0]
+        self.assertEqual(relation["lane_anchor"], "lane_center")
+        self.assertEqual(relation["placement_mode_hint"], "normal_lane_actor")
 
     def test_oncoming_vehicle_keeps_opposite_yaw_after_dense_snap(self):
         scene_understanding = {
@@ -1697,6 +2603,35 @@ class TestGenerationPipelineHelpers(unittest.TestCase):
         }
         score, details = matcher._score_candidate_features(candidate, scene_features)
         self.assertTrue(details["hard_reject"])
+        self.assertLessEqual(score, 0.05)
+
+    def test_topology_candidate_scoring_rejects_junction_for_explicit_straight_road(self):
+        matcher = SceneMapMatcher()
+        scene_features = {
+            "road_topology_signature": {
+                "topology_type": "straight_road",
+                "junction_visible": False,
+                "target_branch_count": 1,
+                "driving_lane_count": 3,
+                "forward_lane_count": 3,
+                "opposing_lane_count": 0,
+            }
+        }
+        candidate = {
+            "candidate_topology_type": "t_junction",
+            "estimated_junction_degree": 3,
+            "same_road_lane_count": 4,
+            "same_direction_lane_count": 4,
+            "junction_waypoint_ratio": 0.51,
+            "heading_cluster_count": 3,
+            "nearby_road_count": 3,
+            "is_junction": True,
+        }
+
+        score, details = matcher._score_candidate_features(candidate, scene_features)
+
+        self.assertTrue(details["hard_reject"])
+        self.assertIn("Straight-road target rejects", details["reject_reason"])
         self.assertLessEqual(score, 0.05)
 
     def test_topology_candidate_scoring_rejects_overly_wide_straight_road(self):
@@ -2645,7 +3580,7 @@ class TestGenerationPipelineHelpers(unittest.TestCase):
         self.assertEqual(details["median_alignment_adjustment"], "strong_penalty")
         self.assertGreater(with_median_score - without_median_score, 0.2)
 
-    def test_topology_match_falls_back_to_best_rejected_candidate(self):
+    def test_topology_match_returns_unmatched_when_all_candidates_rejected(self):
         matcher = SceneMapMatcher()
 
         class FakeClient:
@@ -2703,9 +3638,12 @@ class TestGenerationPipelineHelpers(unittest.TestCase):
                 sys.modules.pop("carla", None)
             else:
                 sys.modules["carla"] = previous_carla
-        self.assertEqual(result["status"], "matched")
-        self.assertEqual(result["best_match"]["candidate_lane"]["road_id"], 2)
-        self.assertTrue(result["best_match"]["used_rejected_candidate"])
+        self.assertEqual(result["status"], "unmatched")
+        self.assertIsNone(result["best_match"])
+        self.assertEqual(
+            result["candidate_debug"]["best_rejected_candidate"]["candidate_lane"]["road_id"],
+            2,
+        )
 
     def test_topology_fallback_prefers_non_blacklisted_lane_match(self):
         matcher = SceneMapMatcher()
@@ -2769,8 +3707,488 @@ class TestGenerationPipelineHelpers(unittest.TestCase):
                 sys.modules.pop("carla", None)
             else:
                 sys.modules["carla"] = previous_carla
+        self.assertEqual(result["status"], "unmatched")
+        self.assertIsNone(result["best_match"])
+        self.assertEqual(
+            result["candidate_debug"]["best_rejected_candidate"]["candidate_lane"]["road_id"],
+            2,
+        )
+
+    def test_v2_cache_open_road_rejects_junction_and_selects_open_candidate(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cache = {
+                "world_name": "FakeTown",
+                "candidates": [
+                    {
+                        "location": {"x": 1.0, "y": 0.0, "z": 0.0},
+                        "yaw": 0.0,
+                        "candidate_lane": {"road_id": 10, "lane_id": -1},
+                        "candidate_topology_type": "t_junction",
+                        "is_junction": True,
+                        "junction_waypoint_ratio": 0.5,
+                        "heading_cluster_count": 3,
+                        "nearby_road_count": 3,
+                        "same_road_lane_count": 3,
+                        "same_direction_lane_count": 3,
+                    },
+                    {
+                        "location": {"x": 2.0, "y": 0.0, "z": 0.0},
+                        "yaw": 0.0,
+                        "candidate_lane": {"road_id": 20, "lane_id": -1},
+                        "candidate_topology_type": "straight_two_way",
+                        "is_junction": False,
+                        "junction_waypoint_ratio": 0.0,
+                        "heading_cluster_count": 1,
+                        "nearby_road_count": 1,
+                        "same_road_lane_count": 3,
+                        "same_direction_lane_count": 3,
+                        "is_curve": False,
+                        "has_center_median_candidate": False,
+                    },
+                ],
+            }
+            (Path(tmp) / "FakeTown.json").write_text(json.dumps(cache), encoding="utf-8")
+            matcher = SceneMapMatcher(topology_cache_dir=tmp)
+
+            result = matcher._match_from_cache(
+                {
+                    "road_topology_signature": {
+                        "topology_type": "straight_road",
+                        "junction_visible": False,
+                        "target_branch_count": 1,
+                        "forward_lane_count": 3,
+                        "opposing_lane_count": 0,
+                        "driving_lane_count": 3,
+                        "has_center_median": False,
+                    }
+                }
+            )
+
         self.assertEqual(result["status"], "matched")
-        self.assertEqual(result["best_match"]["candidate_lane"]["road_id"], 2)
+        self.assertEqual(result["best_match"]["search_strategy"], "cache_v2")
+        self.assertEqual(result["best_match"]["candidate_lane"]["road_id"], 20)
+        self.assertFalse(result["best_match"]["candidate_features"]["is_junction"])
+        self.assertLess(
+            result["best_match"]["candidate_features"]["junction_waypoint_ratio"],
+            0.18,
+        )
+
+    def test_v2_cache_open_road_rejects_parking_lane_when_target_has_none(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cache = {
+                "world_name": "FakeTown",
+                "candidates": [
+                    {
+                        "location": {"x": 1.0, "y": 0.0, "z": 0.0},
+                        "yaw": 0.0,
+                        "candidate_lane": {"road_id": 10, "lane_id": -1},
+                        "candidate_topology_type": "straight_two_way",
+                        "is_junction": False,
+                        "junction_waypoint_ratio": 0.0,
+                        "heading_cluster_count": 1,
+                        "nearby_road_count": 1,
+                        "same_road_lane_count": 2,
+                        "same_direction_lane_count": 2,
+                        "is_curve": False,
+                        "has_center_median_candidate": False,
+                        "right_parking_lane_present": True,
+                    },
+                    {
+                        "location": {"x": 2.0, "y": 0.0, "z": 0.0},
+                        "yaw": 0.0,
+                        "candidate_lane": {"road_id": 20, "lane_id": -1},
+                        "candidate_topology_type": "straight_two_way",
+                        "is_junction": False,
+                        "junction_waypoint_ratio": 0.0,
+                        "heading_cluster_count": 1,
+                        "nearby_road_count": 1,
+                        "same_road_lane_count": 2,
+                        "same_direction_lane_count": 2,
+                        "is_curve": False,
+                        "has_center_median_candidate": False,
+                        "left_parking_lane_present": False,
+                        "right_parking_lane_present": False,
+                    },
+                ],
+            }
+            (Path(tmp) / "FakeTown.json").write_text(json.dumps(cache), encoding="utf-8")
+            matcher = SceneMapMatcher(topology_cache_dir=tmp)
+
+            result = matcher._match_from_cache(
+                {
+                    "road_topology_signature": {
+                        "topology_type": "straight_road",
+                        "junction_visible": False,
+                        "forward_lane_count": 2,
+                        "driving_lane_count": 2,
+                        "left_parking_presence": False,
+                        "right_parking_presence": False,
+                        "has_center_median": False,
+                    }
+                }
+            )
+
+        self.assertEqual(result["status"], "matched")
+        self.assertEqual(result["best_match"]["candidate_lane"]["road_id"], 20)
+        self.assertEqual(result["best_match"]["world"], "FakeTown")
+        self.assertFalse(
+            result["best_match"]["candidate_features"]["right_parking_lane_present"]
+        )
+        self.assertEqual(
+            result["candidate_summary"]["accepted"][0]["world"],
+            "FakeTown",
+        )
+        self.assertEqual(
+            result["candidate_summary"]["accepted"][0]["same_direction_lane_count"],
+            2,
+        )
+        self.assertEqual(
+            result["candidate_summary"]["rejected"][0]["world"],
+            "FakeTown",
+        )
+        rejected_reasons = (
+            result["candidate_debug"]["best_rejected_candidate"]["score_details"][
+                "reject_reasons"
+            ]
+        )
+        self.assertIn(
+            "open-road target rejects candidate with right parking lane",
+            rejected_reasons,
+        )
+
+    def test_v2_open_road_lane_mismatch_is_hard_reject(self):
+        _score, details = score_candidate_v2(
+            {
+                "topology_type": "straight_road",
+                "junction_visible": False,
+                "forward_lane_count": 1,
+                "driving_lane_count": 2,
+                "has_center_median": False,
+            },
+            {
+                "candidate_topology_type": "straight_two_way",
+                "is_junction": False,
+                "junction_waypoint_ratio": 0.0,
+                "heading_cluster_count": 2,
+                "nearby_road_count": 1,
+                "same_direction_lane_count": 2,
+                "same_road_lane_count": 4,
+                "has_center_median_candidate": False,
+            },
+        )
+
+        self.assertTrue(details["hard_reject"])
+        self.assertTrue(
+            any("same-direction lane mismatch" in reason for reason in details["reject_reasons"])
+        )
+        self.assertTrue(
+            any("driving-lane mismatch" in reason for reason in details["reject_reasons"])
+        )
+
+    def test_v2_open_road_center_median_mismatch_is_hard_reject(self):
+        _score, details = score_candidate_v2(
+            {
+                "topology_type": "straight_road",
+                "junction_visible": False,
+                "forward_lane_count": 1,
+                "driving_lane_count": 2,
+                "has_center_median": False,
+            },
+            {
+                "candidate_topology_type": "straight_two_way",
+                "is_junction": False,
+                "junction_waypoint_ratio": 0.0,
+                "heading_cluster_count": 2,
+                "nearby_road_count": 1,
+                "same_direction_lane_count": 1,
+                "same_road_lane_count": 2,
+                "has_center_median_candidate": True,
+            },
+        )
+
+        self.assertTrue(details["hard_reject"])
+        self.assertTrue(
+            any("center-median mismatch" in reason for reason in details["reject_reasons"])
+        )
+
+    def test_v2_cache_open_road_prefers_expected_parking_side(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cache = {
+                "world_name": "FakeTown",
+                "candidates": [
+                    {
+                        "location": {"x": 1.0, "y": 0.0, "z": 0.0},
+                        "yaw": 0.0,
+                        "candidate_lane": {"road_id": 10, "lane_id": -1},
+                        "candidate_topology_type": "straight_two_way",
+                        "is_junction": False,
+                        "junction_waypoint_ratio": 0.0,
+                        "heading_cluster_count": 1,
+                        "nearby_road_count": 1,
+                        "same_road_lane_count": 2,
+                        "same_direction_lane_count": 2,
+                        "is_curve": False,
+                        "has_center_median_candidate": False,
+                        "left_parking_lane_present": False,
+                        "right_parking_lane_present": False,
+                    },
+                    {
+                        "location": {"x": 2.0, "y": 0.0, "z": 0.0},
+                        "yaw": 0.0,
+                        "candidate_lane": {"road_id": 20, "lane_id": -1},
+                        "candidate_topology_type": "straight_two_way",
+                        "is_junction": False,
+                        "junction_waypoint_ratio": 0.0,
+                        "heading_cluster_count": 1,
+                        "nearby_road_count": 1,
+                        "same_road_lane_count": 2,
+                        "same_direction_lane_count": 2,
+                        "is_curve": False,
+                        "has_center_median_candidate": False,
+                        "left_parking_lane_present": False,
+                        "right_parking_lane_present": True,
+                    },
+                ],
+            }
+            (Path(tmp) / "FakeTown.json").write_text(json.dumps(cache), encoding="utf-8")
+            matcher = SceneMapMatcher(topology_cache_dir=tmp)
+
+            result = matcher._match_from_cache(
+                {
+                    "road_topology_signature": {
+                        "topology_type": "straight_road",
+                        "junction_visible": False,
+                        "forward_lane_count": 2,
+                        "driving_lane_count": 2,
+                        "left_parking_presence": False,
+                        "right_parking_presence": True,
+                        "has_center_median": False,
+                    }
+                }
+            )
+
+        self.assertEqual(result["status"], "matched")
+        self.assertEqual(result["best_match"]["candidate_lane"]["road_id"], 20)
+        self.assertTrue(
+            result["best_match"]["candidate_features"]["right_parking_lane_present"]
+        )
+        self.assertIn(
+            "parking",
+            result["best_match"]["score_details"]["ranking_components"],
+        )
+
+    def test_v2_cache_junction_parking_lane_does_not_hard_reject_candidate(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cache = {
+                "world_name": "FakeTown",
+                "candidates": [
+                    {
+                        "location": {"x": 1.0, "y": 0.0, "z": 0.0},
+                        "yaw": 0.0,
+                        "candidate_lane": {"road_id": 10, "lane_id": -1},
+                        "candidate_topology_type": "t_junction",
+                        "is_junction": True,
+                        "junction_waypoint_ratio": 0.4,
+                        "heading_cluster_count": 3,
+                        "nearby_road_count": 3,
+                        "estimated_junction_degree": 3,
+                        "same_road_lane_count": 2,
+                        "same_direction_lane_count": 1,
+                        "junction_branch_dirs": {
+                            "ahead": True,
+                            "left": False,
+                            "right": True,
+                        },
+                        "right_parking_lane_present": True,
+                    },
+                ],
+            }
+            (Path(tmp) / "FakeTown.json").write_text(json.dumps(cache), encoding="utf-8")
+            matcher = SceneMapMatcher(topology_cache_dir=tmp)
+
+            result = matcher._match_from_cache(
+                {
+                    "road_topology_signature": {
+                        "topology_type": "t_junction",
+                        "junction_type": "t_junction",
+                        "junction_visible": True,
+                        "junction_branches": {
+                            "ahead": True,
+                            "left": False,
+                            "right": True,
+                            "known": True,
+                        },
+                        "forward_lane_count": 1,
+                        "driving_lane_count": 2,
+                        "left_parking_presence": False,
+                        "right_parking_presence": False,
+                        "has_center_median": False,
+                    }
+                }
+            )
+
+        self.assertEqual(result["status"], "matched")
+        self.assertEqual(result["best_match"]["candidate_lane"]["road_id"], 10)
+        self.assertEqual(
+            result["best_match"]["score_details"]["candidate_kind"],
+            "junction",
+        )
+        self.assertTrue(
+            result["best_match"]["candidate_features"]["right_parking_lane_present"]
+        )
+
+    def test_v2_junction_branch_mismatch_is_hard_reject(self):
+        score, details = score_candidate_v2(
+            {
+                "topology_type": "cross_intersection",
+                "junction_visible": True,
+                "junction_branches": {
+                    "ahead": True,
+                    "left": True,
+                    "right": True,
+                    "known": True,
+                },
+                "forward_lane_count": 1,
+                "driving_lane_count": 2,
+            },
+            {
+                "candidate_topology_type": "cross_intersection",
+                "is_junction": False,
+                "junction_waypoint_ratio": 0.4,
+                "heading_cluster_count": 4,
+                "nearby_road_count": 4,
+                "estimated_junction_degree": 4,
+                "same_direction_lane_count": 1,
+                "same_road_lane_count": 2,
+                "junction_branch_dirs": {
+                    "ahead": True,
+                    "left": False,
+                    "right": True,
+                },
+            },
+        )
+
+        self.assertTrue(details["hard_reject"])
+        self.assertIn(
+            "junction target rejects branch mismatch: missing_required_left_branch",
+            details["reject_reasons"],
+        )
+        self.assertLess(score, 0.9)
+
+    def test_v2_junction_lane_mismatch_is_hard_reject(self):
+        _score, details = score_candidate_v2(
+            {
+                "topology_type": "cross_intersection",
+                "junction_visible": True,
+                "junction_branches": {
+                    "ahead": True,
+                    "left": True,
+                    "right": True,
+                    "known": True,
+                },
+                "forward_lane_count": 2,
+                "driving_lane_count": 4,
+            },
+            {
+                "candidate_topology_type": "cross_intersection",
+                "is_junction": False,
+                "junction_waypoint_ratio": 0.6,
+                "heading_cluster_count": 4,
+                "nearby_road_count": 4,
+                "estimated_junction_degree": 4,
+                "same_direction_lane_count": 1,
+                "same_road_lane_count": 2,
+                "junction_branch_dirs": {
+                    "ahead": True,
+                    "left": True,
+                    "right": True,
+                },
+            },
+        )
+
+        self.assertTrue(details["hard_reject"])
+        self.assertTrue(
+            any("too few approach lanes" in reason for reason in details["reject_reasons"])
+        )
+        self.assertTrue(
+            any("severe driving-lane mismatch" in reason for reason in details["reject_reasons"])
+        )
+
+    def test_v2_signalized_junction_without_signal_is_hard_reject(self):
+        _score, details = score_candidate_v2(
+            {
+                "topology_type": "cross_intersection",
+                "junction_visible": True,
+                "junction_branches": {
+                    "ahead": True,
+                    "left": True,
+                    "right": True,
+                    "known": True,
+                },
+                "forward_lane_count": 1,
+                "driving_lane_count": 2,
+                "has_traffic_light": True,
+            },
+            {
+                "candidate_topology_type": "cross_intersection",
+                "is_junction": False,
+                "junction_waypoint_ratio": 0.6,
+                "heading_cluster_count": 4,
+                "nearby_road_count": 4,
+                "estimated_junction_degree": 4,
+                "same_direction_lane_count": 1,
+                "same_road_lane_count": 2,
+                "junction_branch_dirs": {
+                    "ahead": True,
+                    "left": True,
+                    "right": True,
+                },
+                "distance_to_traffic_light_ahead": None,
+            },
+        )
+
+        self.assertTrue(details["hard_reject"])
+        self.assertIn(
+            "signalized junction target rejects no-signal candidate",
+            details["reject_reasons"],
+        )
+
+    def test_v2_cache_does_not_match_when_only_rejected_candidate_exists(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cache = {
+                "world_name": "FakeTown",
+                "candidates": [
+                    {
+                        "location": {"x": 1.0, "y": 0.0, "z": 0.0},
+                        "yaw": 0.0,
+                        "candidate_lane": {"road_id": 10, "lane_id": -1},
+                        "candidate_topology_type": "t_junction",
+                        "is_junction": True,
+                        "junction_waypoint_ratio": 0.5,
+                        "heading_cluster_count": 3,
+                        "nearby_road_count": 3,
+                        "same_road_lane_count": 3,
+                        "same_direction_lane_count": 3,
+                    }
+                ],
+            }
+            (Path(tmp) / "FakeTown.json").write_text(json.dumps(cache), encoding="utf-8")
+            matcher = SceneMapMatcher(topology_cache_dir=tmp)
+
+            result = matcher._match_from_cache(
+                {
+                    "road_topology_signature": {
+                        "topology_type": "straight_road",
+                        "junction_visible": False,
+                        "forward_lane_count": 3,
+                        "driving_lane_count": 3,
+                    }
+                }
+            )
+
+        self.assertEqual(result["status"], "unmatched")
+        self.assertIsNone(result["best_match"])
+        self.assertIsNotNone(result["candidate_debug"]["best_rejected_candidate"])
 
     def test_topology_fallback_penalizes_overly_wide_candidates(self):
         narrow_score = SceneMapMatcher._topology_fallback_score(
@@ -3049,7 +4467,7 @@ class TestGenerationPipelineHelpers(unittest.TestCase):
                 "live_carla",
             )
 
-    def test_junction_actor_layout_requires_matched_structure(self):
+    def test_crossing_actor_on_straight_road_does_not_require_junction_structure(self):
         with tempfile.TemporaryDirectory() as tmp:
             generator = AutoGenerator(
                 tmp,
@@ -3072,8 +4490,57 @@ class TestGenerationPipelineHelpers(unittest.TestCase):
                 ]
             }
 
-            with self.assertRaisesRegex(RuntimeError, "requires matched_structure"):
-                generator.reproject_junction_step("scene", refined)
+            self.assertIs(generator.reproject_junction_step("scene", refined), refined)
+
+    def test_scene_requires_junction_only_for_topology_evidence(self):
+        straight_with_crossing_actor = {
+            "road_network": {
+                "map_matching": {
+                    "topology_type": "straight_road",
+                    "junction_visible": False,
+                    "junction_type": "none",
+                }
+            },
+            "traffic_subjects": [
+                {
+                    "category": "car",
+                    "heading_relation_to_ego": "crossing",
+                    "layout_anchor_id": "right_arm",
+                }
+            ],
+        }
+        self.assertFalse(
+            AutoGenerator._scene_requires_junction_structure(straight_with_crossing_actor)
+        )
+
+        t_junction = {
+            "road_network": {
+                "map_matching": {
+                    "topology_type": "t_junction",
+                    "junction_visible": True,
+                    "junction_type": "t_junction",
+                    "target_branch_count": 3,
+                }
+            }
+        }
+        self.assertTrue(AutoGenerator._scene_requires_junction_structure(t_junction))
+
+        branch_evidence = {
+            "road_network": {
+                "map_matching": {
+                    "topology_type": "unknown",
+                    "junction_visible": True,
+                    "junction_type": "unknown",
+                    "junction_branches": {
+                        "known": True,
+                        "ahead": True,
+                        "left": True,
+                        "right": False,
+                    },
+                }
+            }
+        }
+        self.assertTrue(AutoGenerator._scene_requires_junction_structure(branch_evidence))
 
     def test_junction_side_arm_vehicle_projects_to_declared_lane(self):
         payload = build_projected_spawn_payload(
@@ -3109,6 +4576,136 @@ class TestGenerationPipelineHelpers(unittest.TestCase):
         self.assertEqual(entity["projected_lane"]["road_id"], 622)
         self.assertEqual(entity["projected_lane"]["yaw"], 270.153564453125)
         self.assertEqual(entity["junction_direction"], "right")
+
+    def test_junction_actor_uses_anchor_relation_distance_to_center(self):
+        coordinates = {
+            "entities": [
+                {
+                    "id": "right_arm_car",
+                    "spawn_kind": "vehicle",
+                    "category": "car",
+                    "heading_relation": "crossing",
+                    "flow_compliance": "legal",
+                    "lane_side_relation": "right_lane",
+                    "lane_index_relation": 1,
+                    "layout_anchor_id": "right_arm",
+                    "anchor_relation": {
+                        "travel_direction": "toward_junction",
+                        "distance_to_junction_m": 24.0,
+                        "lane_from_right": 0,
+                    },
+                    "location": {"x": 0.0, "y": 0.0, "z": 0.3},
+                    "rotation": {"pitch": 0.0, "yaw": 90.0, "roll": 0.0},
+                }
+            ]
+        }
+        matched_structure = {
+            "kind": "junction",
+            "junction_id": 7,
+            "center": {"x": 10.0, "y": 20.0, "z": 0.0},
+            "ego_approach_heading_deg": 0.0,
+            "junction_radius_m": 6.0,
+            "legs": [
+                {
+                    "name": "right",
+                    "heading_out_deg": 90.0,
+                    "inbound_lanes": [
+                        {
+                            "road_id": 77,
+                            "lane_id": -1,
+                            "role": "inbound",
+                            "yaw": 270.0,
+                        }
+                    ],
+                }
+            ],
+        }
+
+        reprojected = reproject_actors_for_junction(coordinates, matched_structure)
+        entity = reprojected["entities"][0]
+        payload = build_projected_spawn_payload(reprojected)
+
+        self.assertEqual(entity["junction_placement"], "frame")
+        self.assertEqual(entity["junction_direction"], "right")
+        self.assertEqual(entity["junction_motion"], "approaching")
+        self.assertAlmostEqual(entity["junction_distance_m"], 24.0)
+        self.assertEqual(payload["entities"][0]["placement_mode"], "project_to_junction_lane")
+
+    def test_junction_frame_row_keeps_lane_yaw(self):
+        payload = build_projected_spawn_payload(
+            {
+                "selected_anchor_lane": {
+                    "start": {"x": 0.0, "y": 0.0},
+                    "end": {"x": 10.0, "y": 0.0},
+                },
+                "entities": [
+                    {
+                        "id": "right_arm_truck",
+                        "spawn_kind": "vehicle",
+                        "category": "truck",
+                        "heading_relation": "crossing",
+                        "turn_intent": "right",
+                        "lane_side_relation": "right_lane",
+                        "lane_index_relation": 1,
+                        "group_id": "right_arm_queue",
+                        "junction_placement": "frame",
+                        "junction_direction": "right",
+                        "junction_leg": "right",
+                        "junction_motion": "leaving",
+                        "projected_lane": {
+                            "road_id": 2282,
+                            "lane_id": 1,
+                            "role": "outbound",
+                            "yaw": -90.51138305664062,
+                            "source": "junction_leg",
+                        },
+                        "location": {"x": -123.7, "y": 117.6, "z": 0.3},
+                        "rotation": {
+                            "pitch": 0.0,
+                            "yaw": -90.51138305664062,
+                            "roll": 0.0,
+                        },
+                    },
+                    {
+                        "id": "right_arm_car",
+                        "spawn_kind": "vehicle",
+                        "category": "car",
+                        "heading_relation": "crossing",
+                        "turn_intent": "none",
+                        "lane_side_relation": "right_lane",
+                        "lane_index_relation": 1,
+                        "group_id": "right_arm_queue",
+                        "junction_placement": "frame",
+                        "junction_direction": "right",
+                        "junction_leg": "right",
+                        "junction_motion": "approaching",
+                        "projected_lane": {
+                            "road_id": 2292,
+                            "lane_id": 1,
+                            "role": "inbound",
+                            "yaw": -270.5113525390625,
+                            "source": "junction_leg",
+                        },
+                        "location": {"x": -130.7, "y": 117.5, "z": 0.3},
+                        "rotation": {
+                            "pitch": 0.0,
+                            "yaw": -270.5113525390625,
+                            "roll": 0.0,
+                        },
+                    },
+                ],
+            }
+        )
+
+        by_id = {entity["id"]: entity for entity in payload["entities"]}
+        self.assertAlmostEqual(
+            by_id["right_arm_truck"]["rotation"]["yaw"],
+            -90.51138305664062,
+        )
+        self.assertAlmostEqual(
+            by_id["right_arm_car"]["rotation"]["yaw"],
+            -270.5113525390625,
+        )
 
 if __name__ == "__main__":
     unittest.main()
