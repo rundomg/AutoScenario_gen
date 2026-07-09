@@ -11,6 +11,7 @@ from tools.junction_placement import (  # noqa: E402
     reproject_actors_for_junction,
     reproject_actors_for_road,
     reproject_actors_for_structure,
+    validate_structural_reprojection,
 )
 from tools.reference_frame import angle_difference  # noqa: E402
 
@@ -192,6 +193,243 @@ class ReprojectionTests(unittest.TestCase):
         ego = out["entities"][0]
         self.assertEqual(ego["projected_lane"]["lane_id"], 2)
 
+    def test_ego_arm_lane_indices_map_from_ego_lane_slot(self):
+        struct = {
+            "kind": "junction",
+            "junction_id": 2,
+            "center": {"x": 0.0, "y": 0.0, "z": 0.0},
+            "ego_approach_heading_deg": 0.0,
+            "junction_radius_m": 5.0,
+            "legs": [
+                {
+                    "name": "ego",
+                    "heading_out_deg": 180.0,
+                    "inbound_lanes": [
+                        {
+                            "road_id": 10,
+                            "lane_id": 4,
+                            "role": "inbound",
+                            "anchor": {"x": -30.0, "y": -3.5, "z": 0.0},
+                        },
+                        {
+                            "road_id": 10,
+                            "lane_id": 5,
+                            "role": "inbound",
+                            "anchor": {"x": -30.0, "y": 0.0, "z": 0.0},
+                        },
+                        {
+                            "road_id": 10,
+                            "lane_id": 6,
+                            "role": "inbound",
+                            "anchor": {"x": -30.0, "y": 3.5, "z": 0.0},
+                        },
+                    ],
+                }
+            ],
+        }
+        coords = {
+            "selected_anchor_lane": {
+                "road_id": 10,
+                "lane_id": 5,
+                "start": {"x": -20.0, "y": 0.0, "z": 0.0},
+            },
+            "entities": [
+                {
+                    "id": "same",
+                    "heading_relation": "same_direction",
+                    "lane_index_relation": 0,
+                    "layout_anchor_id": "ego_approach",
+                    "anchor_relation": {"position_along_anchor": "near_mouth"},
+                    "location": {"x": 0, "y": 0, "z": 0.3},
+                },
+                {
+                    "id": "left",
+                    "heading_relation": "same_direction",
+                    "lane_index_relation": -1,
+                    "layout_anchor_id": "ego_approach",
+                    "anchor_relation": {"position_along_anchor": "near_mouth"},
+                    "location": {"x": 0, "y": 0, "z": 0.3},
+                },
+                {
+                    "id": "right",
+                    "heading_relation": "same_direction",
+                    "lane_index_relation": 1,
+                    "layout_anchor_id": "ego_approach",
+                    "anchor_relation": {"position_along_anchor": "near_mouth"},
+                    "location": {"x": 0, "y": 0, "z": 0.3},
+                },
+            ],
+        }
+
+        out = reproject_actors_for_junction(coords, struct)
+        by_id = {entity["id"]: entity for entity in out["entities"]}
+
+        self.assertEqual(by_id["same"]["projected_lane"]["lane_id"], 5)
+        self.assertEqual(by_id["left"]["projected_lane"]["lane_id"], 4)
+        self.assertEqual(by_id["right"]["projected_lane"]["lane_id"], 6)
+        self.assertEqual(
+            out["metadata"]["junction_reprojection"]["assignments"][0]["lane_slot"],
+            1,
+        )
+
+    def test_duplicate_junction_lane_anchors_do_not_consume_lane_slot(self):
+        struct = {
+            "kind": "junction",
+            "junction_id": 22,
+            "center": {"x": 0.0, "y": 0.0, "z": 0.0},
+            "ego_approach_heading_deg": 0.0,
+            "junction_radius_m": 5.0,
+            "legs": [
+                {
+                    "name": "ego",
+                    "heading_out_deg": 180.0,
+                    "inbound_lanes": [
+                        {
+                            "road_id": 10,
+                            "lane_id": 6,
+                            "role": "inbound",
+                            "anchor": {"x": -30.0, "y": 3.5, "z": 0.0},
+                        },
+                        {
+                            "road_id": 1027,
+                            "lane_id": 1,
+                            "role": "inbound",
+                            "anchor": {"x": -30.0, "y": 0.0, "z": 0.0},
+                        },
+                        {
+                            "road_id": 10,
+                            "lane_id": 5,
+                            "role": "inbound",
+                            "anchor": {"x": -30.0, "y": 0.0, "z": 0.0},
+                        },
+                        {
+                            "road_id": 1004,
+                            "lane_id": 1,
+                            "role": "inbound",
+                            "anchor": {"x": -30.0, "y": -3.5, "z": 0.0},
+                        },
+                    ],
+                }
+            ],
+        }
+        coords = {
+            "selected_anchor_lane": {
+                "road_id": 10,
+                "lane_id": 5,
+                "start": {"x": -20.0, "y": 0.0, "z": 0.0},
+            },
+            "entities": [
+                {
+                    "id": "same",
+                    "heading_relation": "same_direction",
+                    "lane_index_relation": 0,
+                    "layout_anchor_id": "ego_approach",
+                    "anchor_relation": {"position_along_anchor": "near_mouth"},
+                    "location": {"x": 0, "y": 0, "z": 0.3},
+                },
+                {
+                    "id": "right",
+                    "heading_relation": "same_direction",
+                    "lane_index_relation": 1,
+                    "layout_anchor_id": "ego_approach",
+                    "anchor_relation": {"position_along_anchor": "near_mouth"},
+                    "location": {"x": 0, "y": 0, "z": 0.3},
+                },
+                {
+                    "id": "left",
+                    "heading_relation": "same_direction",
+                    "lane_index_relation": -1,
+                    "layout_anchor_id": "ego_approach",
+                    "anchor_relation": {"position_along_anchor": "near_mouth"},
+                    "location": {"x": 0, "y": 0, "z": 0.3},
+                },
+            ],
+        }
+
+        out = reproject_actors_for_junction(coords, struct)
+        by_id = {entity["id"]: entity for entity in out["entities"]}
+
+        self.assertEqual(by_id["same"]["projected_lane"]["lane_id"], 5)
+        self.assertEqual(by_id["right"]["projected_lane"]["lane_id"], 6)
+        self.assertEqual(by_id["left"]["projected_lane"]["road_id"], 1004)
+        self.assertGreater(by_id["right"]["location"]["y"], by_id["same"]["location"]["y"])
+        self.assertLess(by_id["left"]["location"]["y"], by_id["same"]["location"]["y"])
+
+    def test_ego_arm_ahead_uses_longitudinal_gap_before_clearance_floor(self):
+        struct = _cross_structure()
+        struct["ego_distance_to_center_m"] = 20.0
+        struct["junction_radius_m"] = 21.667
+        coords = {
+            "entities": [
+                {
+                    "id": "lead",
+                    "heading_relation": "same_direction",
+                    "longitudinal_relation": "ahead",
+                    "longitudinal_m": 4.0,
+                    "layout_anchor_id": "ego_approach",
+                    "anchor_relation": {"position_along_anchor": "near_mouth"},
+                    "location": {"x": 0, "y": 0, "z": 0.3},
+                }
+            ],
+        }
+
+        out = reproject_actors_for_junction(coords, struct)
+        lead = out["entities"][0]
+
+        self.assertLess(lead["junction_distance_m"], struct["ego_distance_to_center_m"])
+        self.assertAlmostEqual(lead["junction_distance_m"], 16.0)
+
+    def test_opposite_arm_lane_indices_count_from_median(self):
+        struct = {
+            "kind": "junction",
+            "junction_id": 3,
+            "center": {"x": 0.0, "y": 0.0, "z": 0.0},
+            "ego_approach_heading_deg": 0.0,
+            "junction_radius_m": 5.0,
+            "legs": [
+                {
+                    "name": "opposite",
+                    "heading_out_deg": 0.0,
+                    "inbound_lanes": [
+                        {
+                            "road_id": 20,
+                            "lane_id": 1,
+                            "role": "inbound",
+                            "anchor": {"x": 30.0, "y": 0.0, "z": 0.0},
+                        },
+                        {
+                            "road_id": 20,
+                            "lane_id": 2,
+                            "role": "inbound",
+                            "anchor": {"x": 30.0, "y": -3.5, "z": 0.0},
+                        },
+                    ],
+                }
+            ],
+        }
+        coords = {
+            "entities": [
+                {
+                    "id": "near_median",
+                    "heading_relation": "opposite_direction",
+                    "lane_index_relation": -1,
+                    "location": {"x": 0, "y": 0, "z": 0.3},
+                },
+                {
+                    "id": "outer",
+                    "heading_relation": "opposite_direction",
+                    "lane_index_relation": -2,
+                    "location": {"x": 0, "y": 0, "z": 0.3},
+                },
+            ],
+        }
+
+        out = reproject_actors_for_junction(coords, struct)
+        by_id = {entity["id"]: entity for entity in out["entities"]}
+
+        self.assertEqual(by_id["near_median"]["projected_lane"]["lane_id"], 1)
+        self.assertEqual(by_id["outer"]["projected_lane"]["lane_id"], 2)
+
     def test_same_arm_near_mouth_vehicles_are_queued_not_overlapped(self):
         struct = _cross_structure()
         for leg in struct["legs"]:
@@ -255,6 +493,74 @@ class ReprojectionTests(unittest.TestCase):
         coords = {"entities": [{"id": "a", "location": {"x": 1, "y": 2, "z": 0.3}}]}
         out = reproject_actors_for_junction(coords, {"kind": "road_segment"})
         self.assertEqual(out["entities"][0]["location"], {"x": 1, "y": 2, "z": 0.3})
+
+
+class StructuralValidationTests(unittest.TestCase):
+    def test_ego_approach_left_lane_direction_passes(self):
+        report = validate_structural_reprojection(
+            {
+                "entities": [
+                    {
+                        "id": "left_lane_car",
+                        "layout_anchor_id": "ego_approach",
+                        "lane_side_relation": "left_lane",
+                        "junction_direction": "ego",
+                        "junction_placement": "frame",
+                        "projected_lane": {"source": "junction_leg"},
+                    }
+                ]
+            }
+        )
+
+        self.assertEqual(report["status"], "pass")
+        self.assertEqual(report["summary"]["failed"], 0)
+
+    def test_ego_approach_moved_to_side_direction_fails(self):
+        report = validate_structural_reprojection(
+            {
+                "entities": [
+                    {
+                        "id": "bad_car",
+                        "layout_anchor_id": "ego_approach",
+                        "lane_side_relation": "left_lane",
+                        "junction_direction": "left",
+                        "junction_leg": "north",
+                        "junction_placement": "frame",
+                        "projected_lane": {"source": "junction_leg"},
+                    }
+                ]
+            }
+        )
+
+        self.assertEqual(report["status"], "fail")
+        self.assertEqual(
+            report["issues"][0]["issue_type"],
+            "junction_anchor_direction_mismatch",
+        )
+
+    def test_arm_anchor_direction_matches_pass(self):
+        report = validate_structural_reprojection(
+            {
+                "entities": [
+                    {
+                        "id": "left_arm_car",
+                        "layout_anchor_id": "left_arm",
+                        "junction_direction": "left",
+                        "junction_placement": "frame",
+                        "projected_lane": {"source": "junction_leg"},
+                    },
+                    {
+                        "id": "ahead_car",
+                        "layout_anchor_id": "ahead_arm",
+                        "junction_direction": "opposite",
+                        "junction_placement": "frame",
+                        "projected_lane": {"source": "junction_leg"},
+                    },
+                ]
+            }
+        )
+
+        self.assertEqual(report["status"], "pass")
 
 
 class RoadReprojectionTests(unittest.TestCase):

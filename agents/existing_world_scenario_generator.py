@@ -290,6 +290,67 @@ class ExistingWorldScenarioGenerator(ScenarioGenerator):
                 return projected_location, projected_rotation
 
 
+            def _autoscenario_project_vehicle_to_parking_lane(location, rotation, projected_lane=None):
+                base_location = _autoscenario_to_location(location)
+                base_rotation = _autoscenario_to_rotation(rotation)
+                projected_lane = projected_lane if isinstance(projected_lane, dict) else {}
+                try:
+                    world_map = world.get_map()
+                except Exception:
+                    return base_location, base_rotation
+
+                parking_type = getattr(carla.LaneType, "Parking", None)
+                try:
+                    if parking_type is not None:
+                        waypoint = world_map.get_waypoint(
+                            base_location,
+                            project_to_road=True,
+                            lane_type=parking_type,
+                        )
+                    else:
+                        waypoint = world_map.get_waypoint(base_location, project_to_road=True)
+                except TypeError:
+                    try:
+                        waypoint = world_map.get_waypoint(base_location, True)
+                    except Exception:
+                        waypoint = None
+                except Exception:
+                    waypoint = None
+
+                if waypoint is None:
+                    return base_location, base_rotation
+                try:
+                    is_parking = waypoint.lane_type == carla.LaneType.Parking
+                except Exception:
+                    is_parking = "parking" in str(getattr(waypoint, "lane_type", "")).lower()
+                if not is_parking:
+                    return base_location, base_rotation
+                # The projected lane may be the fallback driving lane; the nearest
+                # Parking waypoint is the stronger semantic signal here.
+
+                snapped_location = waypoint.transform.location
+                waypoint_yaw = float(waypoint.transform.rotation.yaw)
+                try:
+                    yaw_reference = float(projected_lane.get("yaw"))
+                except Exception:
+                    yaw_reference = float(base_rotation.yaw)
+                snapped_yaw = min(
+                    [waypoint_yaw, waypoint_yaw + 180.0],
+                    key=lambda yaw_value: _autoscenario_angle_distance(
+                        yaw_value,
+                        yaw_reference,
+                    ),
+                )
+                return (
+                    carla.Location(snapped_location.x, snapped_location.y, snapped_location.z + 0.35),
+                    carla.Rotation(
+                        float(base_rotation.pitch),
+                        _autoscenario_normalize_yaw(snapped_yaw),
+                        float(base_rotation.roll),
+                    ),
+                )
+
+
             def _autoscenario_collect_vehicle_spawn_candidates(location, rotation):
                 base_location = _autoscenario_to_location(location)
                 base_rotation = _autoscenario_to_rotation(rotation)
@@ -500,6 +561,23 @@ class ExistingWorldScenarioGenerator(ScenarioGenerator):
                 _autoscenario_apply_vehicle_color(blueprint, color)
                 _autoscenario_apply_role_name(blueprint, role_name)
                 return _autoscenario_try_spawn_vehicle_actor(
+                    blueprint,
+                    snapped_location,
+                    snapped_rotation,
+                )
+
+
+            def _autoscenario_spawn_vehicle_parking_lane(blueprint_name, location, rotation, projected_lane=None, color=None, role_name=None):
+                snapped_location, snapped_rotation = _autoscenario_project_vehicle_to_parking_lane(
+                    location,
+                    rotation,
+                    projected_lane,
+                )
+                _autoscenario_record_focus_point(snapped_location)
+                blueprint = _autoscenario_pick_blueprint("vehicle", blueprint_name)
+                _autoscenario_apply_vehicle_color(blueprint, color)
+                _autoscenario_apply_role_name(blueprint, role_name)
+                return _autoscenario_try_spawn_vehicle_actor_strict_lane(
                     blueprint,
                     snapped_location,
                     snapped_rotation,
@@ -871,6 +949,17 @@ class ExistingWorldScenarioGenerator(ScenarioGenerator):
             "        if actor is not None and entity_id:\n"
             "            _autoscenario_actor_by_id[entity_id] = actor\n"
             "        continue\n"
+            "    if placement_mode == 'project_to_parking_lane':\n"
+            "        actor = _autoscenario_spawn_vehicle_parking_lane(\n"
+            "            blueprint_name,\n"
+            "            location,\n"
+            "            rotation,\n"
+            "            entity.get('projected_lane'),\n"
+            "            entity.get('color'),\n"
+            "        )\n"
+            "        if actor is not None and entity_id:\n"
+            "            _autoscenario_actor_by_id[entity_id] = actor\n"
+            "        continue\n"
             "    if placement_mode == 'project_to_junction_lane':\n"
             "        actor = _autoscenario_spawn_vehicle_junction_lane(\n"
             "            blueprint_name,\n"
@@ -968,6 +1057,15 @@ class ExistingWorldScenarioGenerator(ScenarioGenerator):
                                 entity.get('blueprint_name'),
                                 location,
                                 rotation,
+                                entity.get('color'),
+                                role_name=role_name,
+                            )
+                        elif placement_mode == 'project_to_parking_lane':
+                            actor = _autoscenario_spawn_vehicle_parking_lane(
+                                entity.get('blueprint_name'),
+                                location,
+                                rotation,
+                                entity.get('projected_lane'),
                                 entity.get('color'),
                                 role_name=role_name,
                             )
@@ -1524,6 +1622,15 @@ class ExistingWorldScenarioGenerator(ScenarioGenerator):
                                 entity.get('blueprint_name'),
                                 location,
                                 rotation,
+                                entity.get('color'),
+                                role_name=role_name,
+                            )
+                        elif placement_mode == 'project_to_parking_lane':
+                            actor = _autoscenario_spawn_vehicle_parking_lane(
+                                entity.get('blueprint_name'),
+                                location,
+                                rotation,
+                                entity.get('projected_lane'),
                                 entity.get('color'),
                                 role_name=role_name,
                             )

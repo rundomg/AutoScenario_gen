@@ -488,7 +488,6 @@ class SceneMapMatcher:
     ) -> Dict[str, Any]:
         road_network = scene_understanding.get("road_network", {}) or {}
         metadata = scene_understanding.get("metadata", {}) or {}
-        decisive = metadata.get("decisive_map_matching_cues") or {}
         ego_localization = (
             metadata.get("ego_localization")
             if isinstance(metadata.get("ego_localization"), dict)
@@ -499,165 +498,214 @@ class SceneMapMatcher:
             if isinstance(road_network.get("map_matching"), dict)
             else {}
         )
-        scene_text = json.dumps(scene_understanding, sort_keys=True, ensure_ascii=False).lower()
         lane_groups = road_network.get("lane_groups") or []
         valid_lane_groups = [
             lane_group for lane_group in lane_groups if isinstance(lane_group, dict)
         ]
         primary_lane_group = valid_lane_groups[0] if valid_lane_groups else {}
-        road_segments = road_network.get("road_segments") or []
-        special_areas = road_network.get("special_road_areas") or []
-        control_elements = road_network.get("control_elements") or []
-        junctions = road_network.get("junctions") or []
-        lane_markings = road_network.get("lane_markings") or {}
 
-        forward_lanes = int(primary_lane_group.get("forward_lane_count", 1) or 1)
-        primary_opposing_lanes = int(primary_lane_group.get("opposing_lane_count", 0) or 0)
+        def _count_from_group(group: Dict[str, Any], key: str, default: int = 0) -> int:
+            try:
+                return max(0, int(group.get(key, default) or default))
+            except (TypeError, ValueError):
+                return max(0, int(default))
+
+        lane_forward_lanes = _count_from_group(primary_lane_group, "forward_lane_count", 1)
+        primary_opposing_lanes = _count_from_group(primary_lane_group, "opposing_lane_count", 0)
         extra_opposing_lanes = sum(
-            int(lane_group.get("opposing_lane_count", 0) or 0)
+            _count_from_group(lane_group, "opposing_lane_count", 0)
             for lane_group in valid_lane_groups[1:]
-            if int(lane_group.get("forward_lane_count", 0) or 0) == 0
+            if _count_from_group(lane_group, "forward_lane_count", 0) == 0
         )
-        opposing_lanes = primary_opposing_lanes + extra_opposing_lanes
-        left_parking = any(
-            int(lane_group.get("left_parking_lane_count", 0) or 0) > 0
+        lane_opposing_lanes = primary_opposing_lanes + extra_opposing_lanes
+        lane_left_parking = any(
+            _count_from_group(lane_group, "left_parking_lane_count", 0) > 0
             for lane_group in valid_lane_groups
         )
-        right_parking = any(
-            int(lane_group.get("right_parking_lane_count", 0) or 0) > 0
+        lane_right_parking = any(
+            _count_from_group(lane_group, "right_parking_lane_count", 0) > 0
             for lane_group in valid_lane_groups
         )
 
-        junction_visible = cls._explicit_bool(
-            decisive,
-            ("junction_visible", "near_junction", "intersection_visible"),
-            default=None,
-        )
-        target_branch_count = 1
-        junction_type = "none"
+        forward_lanes = cls._optional_int(map_matching, "forward_lane_count")
+        if forward_lanes is None:
+            forward_lanes = lane_forward_lanes
+        forward_lanes = max(1, int(forward_lanes or 1))
+
+        opposing_lanes = cls._optional_int(map_matching, "opposing_lane_count")
+        if opposing_lanes is None:
+            opposing_lanes = lane_opposing_lanes
+        opposing_lanes = max(0, int(opposing_lanes or 0))
+
+        driving_lanes = cls._optional_int(map_matching, "driving_lane_count")
+        if driving_lanes is None:
+            driving_lanes = forward_lanes + opposing_lanes
+        driving_lanes = max(1, int(driving_lanes or 1))
+
+        def _slug(value: Any) -> str:
+            return str(value or "").strip().lower().replace("-", "_").replace(" ", "_")
+
+        def _canonical_topology(value: Any) -> str:
+            raw = _slug(value)
+            if raw in {
+                "straight_road",
+                "straight_two_way",
+                "curve",
+                "t_junction",
+                "cross_intersection",
+                "multi_branch",
+                "roundabout",
+                "unknown",
+            }:
+                return raw
+            if "roundabout" in raw or "rotary" in raw:
+                return "roundabout"
+            if raw in {"intersection", "signalized_intersection", "signalized_junction"}:
+                return "cross_intersection"
+            if "cross" in raw or "four_way" in raw or "4_way" in raw:
+                return "cross_intersection"
+            if "t_junction" in raw or "three_way" in raw or "3_way" in raw:
+                return "t_junction"
+            if "multi" in raw or "complex" in raw:
+                return "multi_branch"
+            if "curve" in raw or "bend" in raw:
+                return "curve"
+            if "straight" in raw:
+                return "straight_two_way" if opposing_lanes > 0 else "straight_road"
+            return ""
+
+        def _branches_from_value(value: Any, junction_visible_hint: bool) -> Dict[str, bool]:
+            if isinstance(value, dict):
+                return {
+                    "ahead": bool(value.get("ahead", junction_visible_hint)),
+                    "left": bool(value.get("left", False)),
+                    "right": bool(value.get("right", False)),
+                    "known": bool(value.get("known", True)),
+                }
+            if isinstance(value, (list, tuple, set)):
+                tokens = {_slug(item) for item in value}
+                return {
+                    "ahead": bool(
+                        tokens
+                        & {"ahead", "ahead_arm", "straight", "through", "oncoming", "oncoming_arm"}
+                    ),
+                    "left": bool(tokens & {"left", "left_arm", "left_branch"}),
+                    "right": bool(tokens & {"right", "right_arm", "right_branch"}),
+                    "known": bool(tokens),
+                }
+            return {"ahead": False, "left": False, "right": False, "known": False}
+
+        topology_type = _canonical_topology(map_matching.get("topology_type"))
+        has_map_matching = bool(map_matching)
+        if not topology_type:
+            if has_map_matching:
+                topology_type = "unknown"
+            else:
+                road_segments = road_network.get("road_segments") or []
+                geometry_text = " ".join(
+                    str(segment.get("geometry_type") or segment.get("curvature_hint") or "")
+                    for segment in road_segments
+                    if isinstance(segment, dict)
+                ).lower()
+                if "curve" in geometry_text or "bend" in geometry_text:
+                    topology_type = "curve"
+                elif forward_lanes or opposing_lanes:
+                    topology_type = "straight_two_way" if opposing_lanes > 0 else "straight_road"
+                else:
+                    topology_type = "unknown"
+
+        junction_topologies = {"t_junction", "cross_intersection", "multi_branch", "roundabout"}
+        junction_visible = cls._optional_bool(map_matching, "junction_visible")
         if junction_visible is None:
-            junction_visible = False
-            for junction in junctions:
-                parsed_visible, parsed_type, parsed_branch_count = cls._parse_junction_hint(junction)
+            junction_visible = topology_type in junction_topologies
+        if not has_map_matching and not junction_visible:
+            for junction in road_network.get("junctions") or []:
+                parsed_visible, parsed_type, _parsed_branch_count = cls._parse_junction_hint(junction)
                 if parsed_visible:
                     junction_visible = True
-                    junction_type = parsed_type
-                    target_branch_count = parsed_branch_count
-                    break
-        else:
-            for junction in junctions:
-                _visible, parsed_type, parsed_branch_count = cls._parse_junction_hint(junction)
-                if parsed_type != "none":
-                    junction_type = parsed_type
-                    target_branch_count = parsed_branch_count
+                    topology_type = _canonical_topology(parsed_type) or "t_junction"
                     break
 
-        if not junction_visible:
+        junction_type = str(map_matching.get("junction_type") or "").strip()
+        if not junction_type:
+            junction_type = topology_type if topology_type in junction_topologies else "none"
+        if not junction_visible and topology_type not in junction_topologies:
             junction_type = "none"
-            target_branch_count = 1
 
-        geometry_text = " ".join(
-            str(segment.get("geometry_type") or segment.get("curvature_hint") or "")
-            for segment in road_segments
-            if isinstance(segment, dict)
-        ).lower()
-        curve_tokens = ("curve", "curved", "bend", "bending", "弯", "弯道", "转弯")
-        straight_tokens = ("straight", "line", "linear")
-        straight_road = cls._explicit_bool(
-            decisive,
-            ("simple_straight_street", "straight_road"),
-            default=(
-                any(t in geometry_text for t in straight_tokens)
-                and not any(t in geometry_text for t in curve_tokens)
-            ),
+        target_branch_count = cls._optional_int(map_matching, "target_branch_count")
+        if target_branch_count is None:
+            if topology_type == "cross_intersection":
+                target_branch_count = 4
+            elif topology_type == "t_junction":
+                target_branch_count = 3
+            elif topology_type == "multi_branch":
+                target_branch_count = 5
+            else:
+                target_branch_count = 1
+        target_branch_count = max(1, int(target_branch_count or 1))
+
+        junction_branches = _branches_from_value(
+            map_matching.get("junction_branches"),
+            bool(junction_visible),
         )
-        curved_road = any(t in geometry_text or t in scene_text for t in curve_tokens)
+        if not junction_branches.get("known") and not has_map_matching and junction_visible:
+            junction_branches = cls._target_junction_branches(
+                road_network.get("special_road_areas") or [],
+                road_network.get("junctions") or [],
+                {},
+                bool(junction_visible),
+                junction_type,
+            )
+        if junction_branches.get("known") and "target_branch_count" not in map_matching:
+            visible_directions = int(junction_branches["ahead"]) + int(
+                junction_branches["left"]
+            ) + int(junction_branches["right"])
+            if visible_directions > 0:
+                target_branch_count = max(target_branch_count, visible_directions + 1)
+
         directionality_text = str(road_network.get("directionality") or "").lower()
-        two_way = (
-            "two_way" in directionality_text
-            or "two-way" in directionality_text
-            or opposing_lanes > 0
-        )
-
-        topology_type = cls._topology_type_from_hints(
-            junction_visible=junction_visible,
-            junction_type=junction_type,
-            target_branch_count=target_branch_count,
-            straight_road=straight_road,
-            curved_road=curved_road,
-            two_way=two_way,
-        )
-
-        has_crosswalk = cls._has_area_or_control(
-            special_areas,
-            control_elements,
-            ("crosswalk", "zebra", "pedestrian_crossing", "斑马"),
-        ) or bool(
-            decisive.get("near_crosswalk")
-            or lane_markings.get("zebra_crossing_present")
-            or lane_markings.get("crosswalk_present")
-            or lane_markings.get("pedestrian_crossing_present")
-            or cls._visible_lane_marking(lane_markings, ("zebra", "crosswalk", "pedestrian"))
-            or cls._text_has_positive_tokens(
-                scene_text,
-                ("crosswalk", "zebra crossing", "zebra_crossing", "斑马"),
-                ("no crosswalk", "without crosswalk", "no zebra", "无斑马"),
+        directionality = str(map_matching.get("directionality") or "").strip()
+        if not directionality:
+            directionality = (
+                "two_way"
+                if opposing_lanes > 0
+                or "two_way" in directionality_text
+                or "two-way" in directionality_text
+                else "one_way_or_unknown"
             )
-        )
-        has_traffic_light = cls._has_area_or_control(
-            special_areas,
-            control_elements,
-            ("traffic_light", "traffic_signal", "signal", "red_light", "红绿灯"),
-        )
-        has_traffic_sign = cls._has_area_or_control(
-            special_areas,
-            control_elements,
-            ("traffic_sign", "sign", "direction_sign", "road_sign", "标志"),
-        )
-        median_explicitly_absent = cls._has_negative_area_or_control(
-            special_areas,
-            control_elements,
-            (
-                "center_median",
-                "central_median",
-                "planted_center_median",
-                "planted_median",
-                "center median",
-                "central median",
-                "planted median",
-                "median island",
-                "center island",
-                "central island",
-                "中央隔离",
-                "中央绿化",
-                "中央岛",
-                "分隔带",
-            ),
-        ) or any(
-            token in directionality_text
-            for token in (
-                "not_median",
-                "not median",
-                "no_median",
-                "no median",
-                "without_median",
-                "without median",
-                "lane_markings_not_median",
-                "markings_not_median",
-                "painted_only",
+
+        has_crosswalk = cls._optional_bool(map_matching, "has_crosswalk")
+        if has_crosswalk is None:
+            has_crosswalk = False if has_map_matching else cls._has_area_or_control(
+                road_network.get("special_road_areas") or [],
+                road_network.get("control_elements") or [],
+                ("crosswalk", "zebra", "pedestrian_crossing", "斑马"),
+            ) or cls._visible_lane_marking(
+                road_network.get("lane_markings") or {},
+                ("zebra", "crosswalk", "pedestrian"),
             )
-        )
-        has_center_median = cls._explicit_bool(
-            decisive,
-            ("raised_center_median_visible", "center_island_visible", "has_center_median"),
-            default=None,
-        )
-        if median_explicitly_absent:
-            has_center_median = False
-        elif has_center_median is None:
-            has_center_median = cls._has_positive_area_or_control(
-                special_areas,
-                control_elements,
+
+        has_traffic_light = cls._optional_bool(map_matching, "has_traffic_light")
+        if has_traffic_light is None:
+            has_traffic_light = False if has_map_matching else cls._has_area_or_control(
+                road_network.get("special_road_areas") or [],
+                road_network.get("control_elements") or [],
+                ("traffic_light", "traffic_signal", "signal", "red_light", "红绿灯"),
+            )
+
+        has_traffic_sign = cls._optional_bool(map_matching, "has_traffic_sign")
+        if has_traffic_sign is None:
+            has_traffic_sign = False if has_map_matching else cls._has_area_or_control(
+                road_network.get("special_road_areas") or [],
+                road_network.get("control_elements") or [],
+                ("traffic_sign", "sign", "direction_sign", "road_sign", "标志"),
+            )
+
+        has_center_median = cls._optional_bool(map_matching, "has_center_median")
+        if has_center_median is None:
+            has_center_median = False if has_map_matching else cls._has_positive_area_or_control(
+                road_network.get("special_road_areas") or [],
+                road_network.get("control_elements") or [],
                 (
                     "center_median",
                     "central_median",
@@ -675,86 +723,24 @@ class SceneMapMatcher:
                     "分隔带",
                 ),
             )
-        if not has_center_median and not median_explicitly_absent:
-            has_center_median = cls._text_has_positive_tokens(
-                scene_text,
-                (
-                    "center_median",
-                    "central_median",
-                    "planted_center_median",
-                    "planted_median",
-                    "center median",
-                    "central median",
-                    "planted median",
-                    "central planted median",
-                    "divided by planted median",
-                    "median island",
-                    "center island",
-                    "central island",
-                    "中央隔离",
-                    "中央绿化",
-                    "中央岛",
-                    "分隔带",
-                ),
-                (
-                    "no center median",
-                    "no central median",
-                    "no median",
-                    "without center median",
-                    "without central median",
-                    "absence of center median",
-                    "not_median_visible",
-                    "not median visible",
-                    "lane_markings_not_median",
-                    "markings not median",
-                    "painted-only divider",
-                    "painted only divider",
-                    "undivided",
-                    "无中央隔离",
-                    "没有中央隔离",
-                ),
-            )
 
-        if (
-            junction_visible
-            and junction_type == "intersection"
-            and has_crosswalk
-            and has_traffic_light
-            and (
-                cls._visible_lane_marking(
-                    lane_markings,
-                    ("stop_line", "stop line", "arrow", "directional"),
-                )
-                or "major urban intersection" in scene_text
-                or "signalized intersection" in scene_text
-            )
-        ):
-            junction_type = "cross_intersection"
-            target_branch_count = 4
-            topology_type = "cross_intersection"
+        curve_direction = str(map_matching.get("curve_direction") or "").lower()
+        if curve_direction not in {"straight", "left", "right", "unknown"}:
+            curve_direction = "straight" if topology_type in {"straight_road", "straight_two_way"} else "unknown"
+
+        left_parking_presence = cls._optional_bool(map_matching, "left_parking_presence")
+        if left_parking_presence is None:
+            left_parking_presence = lane_left_parking
+        right_parking_presence = cls._optional_bool(map_matching, "right_parking_presence")
+        if right_parking_presence is None:
+            right_parking_presence = lane_right_parking
 
         side_context = cls._side_context(scene_understanding)
-        environment_context = cls._target_environment_context(scene_understanding, side_context)
-        junction_branches = cls._target_junction_branches(
-            special_areas,
-            junctions,
-            decisive,
-            bool(junction_visible),
-            junction_type,
+        environment_context = (
+            map_matching.get("environment_context")
+            if isinstance(map_matching.get("environment_context"), dict)
+            else cls._target_environment_context(scene_understanding, side_context)
         )
-
-        # Reconcile the junction class with the confirmed branch evidence. A
-        # junction with an ahead branch plus exactly one confirmed side branch is
-        # a three-way (T) junction, even if an upstream signalized→cross promotion
-        # over-classified it as a 4-way cross. Only ever downgrades cross→T when
-        # the side evidence is unambiguous; never upgrades.
-        if junction_branches.get("known") and junction_branches.get("ahead"):
-            has_left = bool(junction_branches.get("left"))
-            has_right = bool(junction_branches.get("right"))
-            if has_left != has_right:
-                junction_type = "t_junction"
-                topology_type = "t_junction"
-                target_branch_count = 3
 
         signature = {
             "topology_type": topology_type,
@@ -762,33 +748,34 @@ class SceneMapMatcher:
             "junction_visible": bool(junction_visible),
             "target_branch_count": int(target_branch_count),
             "junction_branches": junction_branches,
-            "directionality": "two_way" if two_way else "one_way_or_unknown",
-            "driving_lane_count": max(1, forward_lanes + opposing_lanes),
+            "directionality": directionality,
+            "driving_lane_count": driving_lanes,
             "forward_lane_count": forward_lanes,
             "opposing_lane_count": opposing_lanes,
-            "left_parking_presence": bool(
-                left_parking or decisive.get("continuous_curbside_parking_left")
-            ),
-            "right_parking_presence": bool(
-                right_parking or decisive.get("continuous_curbside_parking_right")
-            ),
+            "left_parking_presence": bool(left_parking_presence),
+            "right_parking_presence": bool(right_parking_presence),
             "has_crosswalk": bool(has_crosswalk),
             "has_traffic_light": bool(has_traffic_light),
             "has_traffic_sign": bool(has_traffic_sign),
             "has_center_median": bool(has_center_median),
+            "curve_direction": curve_direction,
             "side_context": side_context,
             "environment_context": environment_context,
+            "topology_signature_source": "structured_map_matching_v1"
+            if has_map_matching
+            else "structured_legacy_fallback_v1",
         }
-        if map_matching:
-            signature = cls._apply_map_matching_overrides(signature, map_matching)
-        if "ego_lane_from_right" not in signature:
-            value = cls._optional_int(ego_localization, "ego_lane_from_right")
-            if value is not None:
-                signature["ego_lane_from_right"] = max(0, value)
-        if "ego_to_junction_distance_m" not in signature:
-            value = cls._optional_float(ego_localization, "ego_to_junction_distance_m")
-            if value is not None and value >= 0:
-                signature["ego_to_junction_distance_m"] = value
+        ego_lane = cls._optional_int(map_matching, "ego_lane_from_right")
+        if ego_lane is None:
+            ego_lane = cls._optional_int(ego_localization, "ego_lane_from_right")
+        if ego_lane is not None:
+            signature["ego_lane_from_right"] = max(0, ego_lane)
+
+        ego_distance = cls._optional_float(map_matching, "ego_to_junction_distance_m")
+        if ego_distance is None:
+            ego_distance = cls._optional_float(ego_localization, "ego_to_junction_distance_m")
+        if ego_distance is not None and ego_distance >= 0:
+            signature["ego_to_junction_distance_m"] = ego_distance
         return signature
 
     @staticmethod
@@ -1245,10 +1232,125 @@ class SceneMapMatcher:
         return any(token.lower() in lowered for token in positive_tokens)
 
     @staticmethod
+    def _text_has_curbside_parked_vehicles(text: str, side: str) -> bool:
+        lowered = str(text or "").lower()
+        if not lowered:
+            return False
+        parking_tokens = (
+            "parked car",
+            "parked cars",
+            "parked vehicle",
+            "parked vehicles",
+            "parking row",
+            "curbside parking",
+            "roadside parking",
+            "路边停车",
+            "停在路边",
+            "停车车辆",
+        )
+        if not any(token in lowered for token in parking_tokens):
+            return False
+        global_negative_patterns = (
+            r"(?:no|without)[^.，。,;]*(?:curbside parked vehicles|parked vehicles|parked cars)",
+            r"(?:no|without)[^.，。,;]*(?:marked parking strip|parking strip|parking lane|parking lanes)",
+            r"no extra[^.，。,;]*(?:curbside parking lanes|parking lanes)",
+            r"(?:无|没有|未见)[^。；，.]*(?:路边停车|停车车辆|停车道|停车带)",
+        )
+        if any(re.search(pattern, lowered) for pattern in global_negative_patterns):
+            return False
+        if any(
+            token in lowered
+            for token in (
+                "moving traffic",
+                "stopped traffic",
+                "traffic queue",
+                "queued traffic",
+                "排队车辆",
+                "等待车辆",
+            )
+        ):
+            return False
+        side_tokens = {
+            "left": (
+                "left curb",
+                "left curbside",
+                "left road edge",
+                "left edge",
+                "left side",
+                "left roadside",
+                "左侧路边",
+                "左路边",
+                "左侧",
+            ),
+            "right": (
+                "right curb",
+                "right curbside",
+                "right road edge",
+                "right edge",
+                "right side",
+                "right roadside",
+                "右侧路边",
+                "右路边",
+                "右侧",
+            ),
+        }
+        side_negative_patterns = {
+            "left": (
+                r"left[^.，。,;]*parking[^.，。,;]*(?:not evident|absent|none)",
+                r"(?:no|without)[^.，。,;]*left[^.，。,;]*parking",
+                r"左侧[^。；，.]*(?:无|没有|未见)[^。；，.]*停车",
+            ),
+            "right": (
+                r"right[^.，。,;]*parking[^.，。,;]*(?:not evident|absent|none)",
+                r"(?:no|without)[^.，。,;]*right[^.，。,;]*parking",
+                r"右侧[^。；，.]*(?:无|没有|未见)[^。；，.]*停车",
+            ),
+        }
+        if any(re.search(pattern, lowered) for pattern in side_negative_patterns.get(side, ())):
+            return False
+        return any(token in lowered for token in side_tokens.get(side, ()))
+
+    @staticmethod
+    def _apply_straight_road_parking_symmetry(signature: Dict[str, Any]) -> None:
+        topology = str(signature.get("topology_type") or "").lower()
+        if topology not in {"straight_road", "straight_two_way"}:
+            return
+        if signature.get("junction_visible"):
+            return
+        if signature.get("directionality") != "two_way":
+            return
+        if bool(signature.get("has_center_median")):
+            return
+        left = bool(signature.get("left_parking_presence"))
+        right = bool(signature.get("right_parking_presence"))
+        if left == right:
+            return
+        sources = signature.get("_parking_presence_sources") or {}
+        source_side = "left" if left else "right"
+        source = sources.get(source_side) or {}
+        can_infer_from_source = any(
+            bool(source.get(key)) for key in ("lane_group", "decisive")
+        )
+        if not can_infer_from_source:
+            return
+        if left or right:
+            signature["left_parking_presence"] = True
+            signature["right_parking_presence"] = True
+            side_context = signature.setdefault("side_context", {})
+            side_context["left_parking_strip"] = True
+            side_context["right_parking_strip"] = True
+            signature["parking_symmetry_inferred"] = True
+
+    @staticmethod
     def _side_context(scene_understanding: Dict[str, Any]) -> Dict[str, Any]:
         road_network = scene_understanding.get("road_network", {}) or {}
         general_environment = scene_understanding.get("general_environment", {}) or {}
-        text_all = json.dumps(scene_understanding, ensure_ascii=False).lower()
+        descriptive_payload = {
+            "actor_layout": scene_understanding.get("actor_layout") or {},
+            "general_environment": general_environment,
+            "metadata": scene_understanding.get("metadata") or {},
+        }
+        text_all = json.dumps(descriptive_payload, ensure_ascii=False).lower()
         text_left = json.dumps(
             general_environment.get("roadside_context_left") or [],
             ensure_ascii=False,
@@ -1262,17 +1364,25 @@ class SceneMapMatcher:
         if not text_right or text_right == "[]":
             text_right = text_all
         special_areas = road_network.get("special_road_areas") or []
-        left_parking = any(
+        left_special_parking = any(
             isinstance(area, dict)
             and "parking" in str(area.get("type") or "").lower()
             and "left" in json.dumps(area, ensure_ascii=False).lower()
             for area in special_areas
         )
-        right_parking = any(
+        right_special_parking = any(
             isinstance(area, dict)
             and "parking" in str(area.get("type") or "").lower()
             and "right" in json.dumps(area, ensure_ascii=False).lower()
             for area in special_areas
+        )
+        left_text_parking = SceneMapMatcher._text_has_curbside_parked_vehicles(
+            text_left,
+            "left",
+        )
+        right_text_parking = SceneMapMatcher._text_has_curbside_parked_vehicles(
+            text_right,
+            "right",
         )
         return {
             "left_continuous_buildings": any(
@@ -1284,8 +1394,12 @@ class SceneMapMatcher:
                 for token in ("building", "shop", "storefront", "建筑", "商铺")
             ),
             "tree_lined": any(_token_in_text(t, text_all) for t in ("tree", "trees", "树")),
-            "left_parking_strip": left_parking,
-            "right_parking_strip": right_parking,
+            "left_parking_strip": left_special_parking,
+            "right_parking_strip": right_special_parking,
+            "left_parking_from_special_area": left_special_parking,
+            "right_parking_from_special_area": right_special_parking,
+            "left_parking_from_text": left_text_parking,
+            "right_parking_from_text": right_text_parking,
         }
 
     @staticmethod
@@ -2160,6 +2274,7 @@ class SceneMapMatcher:
             if world_name in blacklisted_worlds:
                 continue
             candidates = cache.get("candidates") or []
+            self._normalize_cached_parking_sides(candidates)
 
             map_best: Optional[Dict[str, Any]] = None
             map_best_score = -1.0
@@ -2299,6 +2414,7 @@ class SceneMapMatcher:
         "center_median_evidence",
         "same_direction_lane_count", "has_parallel_same_direction_lanes",
         "same_direction_lane_evidence",
+        "physical_junction_arms", "lane_maneuver_dirs",
         "is_curve", "curve_yaw_delta_deg", "curve_abs_yaw_delta_deg",
         "curve_direction", "curve_score", "curve_sample_distance_m",
         "left_parking_lane_present", "right_parking_lane_present",
@@ -2334,6 +2450,62 @@ class SceneMapMatcher:
         if isinstance(matched_structure, dict) and not matched_structure.get("error"):
             best_match["matched_structure"] = matched_structure
         return best_match
+
+    @classmethod
+    def _normalize_cached_parking_sides(cls, candidates: List[Dict[str, Any]]) -> None:
+        """Backfill road-side parking semantics for cached two-way road candidates.
+
+        Older caches only recorded whether a parking lane was reachable by repeatedly
+        following a waypoint's fixed left/right link. On two-way roads, the far curb's
+        parking lane is usually on the opposing lane's own outer side, so a single
+        candidate can miss it even though another candidate on the same road sees it.
+        """
+        road_signs: Dict[Any, set] = {}
+        for candidate in candidates or []:
+            lane = candidate.get("candidate_lane") or {}
+            road_id = lane.get("road_id")
+            lane_sign = cls._lane_id_sign(lane.get("lane_id"))
+            if road_id is None or lane_sign == 0:
+                continue
+            road_signs.setdefault(road_id, set()).add(lane_sign)
+
+        road_side_parking: Dict[Any, Dict[str, bool]] = {}
+        for candidate in candidates or []:
+            lane = candidate.get("candidate_lane") or {}
+            road_id = lane.get("road_id")
+            lane_sign = cls._lane_id_sign(lane.get("lane_id"))
+            if road_id is None or lane_sign == 0 or road_signs.get(road_id) != {-1, 1}:
+                continue
+            sides = road_side_parking.setdefault(
+                road_id,
+                {"negative": False, "positive": False},
+            )
+            if bool(candidate.get("right_parking_lane_present")):
+                sides["negative" if lane_sign < 0 else "positive"] = True
+            if bool(candidate.get("left_parking_lane_present")):
+                sides["positive" if lane_sign < 0 else "negative"] = True
+
+        for candidate in candidates or []:
+            lane = candidate.get("candidate_lane") or {}
+            road_id = lane.get("road_id")
+            lane_sign = cls._lane_id_sign(lane.get("lane_id"))
+            sides = road_side_parking.get(road_id)
+            if lane_sign == 0 or not sides:
+                continue
+            if lane_sign < 0:
+                candidate["right_parking_lane_present"] = bool(
+                    candidate.get("right_parking_lane_present") or sides["negative"]
+                )
+                candidate["left_parking_lane_present"] = bool(
+                    candidate.get("left_parking_lane_present") or sides["positive"]
+                )
+            else:
+                candidate["right_parking_lane_present"] = bool(
+                    candidate.get("right_parking_lane_present") or sides["positive"]
+                )
+                candidate["left_parking_lane_present"] = bool(
+                    candidate.get("left_parking_lane_present") or sides["negative"]
+                )
 
     def _match_to_carla(
         self,
@@ -3031,6 +3203,93 @@ class SceneMapMatcher:
         except Exception:
             return None
 
+    @classmethod
+    def _physical_junction_arms_for_waypoint(
+        cls,
+        center_waypoint: Any,
+        max_distance: float = JUNCTION_TARGET_REACH_M,
+    ) -> Optional[Dict[str, Any]]:
+        """Return physical junction arms relative to the candidate's approach.
+
+        Unlike ``_classify_junction_branches``, this uses the whole
+        ``carla.Junction`` leg graph. It describes road topology, not which
+        maneuvers the current lane can take.
+        """
+        try:
+            from tools.map_structure import build_matched_structure_from_waypoint
+
+            ego_yaw = cls._waypoint_yaw(center_waypoint)
+            structure = build_matched_structure_from_waypoint(
+                center_waypoint,
+                ego_inbound_yaw=ego_yaw,
+                junction_lookahead_m=float(max_distance),
+            )
+        except Exception:
+            try:
+                ego_yaw = cls._waypoint_yaw(center_waypoint)
+                junction_wp = center_waypoint
+                if not bool(getattr(junction_wp, "is_junction", False)):
+                    current = center_waypoint
+                    traversed = 0.0
+                    junction_wp = None
+                    while traversed < max_distance:
+                        next_waypoints = current.next(JUNCTION_AHEAD_STEP_M)
+                        if not next_waypoints:
+                            break
+                        junction_wp = next(
+                            (wp for wp in next_waypoints if getattr(wp, "is_junction", False)),
+                            None,
+                        )
+                        if junction_wp is not None:
+                            break
+                        current = next_waypoints[0]
+                        traversed += JUNCTION_AHEAD_STEP_M
+                if junction_wp is None or not bool(getattr(junction_wp, "is_junction", False)):
+                    return None
+                junction = junction_wp.get_junction()
+                pairs = list(junction.get_waypoints(None) or [])
+                dirs = {"ahead": False, "left": False, "right": False}
+                for _entry_wp, exit_wp in pairs:
+                    direction = cls._turn_direction(
+                        ego_yaw,
+                        float(exit_wp.transform.rotation.yaw),
+                    )
+                    if direction in dirs:
+                        dirs[direction] = True
+                arm_count = max(
+                    1 + sum(1 for key in ("ahead", "left", "right") if dirs[key]),
+                    len(pairs),
+                )
+                return {
+                    **dirs,
+                    "ego": True,
+                    "known": bool(pairs),
+                    "arm_count": arm_count,
+                    "leg_count": arm_count,
+                    "junction_id": getattr(junction, "id", None),
+                    "source": "junction_waypoints_fallback",
+                }
+            except Exception:
+                return None
+        if not isinstance(structure, dict) or structure.get("kind") != "junction":
+            return None
+
+        legs = structure.get("legs") or []
+        names = {str(leg.get("name") or "").lower() for leg in legs if isinstance(leg, dict)}
+        leg_count = int(structure.get("leg_count") or len(legs) or 0)
+        arms = {
+            "ahead": "opposite" in names or "ahead" in names,
+            "left": "left" in names,
+            "right": "right" in names,
+            "ego": "ego" in names,
+            "known": bool(legs),
+            "arm_count": leg_count,
+            "leg_count": leg_count,
+            "junction_id": structure.get("junction_id"),
+            "source": "junction_legs",
+        }
+        return arms
+
     def _extract_candidate_features(
         self,
         sampled_waypoints: List[Any],
@@ -3079,6 +3338,9 @@ class SceneMapMatcher:
         distance_to_junction_ahead = self._detect_junction_ahead(center_waypoint)
         distance_to_traffic_light_ahead = self._detect_traffic_light_ahead(center_waypoint)
         junction_branch_dirs = self._classify_junction_branches(center_waypoint)
+        physical_junction_arms = self._physical_junction_arms_for_waypoint(
+            center_waypoint
+        )
         return {
             "yaw": center_waypoint.transform.rotation.yaw,
             "is_junction": center_waypoint.is_junction,
@@ -3099,6 +3361,8 @@ class SceneMapMatcher:
             "has_highway_shoulder": has_highway_shoulder,
             "distance_to_junction_ahead": distance_to_junction_ahead,
             "distance_to_traffic_light_ahead": distance_to_traffic_light_ahead,
+            "physical_junction_arms": physical_junction_arms,
+            "lane_maneuver_dirs": junction_branch_dirs,
             "junction_branch_dirs": junction_branch_dirs,
             **same_direction_lane_features,
             **curve_features,
@@ -3150,6 +3414,9 @@ class SceneMapMatcher:
         distance_to_junction_ahead = self._detect_junction_ahead(center_waypoint)
         distance_to_traffic_light_ahead = self._detect_traffic_light_ahead(center_waypoint)
         junction_branch_dirs = self._classify_junction_branches(center_waypoint)
+        physical_junction_arms = self._physical_junction_arms_for_waypoint(
+            center_waypoint
+        )
         return {
             "yaw": center_waypoint.transform.rotation.yaw,
             "is_junction": center_waypoint.is_junction,
@@ -3170,24 +3437,88 @@ class SceneMapMatcher:
             "has_highway_shoulder": has_highway_shoulder,
             "distance_to_junction_ahead": distance_to_junction_ahead,
             "distance_to_traffic_light_ahead": distance_to_traffic_light_ahead,
+            "physical_junction_arms": physical_junction_arms,
+            "lane_maneuver_dirs": junction_branch_dirs,
             "junction_branch_dirs": junction_branch_dirs,
             **same_direction_lane_features,
             **curve_features,
         }
 
+    @classmethod
+    def _detect_parking_sides(
+        cls, center_waypoint: Any, max_lateral_steps: int = 4
+    ) -> Tuple[bool, bool]:
+        anchor_road_id = getattr(center_waypoint, "road_id", None)
+        anchor_yaw = cls._waypoint_yaw(center_waypoint)
+
+        def _same_road(lane: Any) -> bool:
+            lane_road_id = getattr(lane, "road_id", anchor_road_id)
+            return not (
+                anchor_road_id is not None
+                and lane_road_id is not None
+                and lane_road_id != anchor_road_id
+            )
+
+        def _scan_from(lane: Any, side: str, steps: int) -> bool:
+            for _step in range(steps):
+                if lane is None:
+                    break
+                if not _same_road(lane):
+                    break
+                if "parking" in cls._lane_type_text(lane).lower():
+                    return True
+                lane = cls._get_lateral_lane(lane, side)
+            return False
+
+        def _scan(side: str) -> bool:
+            lane = cls._get_lateral_lane(center_waypoint, side)
+            opposite_side = "right" if side == "left" else "left"
+            for step in range(max_lateral_steps):
+                if lane is None:
+                    break
+                if not _same_road(lane):
+                    break
+                if "parking" in cls._lane_type_text(lane).lower():
+                    return True
+                if cls._is_opposing_driving_waypoint(lane, anchor_yaw, center_waypoint):
+                    return _scan_from(
+                        cls._get_lateral_lane(lane, opposite_side),
+                        opposite_side,
+                        max_lateral_steps - step - 1,
+                    )
+                lane = cls._get_lateral_lane(lane, side)
+            return False
+
+        return _scan("left"), _scan("right")
+
+    @classmethod
+    def _is_opposing_driving_waypoint(
+        cls,
+        lane: Any,
+        anchor_yaw: Optional[float],
+        anchor_waypoint: Any,
+    ) -> bool:
+        if not cls._is_driving_waypoint(lane):
+            return False
+        lane_yaw = cls._waypoint_yaw(lane)
+        if lane_yaw is not None and anchor_yaw is not None:
+            return (
+                _angle_difference_deg(lane_yaw, anchor_yaw)
+                >= 180.0 - SAME_DIRECTION_LANE_YAW_TOLERANCE_DEG
+            )
+        try:
+            lane_id = int(getattr(lane, "lane_id"))
+            anchor_lane_id = int(getattr(anchor_waypoint, "lane_id"))
+            return lane_id * anchor_lane_id < 0
+        except (TypeError, ValueError):
+            return False
+
     @staticmethod
-    def _detect_parking_sides(center_waypoint: Any) -> Tuple[bool, bool]:
+    def _waypoint_yaw(waypoint: Any) -> Optional[float]:
         try:
-            left_lane = center_waypoint.get_left_lane()
-            left_parking = left_lane is not None and "Parking" in str(left_lane.lane_type)
+            return float(waypoint.transform.rotation.yaw)
         except Exception:
-            left_parking = False
-        try:
-            right_lane = center_waypoint.get_right_lane()
-            right_parking = right_lane is not None and "Parking" in str(right_lane.lane_type)
-        except Exception:
-            right_parking = False
-        return left_parking, right_parking
+            return None
 
     @staticmethod
     def _detect_highway_shoulder(center_waypoint: Any) -> bool:
@@ -3299,15 +3630,24 @@ class SceneMapMatcher:
 
     @staticmethod
     def _center_side_for_lane_id(lane_id: Any) -> Optional[str]:
+        lane_sign = SceneMapMatcher._lane_id_sign(lane_id)
+        if lane_sign < 0:
+            return "left"
+        if lane_sign > 0:
+            return "right"
+        return None
+
+    @staticmethod
+    def _lane_id_sign(lane_id: Any) -> int:
         try:
             numeric_lane_id = int(lane_id)
         except (TypeError, ValueError):
-            return None
+            return 0
         if numeric_lane_id < 0:
-            return "left"
+            return -1
         if numeric_lane_id > 0:
-            return "right"
-        return None
+            return 1
+        return 0
 
     @staticmethod
     def _get_lateral_lane(waypoint: Any, side: str) -> Any:
@@ -4093,12 +4433,12 @@ class SceneMapMatcher:
     def _score_branch_directions(
         candidate: Dict[str, Any], signature: Dict[str, Any]
     ) -> Tuple[float, Dict[str, Any]]:
-        """Score how well the candidate junction's reachable maneuvers match the
-        target's branch orientation. Returns ``(score in [0,1], detail)``.
+        """Score how well physical candidate junction arms match the target.
 
         Neutral (1.0) when the target branch sides are unknown. When the target
-        is known but an older cache lacks ``junction_branch_dirs``, return a
-        non-rejecting penalty so missing data cannot beat known-good geometry.
+        is known but an older cache lacks ``physical_junction_arms``, return a
+        non-rejecting penalty. The older ``junction_branch_dirs`` field is
+        lane-level maneuver reachability and is intentionally not used here.
         """
         target = signature.get("junction_branches") or {}
         if not target.get("known"):
@@ -4108,13 +4448,16 @@ class SceneMapMatcher:
                 "errors": [],
                 "factor": 1.0,
             }
-        candidate_dirs = candidate.get("junction_branch_dirs")
+        candidate_dirs = candidate.get("physical_junction_arms")
+        if isinstance(candidate_dirs, dict) and candidate_dirs.get("known") is False:
+            candidate_dirs = None
         if not isinstance(candidate_dirs, dict):
             return BRANCH_MATCH_CANDIDATE_MISSING_FACTOR, {
                 "status": "candidate_missing",
                 "severity": "candidate_missing",
-                "errors": ["candidate_branch_direction_missing"],
+                "errors": ["physical_junction_arms_missing"],
                 "factor": BRANCH_MATCH_CANDIDATE_MISSING_FACTOR,
+                "legacy_lane_maneuver_dirs": candidate.get("junction_branch_dirs"),
             }
 
         missing_required = []

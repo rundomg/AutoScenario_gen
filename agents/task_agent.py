@@ -1,5 +1,7 @@
 import os
+import threading
 import time
+from email.utils import parsedate_to_datetime
 
 import requests
 from dotenv import load_dotenv
@@ -14,8 +16,14 @@ OPENAI_MODEL = os.getenv("OPENAI_MODEL")
 OPENAI_MAX_TOKENS = int(os.getenv("OPENAI_MAX_TOKENS", 2000))
 OPENAI_TIMEOUT = int(os.getenv("OPENAI_TIMEOUT", 30))
 OPENAI_CONNECT_TIMEOUT = int(os.getenv("OPENAI_CONNECT_TIMEOUT", 10))
+OPENAI_MIN_READ_TIMEOUT = float(os.getenv("OPENAI_MIN_READ_TIMEOUT", 0))
 OPENAI_REQUEST_RETRIES = int(os.getenv("OPENAI_REQUEST_RETRIES", 2))
+OPENAI_REQUEST_MIN_INTERVAL = float(os.getenv("OPENAI_REQUEST_MIN_INTERVAL", 0))
+OPENAI_RETRY_MAX_WAIT = float(os.getenv("OPENAI_RETRY_MAX_WAIT", 30))
 OPENAI_SYSTEM_PROMPT = os.getenv("OPENAI_SYSTEM_PROMPT")
+
+_REQUEST_LOCK = threading.Lock()
+_LAST_REQUEST_MONOTONIC = 0.0
 
 
 class APIResponseError(Exception):
@@ -62,6 +70,7 @@ class TaskAgent:
             last_error = None
             for attempt in range(1, max_attempts + 1):
                 try:
+                    self._wait_for_rate_limit()
                     response = requests.post(
                         OPENAI_URL,
                         headers=self.post_header,
@@ -112,7 +121,17 @@ class TaskAgent:
                     )
                     time.sleep(wait_seconds)
                 except requests.exceptions.HTTPError as e:
-                    raise Exception(self._format_http_error(e)) from e
+                    if not self._is_retryable_http_error(e):
+                        raise Exception(self._format_http_error(e)) from e
+                    last_error = Exception(self._format_http_error(e))
+                    if attempt >= max_attempts:
+                        break
+                    wait_seconds = self._retry_wait_seconds(attempt, e)
+                    print(
+                        f"{request_label} request attempt {attempt}/{max_attempts} "
+                        f"failed: {last_error}. Retrying in {wait_seconds:g}s..."
+                    )
+                    time.sleep(wait_seconds)
 
             raise Exception(
                 f"{request_label} request failed after {max_attempts} attempts: "
@@ -135,9 +154,9 @@ class TaskAgent:
         if add_info and "request_timeout" in add_info:
             timeout = add_info["request_timeout"]
             if isinstance(timeout, (list, tuple)) and len(timeout) == 2:
-                return float(timeout[0]), float(timeout[1])
-            return OPENAI_CONNECT_TIMEOUT, float(timeout)
-        return OPENAI_CONNECT_TIMEOUT, float(OPENAI_TIMEOUT)
+                return float(timeout[0]), max(float(timeout[1]), OPENAI_MIN_READ_TIMEOUT)
+            return OPENAI_CONNECT_TIMEOUT, max(float(timeout), OPENAI_MIN_READ_TIMEOUT)
+        return OPENAI_CONNECT_TIMEOUT, max(float(OPENAI_TIMEOUT), OPENAI_MIN_READ_TIMEOUT)
 
     @staticmethod
     def _resolve_request_attempts(add_info):
@@ -159,6 +178,54 @@ class TaskAgent:
         if add_info and "request_max_tokens" in add_info:
             return int(add_info["request_max_tokens"])
         return OPENAI_MAX_TOKENS
+
+    @staticmethod
+    def _wait_for_rate_limit():
+        if OPENAI_REQUEST_MIN_INTERVAL <= 0:
+            return
+        global _LAST_REQUEST_MONOTONIC
+        with _REQUEST_LOCK:
+            now = time.monotonic()
+            wait_seconds = OPENAI_REQUEST_MIN_INTERVAL - (now - _LAST_REQUEST_MONOTONIC)
+            if wait_seconds > 0:
+                time.sleep(wait_seconds)
+                now = time.monotonic()
+            _LAST_REQUEST_MONOTONIC = now
+
+    @staticmethod
+    def _is_retryable_http_error(error):
+        response = getattr(error, "response", None)
+        status_code = getattr(response, "status_code", None)
+        return status_code == 429 or status_code in {500, 502, 503, 504}
+
+    @staticmethod
+    def _retry_wait_seconds(attempt, error=None):
+        response = getattr(error, "response", None)
+        headers = getattr(response, "headers", {}) or {}
+        retry_after = ""
+        if hasattr(headers, "get"):
+            retry_after = headers.get("Retry-After") or headers.get("retry-after") or ""
+        parsed_retry_after = TaskAgent._parse_retry_after_seconds(retry_after)
+        if parsed_retry_after is not None:
+            return min(max(0.0, parsed_retry_after), OPENAI_RETRY_MAX_WAIT)
+        return min(float(2 ** (attempt - 1)), OPENAI_RETRY_MAX_WAIT)
+
+    @staticmethod
+    def _parse_retry_after_seconds(value):
+        if value is None or value == "":
+            return None
+        text = str(value).strip()
+        try:
+            return float(text)
+        except ValueError:
+            pass
+        try:
+            retry_at = parsedate_to_datetime(text)
+        except (TypeError, ValueError, IndexError, OverflowError):
+            return None
+        if retry_at.tzinfo is None:
+            retry_at = retry_at.astimezone()
+        return max(0.0, retry_at.timestamp() - time.time())
 
     @staticmethod
     def _format_http_error(error):

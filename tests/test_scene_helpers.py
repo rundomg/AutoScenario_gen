@@ -2,6 +2,7 @@ import math
 import os
 import sys
 import unittest
+from unittest import mock
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
@@ -81,6 +82,48 @@ class SceneHelperTests(unittest.TestCase):
         )
 
         self.assertIs(result, start)
+
+    def test_parking_lane_spawn_uses_strict_lane_candidates(self):
+        location = _FakeLocation(10.0, 20.0, 0.35)
+        rotation = _FakeRotation(yaw=90.0)
+        blueprint = object()
+        actor = object()
+
+        with mock.patch.object(
+            helpers,
+            "_autoscenario_project_vehicle_to_parking_lane",
+            return_value=(location, rotation),
+        ), mock.patch.object(
+            helpers,
+            "_autoscenario_record_focus_point",
+        ), mock.patch.object(
+            helpers,
+            "_autoscenario_pick_blueprint",
+            return_value=blueprint,
+        ), mock.patch.object(
+            helpers,
+            "_autoscenario_apply_vehicle_color",
+        ), mock.patch.object(
+            helpers,
+            "_autoscenario_apply_role_name",
+        ), mock.patch.object(
+            helpers,
+            "_autoscenario_try_spawn_vehicle_actor",
+        ) as normal_spawn, mock.patch.object(
+            helpers,
+            "_autoscenario_try_spawn_vehicle_actor_strict_lane",
+            return_value=actor,
+        ) as strict_spawn:
+            result = helpers._autoscenario_spawn_vehicle_parking_lane(
+                "vehicle.tesla.model3",
+                location,
+                rotation,
+                {"road_id": 76, "lane_id": -2},
+            )
+
+        self.assertIs(result, actor)
+        normal_spawn.assert_not_called()
+        strict_spawn.assert_called_once_with(blueprint, location, rotation, 3.5)
 
 
 if __name__ == "__main__":

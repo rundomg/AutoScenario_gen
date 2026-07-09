@@ -123,6 +123,38 @@ class TestLayoutCapture(unittest.TestCase):
             self.assertIsNone(capture["ego_view_path"])
             self.assertEqual(capture["layout_image_path"], capture["bev_path"])
 
+    def test_capture_quick_bev_preview_writes_fixed_preview(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            generator = _make_generator(tmp)
+            generator.require_carla_connection = True
+            generator.carla_spawn_context = {"status": "available"}
+            seen_env = {}
+
+            def fake_run(*_args, **kwargs):
+                seen_env.update(kwargs["env"])
+                Path(kwargs["env"]["AUTOSCENARIO_BEV_OUTPUT"]).write_bytes(b"bev")
+                return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+
+            with mock.patch("experiments.auto_generate_all_vlm.subprocess.run", fake_run):
+                capture = generator._capture_quick_bev_preview("s0000", "/tmp/final.py")
+
+            self.assertIsNone(capture["error"])
+            self.assertEqual(capture["bev_path"], str(Path(tmp) / "s0000_quick_bev.png"))
+            self.assertTrue(Path(capture["bev_path"]).exists())
+            self.assertEqual(Path(tmp, "image.png").read_bytes(), b"bev")
+            self.assertIn("AUTOSCENARIO_BEV_OUTPUT", seen_env)
+            self.assertNotIn("AUTOSCENARIO_EGO_VIEW_OUTPUT", seen_env)
+
+    def test_capture_quick_bev_preview_skips_without_carla(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            generator = _make_generator(tmp)
+
+            capture = generator._capture_quick_bev_preview("s0000", "/tmp/final.py")
+
+            self.assertTrue(capture["enabled"])
+            self.assertIsNone(capture["bev_path"])
+            self.assertIn("CARLA connection disabled", capture["error"])
+
     def test_start_and_end_have_coordinate_keys(self):
         entry = AutoGenerator._fallback_topology_sample()[0]
         for coord_key in ("x", "y", "z", "yaw"):

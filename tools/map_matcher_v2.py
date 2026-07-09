@@ -289,9 +289,14 @@ def _branch_direction_fit(
 ) -> Tuple[float, List[str]]:
     if not isinstance(target_branches, dict) or not target_branches.get("known"):
         return 0.75, []
-    candidate_dirs = candidate.get("junction_branch_dirs")
+    candidate_dirs = candidate.get("physical_junction_arms")
+    if isinstance(candidate_dirs, dict) and candidate_dirs.get("known") is False:
+        candidate_dirs = None
     if not isinstance(candidate_dirs, dict):
-        return 0.45, ["candidate_branch_direction_missing"]
+        # Older caches only have ``junction_branch_dirs``, which describes the
+        # current lane's reachable maneuvers. Do not compare that lane-level
+        # field to the target's physical junction arms.
+        return 0.72, []
     errors = []
     for side in ("ahead", "left", "right"):
         target_has = bool(target_branches.get(side))
@@ -419,6 +424,53 @@ def _open_road_lane_hard_mismatches(
     return reasons
 
 
+def _curve_open_road_lane_hard_mismatches(
+    target: Dict[str, Any], candidate: Dict[str, Any]
+) -> List[str]:
+    """Reject clearly over-wide curve candidates for narrow open-road targets.
+
+    Curved roads are harder to count from a single image, so keep this narrower
+    than the straight-road exact gate.  The important case is preventing a 1+1
+    undivided curve from matching a 2+2 boulevard just because the curve and
+    side context score well.
+    """
+    reasons: List[str] = []
+    target_forward = target.get("forward_lane_count")
+    target_opposing = target.get("opposing_lane_count")
+    target_total = target.get("driving_lane_count")
+    candidate_forward = _as_int(candidate.get("same_direction_lane_count"))
+    candidate_total = _as_int(candidate.get("same_road_lane_count"))
+
+    narrow_two_way_target = (
+        isinstance(target_forward, int)
+        and isinstance(target_opposing, int)
+        and target_forward <= 1
+        and target_opposing >= 1
+    )
+    if (
+        narrow_two_way_target
+        and candidate_forward is not None
+        and candidate_forward > target_forward
+    ):
+        reasons.append(
+            "curve open-road target rejects same-direction lane mismatch "
+            f"(target_forward_lane_count={target_forward}, "
+            f"candidate_same_direction_lane_count={candidate_forward})"
+        )
+    if (
+        isinstance(target_total, int)
+        and target_total <= 2
+        and candidate_total is not None
+        and candidate_total > target_total + 1
+    ):
+        reasons.append(
+            "curve open-road target rejects overly wide driving-lane mismatch "
+            f"(target_driving_lane_count={target_total}, "
+            f"candidate_driving_lane_count={candidate_total})"
+        )
+    return reasons
+
+
 def _open_road_median_hard_mismatches(
     target: Dict[str, Any], candidate: Dict[str, Any]
 ) -> List[str]:
@@ -456,6 +508,9 @@ def gate_candidate(target: Dict[str, Any], candidate: Dict[str, Any]) -> Tuple[b
             reasons.append("open-road target rejects high junction waypoint ratio")
         if target.get("road_shape") == "straight":
             reasons.extend(_open_road_lane_hard_mismatches(target, candidate))
+            reasons.extend(_open_road_median_hard_mismatches(target, candidate))
+        elif str(target.get("road_shape") or "").startswith("curve_"):
+            reasons.extend(_curve_open_road_lane_hard_mismatches(target, candidate))
             reasons.extend(_open_road_median_hard_mismatches(target, candidate))
         if (
             target.get("parking_presence_known")
@@ -607,6 +662,7 @@ def summarize_entry(entry: Dict[str, Any]) -> Dict[str, Any]:
         "junction_waypoint_ratio": entry.get("junction_waypoint_ratio"),
         "same_road_lane_count": entry.get("same_road_lane_count"),
         "same_direction_lane_count": entry.get("same_direction_lane_count"),
+        "physical_junction_arms": entry.get("physical_junction_arms"),
         "left_parking_lane_present": entry.get("left_parking_lane_present"),
         "right_parking_lane_present": entry.get("right_parking_lane_present"),
     }

@@ -22,9 +22,8 @@ class VehicleOrientationInterpreter(TaskAgent):
         self.pre_prompt = """
 You inspect detected vehicles in one traffic image.
 Your task is actor-level vehicle orientation using two kinds of visual input.
-Do not do CARLA map matching or final actor layout. You MAY use the annotated full image
-to infer coarse image-region context such as whether a vehicle is on the right-side arm,
-left-side arm, ahead arm, ego approach, or unknown.
+Do not do CARLA map matching or final actor layout. The road-scene agent has
+already classified the road topology; follow that classification exactly.
 
 Inputs:
 1. The first image is the annotated full image. It shows the whole scene and detector ids.
@@ -33,47 +32,18 @@ Inputs:
 2. The following images are vehicle crops in the same order as the detected-vehicle list.
    Use crops to inspect local vehicle details: front, rear, side profile, grille/headlights,
    tail lights, truck cab/bed, wheel direction, and body orientation.
-3. Combine both: crop tells where the vehicle front/rear points; full image tells whether
-   that direction is toward or away from the visible junction/road arm.
+3. Combine both: crop tells where the vehicle front/rear points; full image keeps
+   the detector id and lane/arm context grounded.
 
-Output JSON only:
-{
-  "vehicle_orientation_brief": {
-    "overall_observation": "short summary of visible vehicle orientation patterns",
-    "uncertainties": ["short uncertainty notes"]
-  },
-  "vehicle_orientation_hints": [
-    {
-      "det_id": "det_1",
-      "visible_end": "front | rear | side | unclear",
-      "front_points_image_direction": "left | right | toward_camera | away_from_camera | unclear",
-      "vehicle_region_hint": "right_arm | left_arm | ahead_arm | ego_approach | unknown",
-      "junction_center_relative_to_vehicle": "left | right | ahead | behind | unknown",
-      "heading_relation_to_ego": "same_direction | opposite_direction | crossing | unknown",
-      "junction_travel_direction": "toward_junction | away_from_junction | unknown",
-      "confidence": "high | medium | low",
-      "evidence": "short visual evidence"
-    }
-  ]
-}
-
-Rules:
-- Use the crop to judge front/rear/side details. Use the annotated full image to keep
-  det id, vehicle region, and junction-center direction grounded.
-- Do not set junction_travel_direction=unknown merely because you are not doing map matching.
-  If the full image gives a clear coarse arm/region, use that image geometry.
-- For side-profile vehicles on the right-side arm/right side road:
-  front_points_image_direction=right usually means away_from_junction, and left usually
-  means toward_junction, unless the full image clearly shows the junction center on the
-  opposite side.
-- For side-profile vehicles on the left-side arm/left side road:
-  front_points_image_direction=left usually means away_from_junction, and right usually
-  means toward_junction, unless contradicted by the full image.
-- For vehicles on the ahead/oncoming arm, front facing the ego/camera usually means
-  toward_junction; rear facing the ego/camera usually means away_from_junction.
-- If the vehicle is on a junction arm, front facing the junction means toward_junction;
-  front pointing away from the junction means away_from_junction.
-- If it appears in an opposing travel lane and faces the ego/camera, use opposite_direction unless there is clear wrong-way evidence.
+General rules:
+- Use the crop to judge front/rear/side details.
+- Use the annotated full image only for detector identity and coarse road-region context.
+- If a detected vehicle is clearly outside the drivable/reconstructable road scene,
+  a duplicate/false positive, or a staged roadside object with no scene role, put
+  its det_id in ignored_detections. This is only a soft candidate for downstream
+  review, not a final deletion decision.
+- If it appears in an opposing travel lane and faces the ego/camera, use
+  opposite_direction unless there is clear wrong-way evidence.
 - Use unknown/low confidence only when both crop detail and full-image region are ambiguous.
         """
 
@@ -90,6 +60,11 @@ Rules:
         detections = add_info.get("detections") or []
         annotated_path = add_info.get("annotated_path") or add_info["image_path"]
         prompt = self.pre_prompt
+        road_scene = add_info.get("road_scene") or {}
+        is_junction = _is_junction_scene(road_scene)
+        prompt += "\n\nRoad scene JSON from the road-scene agent (authoritative):\n"
+        prompt += json.dumps(road_scene, ensure_ascii=False, indent=2)
+        prompt += _orientation_schema_block(is_junction)
         if user_request:
             prompt += f"\nAdditional context:\n{user_request}"
         prompt += "\n\nDetected vehicles to inspect:\n"
@@ -126,7 +101,7 @@ Rules:
     def extract_orientation_payload(response_text: str) -> dict:
         text = str(response_text or "").strip()
         if not text:
-            return {"vehicle_orientation_brief": {}, "vehicle_orientation_hints": []}
+            return _empty_orientation_payload()
         fenced = re.search(r"```(?:json)?\s*(.*?)```", text, flags=re.S | re.I)
         if fenced:
             text = fenced.group(1).strip()
@@ -136,19 +111,24 @@ Rules:
             start = text.find("{")
             end = text.rfind("}")
             if start < 0 or end <= start:
-                return {"vehicle_orientation_brief": {}, "vehicle_orientation_hints": []}
+                return _empty_orientation_payload()
             try:
                 payload = json.loads(text[start : end + 1])
             except json.JSONDecodeError:
-                return {"vehicle_orientation_brief": {}, "vehicle_orientation_hints": []}
+                return _empty_orientation_payload()
         if not isinstance(payload, dict):
-            return {"vehicle_orientation_brief": {}, "vehicle_orientation_hints": []}
+            return _empty_orientation_payload()
         brief = payload.get("vehicle_orientation_brief")
         if not isinstance(brief, dict):
             brief = {}
+        ignored = _normalize_ignored_detections(payload.get("ignored_detections"))
         hints = payload.get("vehicle_orientation_hints") if isinstance(payload, dict) else None
         if not isinstance(hints, list):
-            return {"vehicle_orientation_brief": brief, "vehicle_orientation_hints": []}
+            return {
+                "vehicle_orientation_brief": brief,
+                "ignored_detections": ignored,
+                "vehicle_orientation_hints": [],
+            }
         normalized = []
         for hint in hints:
             if not isinstance(hint, dict):
@@ -180,6 +160,20 @@ Rules:
                         },
                         "unknown",
                     ),
+                    "road_region_hint": _choice(
+                        hint.get("road_region_hint"),
+                        {
+                            "ego_lane",
+                            "left_lane",
+                            "right_lane",
+                            "opposing_lane",
+                            "left_parking_lane",
+                            "right_parking_lane",
+                            "roadside",
+                            "unknown",
+                        },
+                        "unknown",
+                    ),
                     "junction_center_relative_to_vehicle": _choice(
                         hint.get("junction_center_relative_to_vehicle"),
                         {"left", "right", "ahead", "behind", "unknown"},
@@ -203,7 +197,32 @@ Rules:
                     "evidence": str(hint.get("evidence") or ""),
                 }
             )
-        return {"vehicle_orientation_brief": brief, "vehicle_orientation_hints": normalized}
+        return {
+            "vehicle_orientation_brief": brief,
+            "ignored_detections": ignored,
+            "vehicle_orientation_hints": normalized,
+        }
+
+    @staticmethod
+    def sanitize_for_road_scene(payload: dict, road_scene: dict) -> dict:
+        if _is_junction_scene(road_scene):
+            return payload
+        sanitized = {
+            "vehicle_orientation_brief": payload.get("vehicle_orientation_brief", {}),
+            "ignored_detections": _normalize_ignored_detections(
+                payload.get("ignored_detections")
+            ),
+            "vehicle_orientation_hints": [],
+        }
+        for hint in payload.get("vehicle_orientation_hints") or []:
+            if not isinstance(hint, dict):
+                continue
+            cleaned = dict(hint)
+            cleaned.pop("vehicle_region_hint", None)
+            cleaned.pop("junction_center_relative_to_vehicle", None)
+            cleaned.pop("junction_travel_direction", None)
+            sanitized["vehicle_orientation_hints"].append(cleaned)
+        return sanitized
 
     @staticmethod
     def extract_orientation_hints(response_text: str) -> list:
@@ -215,3 +234,130 @@ Rules:
 def _choice(value, allowed: set, default: str) -> str:
     normalized = str(value or "").strip().lower()
     return normalized if normalized in allowed else default
+
+
+def _empty_orientation_payload() -> dict:
+    return {
+        "vehicle_orientation_brief": {},
+        "ignored_detections": [],
+        "vehicle_orientation_hints": [],
+    }
+
+
+def _normalize_ignored_detections(value) -> list:
+    if not isinstance(value, list):
+        return []
+    normalized = []
+    seen = set()
+    for item in value:
+        if isinstance(item, str):
+            det_id = item.strip()
+            reason = ""
+        elif isinstance(item, dict):
+            det_id = str(item.get("det_id") or item.get("id") or "").strip()
+            reason = str(item.get("reason") or item.get("evidence") or "").strip()
+        else:
+            continue
+        if not det_id or det_id in seen:
+            continue
+        seen.add(det_id)
+        normalized.append({"det_id": det_id, "reason": reason})
+    return normalized
+
+
+def _is_junction_scene(road_scene: dict) -> bool:
+    map_matching = ((road_scene or {}).get("road_network") or {}).get("map_matching") or {}
+    topology = str(map_matching.get("topology_type") or "").lower()
+    return bool(map_matching.get("junction_visible")) or topology in {
+        "t_junction",
+        "cross_intersection",
+        "multi_branch",
+        "roundabout",
+        "signalized_intersection",
+    }
+
+
+def _orientation_schema_block(is_junction: bool) -> str:
+    if is_junction:
+        return """
+
+Road-scene branch: JUNCTION. Output JSON only:
+{
+  "vehicle_orientation_brief": {
+    "overall_observation": "short summary of visible vehicle orientation patterns",
+    "uncertainties": ["short uncertainty notes"]
+  },
+  "ignored_detections": [
+    {
+      "det_id": "det_2",
+      "reason": "duplicate, false positive, outside drivable scene, or no reconstructable scene role"
+    }
+  ],
+  "vehicle_orientation_hints": [
+    {
+      "det_id": "det_1",
+      "visible_end": "front | rear | side | unclear",
+      "front_points_image_direction": "left | right | toward_camera | away_from_camera | unclear",
+      "vehicle_region_hint": "right_arm | left_arm | ahead_arm | ego_approach | unknown",
+      "junction_center_relative_to_vehicle": "left | right | ahead | behind | unknown",
+      "heading_relation_to_ego": "same_direction | opposite_direction | crossing | unknown",
+      "junction_travel_direction": "toward_junction | away_from_junction | unknown",
+      "confidence": "high | medium | low",
+      "evidence": "short visual evidence"
+    }
+  ]
+}
+
+Junction rules:
+- Treat ignored_detections as soft ignore candidates for downstream review.
+- Use ignored_detections only when a detector id is clearly outside the
+  reconstructable road scene, duplicate/false positive, or has no visible scene role.
+- Assign arm labels only because the road-scene agent classified this as a junction.
+- Do not use image-left/image-right or bbox center-x alone to choose left_arm/right_arm.
+- A vehicle ahead of ego in an ego-approach left/right/same lane is still
+  vehicle_region_hint=ego_approach, not left_arm/right_arm.
+- Use left_arm/right_arm only for vehicles physically on the cross street or side-road
+  branch, with visible road/lane geometry supporting that branch membership.
+- For side-profile vehicles on the right-side arm, front_points_image_direction=right
+  usually means away_from_junction, and left usually means toward_junction.
+- For side-profile vehicles on the left-side arm, front_points_image_direction=left
+  usually means away_from_junction, and right usually means toward_junction.
+- For vehicles on the ahead/oncoming arm, front facing ego/camera usually means
+  toward_junction; rear facing ego/camera usually means away_from_junction.
+"""
+    return """
+
+Road-scene branch: OPEN_ROAD / STRAIGHT_OR_CURVE. Output JSON only:
+{
+  "vehicle_orientation_brief": {
+    "overall_observation": "short summary of visible vehicle orientation patterns",
+    "uncertainties": ["short uncertainty notes"]
+  },
+  "ignored_detections": [
+    {
+      "det_id": "det_2",
+      "reason": "duplicate, false positive, outside drivable scene, or no reconstructable scene role"
+    }
+  ],
+  "vehicle_orientation_hints": [
+    {
+      "det_id": "det_1",
+      "visible_end": "front | rear | side | unclear",
+      "front_points_image_direction": "left | right | toward_camera | away_from_camera | unclear",
+      "road_region_hint": "ego_lane | left_lane | right_lane | opposing_lane | left_parking_lane | right_parking_lane | roadside | unknown",
+      "heading_relation_to_ego": "same_direction | opposite_direction | crossing | unknown",
+      "confidence": "high | medium | low",
+      "evidence": "short visual evidence"
+    }
+  ]
+}
+
+Open-road rules:
+- Treat ignored_detections as soft ignore candidates for downstream review.
+- Use ignored_detections only when a detector id is clearly outside the
+  reconstructable road scene, duplicate/false positive, or has no visible scene role.
+- Do not output vehicle_region_hint, junction_center_relative_to_vehicle, or
+  junction_travel_direction.
+- Do not use arm labels such as right_arm, left_arm, ahead_arm, or ego_approach.
+- Use road_region_hint only for lane/parking/opposing-road context.
+"""

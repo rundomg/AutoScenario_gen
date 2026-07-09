@@ -34,6 +34,7 @@ DEFAULT_LANE_WIDTH_M = 3.5
 DEFAULT_EGO_DISTANCE_M = 12.0
 MIN_LEG_DISTANCE_M = 3.0
 MIN_VEHICLE_LEG_SPACING_M = 5.5
+DUPLICATE_LANE_LATERAL_EPS_M = 0.75
 
 
 def _slug(value: Any) -> str:
@@ -147,12 +148,16 @@ def _leg_distance_for_entity(
     is_ego: bool,
     ego_distance_m: float,
     clearance_m: float = MIN_LEG_DISTANCE_M,
+    *,
+    direction: str = "",
+    motion: str = "",
 ) -> float:
     """Distance from the junction centre to place this actor along its leg.
 
-    ``clearance_m`` is a floor (the junction's own radius plus a margin) so an
-    approaching actor sits on the approach lane outside the junction box rather
-    than inside the intersection where lanes are ill-defined.
+    ``clearance_m`` is a floor for absolute arm placements so an approaching
+    actor sits on the approach lane outside the junction box. Ego-approach
+    relative placements use ``ego_distance_m - longitudinal_m`` instead because
+    smaller distance-to-centre means "ahead of ego" on an inbound leg.
     """
     floor = max(MIN_LEG_DISTANCE_M, float(clearance_m))
     if is_ego:
@@ -170,6 +175,16 @@ def _leg_distance_for_entity(
                 continue
             if distance > 0:
                 return max(floor, distance)
+
+    if _slug(direction) == "ego" and _slug(motion) == "approaching":
+        try:
+            longitudinal_m = float(entity.get("longitudinal_m"))
+        except (TypeError, ValueError):
+            longitudinal_m = None
+        if longitudinal_m is not None:
+            return max(MIN_LEG_DISTANCE_M, float(ego_distance_m) - longitudinal_m)
+
+    if isinstance(anchor_relation, dict):
         position = _slug(
             anchor_relation.get("position_along_anchor")
             or anchor_relation.get("position")
@@ -190,10 +205,141 @@ def _leg_distance_for_entity(
     return max(floor, float(ego_distance_m))
 
 
-def _lanes_for_motion(leg: Any, motion: str) -> List[Dict[str, Any]]:
+def _lane_anchor(lane: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    anchor = lane.get("anchor") if isinstance(lane, dict) else None
+    return anchor if isinstance(anchor, dict) else None
+
+
+def _lane_outbound_lateral(
+    leg: Any,
+    lane: Dict[str, Any],
+    center: Optional[Tuple[float, float, float]],
+) -> Optional[float]:
+    """Return lane anchor lateral offset in the leg's outbound frame."""
+    anchor = _lane_anchor(lane)
+    if anchor is None or center is None:
+        return None
+    try:
+        dx = float(anchor.get("x")) - float(center[0])
+        dy = float(anchor.get("y")) - float(center[1])
+    except (TypeError, ValueError):
+        return None
+    rad = math.radians(float(getattr(leg, "heading_out_deg", 0.0)) + 90.0)
+    return dx * math.cos(rad) + dy * math.sin(rad)
+
+
+def _lane_matches_exact(
+    lane: Dict[str, Any],
+    preferred_lane: Optional[Dict[str, Any]],
+) -> bool:
+    if not isinstance(preferred_lane, dict):
+        return False
+    try:
+        return (
+            int(lane.get("road_id")) == int(preferred_lane.get("road_id"))
+            and int(lane.get("lane_id")) == int(preferred_lane.get("lane_id"))
+        )
+    except (TypeError, ValueError):
+        return False
+
+
+def _lane_duplicate_preference(
+    lane: Dict[str, Any],
+    preferred_lane: Optional[Dict[str, Any]],
+) -> Tuple[int, float, int, int]:
+    try:
+        abs_lane_id = abs(int(lane.get("lane_id") or 0))
+    except (TypeError, ValueError):
+        abs_lane_id = 0
+    try:
+        road_id = int(lane.get("road_id") or 0)
+    except (TypeError, ValueError):
+        road_id = 0
+    anchor = _lane_anchor(lane) or {}
+    try:
+        distance = float(anchor.get("distance_from_center_m") or 0.0)
+    except (TypeError, ValueError):
+        distance = 0.0
+    return (
+        1 if _lane_matches_exact(lane, preferred_lane) else 0,
+        distance,
+        abs_lane_id,
+        -road_id,
+    )
+
+
+def _dedupe_lanes_by_lateral(
+    indexed_lanes: List[Tuple[int, Dict[str, Any]]],
+    lateral_by_id: Dict[int, float],
+    preferred_lane: Optional[Dict[str, Any]] = None,
+) -> List[Dict[str, Any]]:
+    if len(indexed_lanes) <= 1:
+        return [lane for _, lane in indexed_lanes]
+
+    deduped: List[Dict[str, Any]] = []
+    group: List[Tuple[int, Dict[str, Any]]] = []
+    group_lateral: Optional[float] = None
+
+    def flush_group() -> None:
+        if not group:
+            return
+        _, chosen = max(
+            group,
+            key=lambda item: _lane_duplicate_preference(item[1], preferred_lane),
+        )
+        deduped.append(chosen)
+
+    for item in indexed_lanes:
+        index, _lane = item
+        lateral = lateral_by_id[index]
+        if group_lateral is None:
+            group = [item]
+            group_lateral = lateral
+            continue
+        if abs(lateral - group_lateral) <= DUPLICATE_LANE_LATERAL_EPS_M:
+            group.append(item)
+            continue
+        flush_group()
+        group = [item]
+        group_lateral = lateral
+    flush_group()
+    return deduped
+
+
+def _lanes_for_motion(
+    leg: Any,
+    motion: str,
+    center: Optional[Tuple[float, float, float]] = None,
+    preferred_lane: Optional[Dict[str, Any]] = None,
+) -> List[Dict[str, Any]]:
     lanes = leg.lanes_for_motion(motion) if hasattr(leg, "lanes_for_motion") else []
-    # OpenDRIVE lane ids grow outward from the reference line.  The rightmost
-    # lane on a carriageway is therefore the largest |lane_id|, not lane 1.
+    lateral_by_id: Dict[int, float] = {}
+    for index, lane in enumerate(lanes):
+        lateral = _lane_outbound_lateral(leg, lane, center)
+        if lateral is None:
+            lateral_by_id = {}
+            break
+        lateral_by_id[index] = lateral
+    if lateral_by_id:
+        # Rightmost-first in the actor's travel frame.  For approaching actors
+        # travel is opposite the outbound heading, so travel-right is negative
+        # outbound lateral; for leaving actors it is positive outbound lateral.
+        # CARLA junctions can expose overlapping connector and approach lanes at
+        # the same anchor, so collapse those duplicates before lane-slot math.
+        indexed = list(enumerate(lanes))
+        if str(motion or "approaching").lower() == "leaving":
+            ordered = sorted(indexed, key=lambda item: -lateral_by_id[item[0]])
+        else:
+            ordered = sorted(indexed, key=lambda item: lateral_by_id[item[0]])
+        return _dedupe_lanes_by_lateral(
+            ordered,
+            lateral_by_id,
+            preferred_lane=preferred_lane,
+        )
+
+    # Fallback for structures without lane anchors: OpenDRIVE lane ids grow
+    # outward from the reference line, so the rightmost lane on a carriageway is
+    # usually the largest |lane_id|, not lane 1.
     return sorted(lanes, key=lambda lane: -abs(int(lane.get("lane_id", 0) or 0)))
 
 
@@ -218,11 +364,113 @@ def _anchor_lane_from_right(entity: Dict[str, Any]) -> Optional[int]:
     return None
 
 
+def _clamp_lane_slot(slot: int, lanes: List[Dict[str, Any]]) -> int:
+    if not lanes:
+        return int(slot)
+    return min(max(0, int(slot)), len(lanes) - 1)
+
+
+def _ego_lane_slot(
+    lanes: List[Dict[str, Any]],
+    ego_anchor_lane: Optional[Dict[str, Any]],
+) -> Optional[int]:
+    """Find ego's lane slot within a junction leg's rightmost-first lane list."""
+    if not lanes or not isinstance(ego_anchor_lane, dict):
+        return None
+    try:
+        ego_road = int(ego_anchor_lane.get("road_id"))
+        ego_lane = int(ego_anchor_lane.get("lane_id"))
+    except (TypeError, ValueError):
+        ego_road = None
+        try:
+            ego_lane = int(ego_anchor_lane.get("lane_id"))
+        except (TypeError, ValueError):
+            ego_lane = None
+
+    if ego_road is not None and ego_lane is not None:
+        for index, lane in enumerate(lanes):
+            try:
+                if (
+                    int(lane.get("road_id")) == ego_road
+                    and int(lane.get("lane_id")) == ego_lane
+                ):
+                    return index
+            except (TypeError, ValueError):
+                continue
+
+    if ego_lane is not None:
+        matches = []
+        for index, lane in enumerate(lanes):
+            try:
+                if int(lane.get("lane_id")) == ego_lane:
+                    matches.append(index)
+            except (TypeError, ValueError):
+                continue
+        if len(matches) == 1:
+            return matches[0]
+
+    start = ego_anchor_lane.get("start") or {}
+    try:
+        sx = float(start.get("x"))
+        sy = float(start.get("y"))
+    except (TypeError, ValueError):
+        return None
+    best_index = None
+    best_dist = float("inf")
+    for index, lane in enumerate(lanes):
+        anchor = _lane_anchor(lane)
+        if anchor is None:
+            continue
+        try:
+            dist = math.hypot(float(anchor.get("x")) - sx, float(anchor.get("y")) - sy)
+        except (TypeError, ValueError):
+            continue
+        if dist < best_dist:
+            best_dist = dist
+            best_index = index
+    return best_index
+
+
+def _lane_slot_for_entity(
+    entity: Dict[str, Any],
+    *,
+    direction: str,
+    lanes: List[Dict[str, Any]],
+    ego_anchor_lane: Optional[Dict[str, Any]],
+) -> int:
+    explicit_from_right = _anchor_lane_from_right(entity)
+    if explicit_from_right is not None:
+        return _clamp_lane_slot(explicit_from_right, lanes)
+
+    heading = _slug(entity.get("heading_relation"))
+    lane_index = 0 if heading == "crossing" else _entity_lane_index(entity)
+    direction = _slug(direction)
+
+    if direction == "ego":
+        ego_slot = _ego_lane_slot(lanes, ego_anchor_lane)
+        if ego_slot is not None:
+            # lanes are rightmost-first; lane_index=+1 means one lane to ego's
+            # right, so the slot moves toward the front of the list.
+            return _clamp_lane_slot(ego_slot - lane_index, lanes)
+
+    if direction == "opposite" and lane_index < 0 and lanes:
+        # Oncoming lane indices are counted from the median: -1 is the
+        # median-adjacent opposing lane, i.e. the leftmost lane in the oncoming
+        # actor's travel frame.
+        return _clamp_lane_slot(len(lanes) - abs(lane_index), lanes)
+
+    return _clamp_lane_slot(abs(lane_index), lanes)
+
+
 def _lateral_for_entity(
     entity: Dict[str, Any],
     leg: Any,
     motion: str,
     lane_width: float,
+    *,
+    direction: str = "",
+    center: Optional[Tuple[float, float, float]] = None,
+    ego_anchor_lane: Optional[Dict[str, Any]] = None,
 ) -> Tuple[float, Optional[Dict[str, Any]], int]:
     """Lateral offset placing the actor in its ego-relative lane band.
 
@@ -234,18 +482,36 @@ def _lateral_for_entity(
     travel frame, so right-lane and left-lane image evidence does not collapse
     onto the same junction leg centreline.
     """
-    lanes = _lanes_for_motion(leg, motion)
-    explicit_from_right = _anchor_lane_from_right(entity)
+    lanes = _lanes_for_motion(
+        leg,
+        motion,
+        center=center,
+        preferred_lane=ego_anchor_lane if _slug(direction) == "ego" else None,
+    )
     heading = _slug(entity.get("heading_relation"))
     lane_index = 0 if heading == "crossing" else _entity_lane_index(entity)
-    lane_slot = explicit_from_right if explicit_from_right is not None else abs(lane_index)
-    spacing_slot = lane_slot if explicit_from_right is not None else lane_index
+    lane_slot = _lane_slot_for_entity(
+        entity,
+        direction=direction,
+        lanes=lanes,
+        ego_anchor_lane=ego_anchor_lane,
+    )
     if lanes:
-        selected_lane = lanes[min(max(0, lane_slot), len(lanes) - 1)]
+        selected_lane = lanes[_clamp_lane_slot(lane_slot, lanes)]
     else:
         selected_lane = None
 
+    selected_lateral = (
+        _lane_outbound_lateral(leg, selected_lane, center)
+        if selected_lane is not None
+        else None
+    )
+    if selected_lateral is not None:
+        return selected_lateral, selected_lane, lane_slot
+
     lane_center_offset = 0.5 * float(lane_width)
+    explicit_from_right = _anchor_lane_from_right(entity)
+    spacing_slot = lane_slot if explicit_from_right is not None else lane_index
     if str(motion or "approaching").lower() == "leaving":
         # Right of travel is right of the outbound leg heading.
         lane_center_offset += lane_index * float(lane_width)
@@ -312,6 +578,9 @@ def reproject_actors_for_junction(
 
     assignments: List[Dict[str, Any]] = []
     leg_slots: Dict[Tuple[str, str, int], List[float]] = {}
+    ego_anchor_lane = coordinates.get("selected_anchor_lane")
+    if not isinstance(ego_anchor_lane, dict):
+        ego_anchor_lane = None
     for entity in coordinates.get("entities") or []:
         is_ego = _is_ego(entity)
         direction, motion = direction_and_motion_for_entity(entity)
@@ -325,10 +594,23 @@ def reproject_actors_for_junction(
 
         z = float((entity.get("location") or {}).get("z", 0.3) or 0.3)
         lateral_m, selected_lane, lane_slot = _lateral_for_entity(
-            entity, leg, motion, lane_width
+            entity,
+            leg,
+            motion,
+            lane_width,
+            direction=direction,
+            center=frame.center,
+            ego_anchor_lane=ego_anchor_lane,
         )
         distance_m = _spaced_leg_distance(
-            _leg_distance_for_entity(entity, is_ego, ego_dist, clearance),
+            _leg_distance_for_entity(
+                entity,
+                is_ego,
+                ego_dist,
+                clearance,
+                direction=direction,
+                motion=motion,
+            ),
             slots=leg_slots,
             leg_name=leg.name,
             motion=motion,
@@ -395,6 +677,91 @@ def reproject_actors_for_junction(
     coordinates.setdefault("metadata", {})["layout_version"] = "v2"
     coordinates.setdefault("metadata", {})["layout_scene_kind"] = "junction"
     return coordinates
+
+
+def validate_structural_reprojection(coordinates: Dict[str, Any]) -> Dict[str, Any]:
+    """Sanity-check final structural placement after junction reprojection.
+
+    This is intentionally validation-only: it records conflicts between the
+    actor's declared road anchor (layout_anchor_id) and the final junction frame
+    assignment, but does not repair or block generation.
+    """
+    issues: List[Dict[str, Any]] = []
+    checked = 0
+    expected_by_anchor = {
+        "ego_approach": "ego",
+        "ego": "ego",
+        "left_arm": "left",
+        "right_arm": "right",
+        "ahead_arm": "opposite",
+        "oncoming_arm": "opposite",
+        "opposite_arm": "opposite",
+    }
+    ego_lane_relations = {"same_lane", "left_lane", "right_lane"}
+
+    for entity in coordinates.get("entities") or []:
+        if not isinstance(entity, dict) or _is_ego(entity):
+            continue
+        layout_anchor = _slug(entity.get("layout_anchor_id"))
+        if not layout_anchor:
+            continue
+        expected_direction = expected_by_anchor.get(layout_anchor)
+        if expected_direction is None:
+            continue
+        checked += 1
+        actual_direction = _slug(entity.get("junction_direction"))
+        lane_side = _slug(entity.get("lane_side_relation"))
+        if actual_direction != expected_direction:
+            issues.append(
+                {
+                    "entity_id": entity.get("id"),
+                    "issue_type": "junction_anchor_direction_mismatch",
+                    "layout_anchor_id": layout_anchor,
+                    "lane_side_relation": lane_side,
+                    "expected_junction_direction": expected_direction,
+                    "actual_junction_direction": actual_direction,
+                    "junction_leg": entity.get("junction_leg"),
+                }
+            )
+            continue
+        if (
+            layout_anchor in {"ego_approach", "ego"}
+            and lane_side in ego_lane_relations
+            and actual_direction != "ego"
+        ):
+            issues.append(
+                {
+                    "entity_id": entity.get("id"),
+                    "issue_type": "ego_approach_lane_moved_to_side_leg",
+                    "layout_anchor_id": layout_anchor,
+                    "lane_side_relation": lane_side,
+                    "actual_junction_direction": actual_direction,
+                    "junction_leg": entity.get("junction_leg"),
+                }
+            )
+        if str(entity.get("junction_placement") or "") == "frame":
+            projected_lane = entity.get("projected_lane") if isinstance(entity.get("projected_lane"), dict) else {}
+            if projected_lane.get("source") != "junction_leg":
+                issues.append(
+                    {
+                        "entity_id": entity.get("id"),
+                        "issue_type": "junction_frame_missing_projected_lane",
+                        "layout_anchor_id": layout_anchor,
+                        "junction_direction": actual_direction,
+                        "projected_lane": projected_lane,
+                    }
+                )
+
+    return {
+        "status": "pass" if not issues else "fail",
+        "summary": {
+            "total": checked,
+            "failed": len(issues),
+            "passed": max(0, checked - len(issues)),
+        },
+        "issues": issues,
+        "metadata": {"validation_version": "structural-reprojection-validation-v1"},
+    }
 
 
 def _decompose_offsets(
@@ -464,6 +831,13 @@ def reproject_actors_for_road(
             side = "same"
         else:
             side = "opposing" if is_oncoming else "same"
+            if is_oncoming and abs(float(lateral)) < float(lane_width) * 0.25:
+                try:
+                    lane_index = int(entity.get("lane_index_relation") or -1)
+                except (TypeError, ValueError):
+                    lane_index = -1
+                opposing_index = max(1, abs(lane_index))
+                lateral = -opposing_index * float(lane_width)
 
         z = float(loc.get("z", 0.3) or 0.3)
         placement = frame.place(

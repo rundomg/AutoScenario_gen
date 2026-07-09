@@ -45,6 +45,7 @@ MAX_LOCAL_LANE_DISTANCE_M = 150.0
 # push opposite-direction (oncoming) actors across the divider onto the opposing
 # carriageway instead of leaving them in an adjacent same-direction lane.
 MEDIAN_GAP_LANE_EQUIV = 1.0
+PARKING_VEHICLE_MIN_DISTANCE_METERS = 3.5
 
 # Yaw deflection (degrees) applied to a vehicle captured mid-turn at a junction.
 # Static reconstruction has no continuous trajectory, so a turning actor is
@@ -180,33 +181,33 @@ CANONICAL_LANE_SIDE_MAP = {
     "right_rear": "right_lane",
     "opposing_center_right": "right_lane",
     "opposing_right": "right_lane",
-    # Parking / curbside vehicle variants are normalized to adjacent lanes.
-    "curbside_right": "right_lane",
-    "right_curb": "right_lane",
-    "right_curbside": "right_lane",
-    "right_curbside_parking_lane": "right_lane",
-    "right_curbside_row": "right_lane",
-    "right_parking_lane": "right_lane",
-    "right_parking": "right_lane",
-    "parking_right": "right_lane",
-    "curbside_parking_right": "right_lane",
-    "near_right_edge": "right_lane",
-    "far_right_edge": "right_lane",
-    "right_edge": "right_lane",
-    "right_shoulder": "right_lane",
-    "curbside_left": "left_lane",
-    "left_curb": "left_lane",
-    "left_curbside": "left_lane",
-    "left_curbside_parking_lane": "left_lane",
-    "left_curbside_row": "left_lane",
-    "left_parking_lane": "left_lane",
-    "left_parking": "left_lane",
-    "parking_left": "left_lane",
-    "curbside_parking_left": "left_lane",
-    "near_left_edge": "left_lane",
-    "far_left_edge": "left_lane",
-    "left_edge": "left_lane",
-    "left_shoulder": "left_lane",
+    # Parking / curbside variants must keep parking semantics for placement.
+    "curbside_right": "right_parking_lane",
+    "right_curb": "right_parking_lane",
+    "right_curbside": "right_parking_lane",
+    "right_curbside_parking_lane": "right_parking_lane",
+    "right_curbside_row": "right_parking_lane",
+    "right_parking_lane": "right_parking_lane",
+    "right_parking": "right_parking_lane",
+    "parking_right": "right_parking_lane",
+    "curbside_parking_right": "right_parking_lane",
+    "near_right_edge": "right_edge",
+    "far_right_edge": "right_edge",
+    "right_edge": "right_edge",
+    "right_shoulder": "right_edge",
+    "curbside_left": "left_parking_lane",
+    "left_curb": "left_parking_lane",
+    "left_curbside": "left_parking_lane",
+    "left_curbside_parking_lane": "left_parking_lane",
+    "left_curbside_row": "left_parking_lane",
+    "left_parking_lane": "left_parking_lane",
+    "left_parking": "left_parking_lane",
+    "parking_left": "left_parking_lane",
+    "curbside_parking_left": "left_parking_lane",
+    "near_left_edge": "left_edge",
+    "far_left_edge": "left_edge",
+    "left_edge": "left_edge",
+    "left_shoulder": "left_edge",
     # sidewalk variants
     "left_sidewalk": "sidewalk_left",
     "sidewalk_left_side": "sidewalk_left",
@@ -227,11 +228,33 @@ def _coerce_dict(value: Any) -> dict:
     return value if isinstance(value, dict) else {}
 
 
-def _clamp_int(value: Any, minimum: int, maximum: int, default: int) -> int:
-    try:
-        number = int(value)
-    except (TypeError, ValueError):
+def _safe_int(value: Any, default: int = 0) -> int:
+    if value is None:
         return default
+    if isinstance(value, str):
+        value = value.strip()
+        if not value or _slugify(value) in {
+            "unknown",
+            "unk",
+            "none",
+            "null",
+            "na",
+            "n_a",
+            "not_applicable",
+            "unspecified",
+        }:
+            return default
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        try:
+            return int(float(value))
+        except (TypeError, ValueError, OverflowError):
+            return default
+
+
+def _clamp_int(value: Any, minimum: int, maximum: int, default: int) -> int:
+    number = _safe_int(value, default)
     return max(minimum, min(maximum, number))
 
 
@@ -312,7 +335,15 @@ def _canonical_lane_index(value: Any, lane_side_relation: Any = None) -> int:
 
 def _lane_side_from_index(lane_index: int, fallback: Any = None) -> str:
     fallback_relation = _canonical_lane_side(fallback)
-    if fallback_relation in {"sidewalk_left", "sidewalk_right", "crosswalk"}:
+    if fallback_relation in {
+        "sidewalk_left",
+        "sidewalk_right",
+        "crosswalk",
+        "left_parking_lane",
+        "right_parking_lane",
+        "left_edge",
+        "right_edge",
+    }:
         return fallback_relation
     if lane_index > 0:
         return "right_lane"
@@ -536,7 +567,7 @@ def _canonical_group_order_rule(value: Any) -> str:
 
 def _canonical_placement_mode_hint(value: Any, actor_group_type: str) -> str:
     normalized = _slugify(value)
-    if normalized == "normal_lane_actor":
+    if normalized in {"normal_lane_actor", "parking_lane_actor"}:
         return normalized
     return "normal_lane_actor"
 
@@ -644,10 +675,54 @@ def _normalize_map_matching_contract(map_matching: Dict[str, Any]) -> Dict[str, 
         elif normalized.get("topology_type") == "t_junction":
             normalized["junction_type"] = "t_junction"
     if "left_parking_presence" not in normalized and "left_parking_lane_count" in normalized:
-        normalized["left_parking_presence"] = int(normalized.get("left_parking_lane_count") or 0) > 0
+        normalized["left_parking_presence"] = _safe_int(
+            normalized.get("left_parking_lane_count"), 0
+        ) > 0
     if "right_parking_presence" not in normalized and "right_parking_lane_count" in normalized:
-        normalized["right_parking_presence"] = int(normalized.get("right_parking_lane_count") or 0) > 0
+        normalized["right_parking_presence"] = _safe_int(
+            normalized.get("right_parking_lane_count"), 0
+        ) > 0
     return normalized
+
+
+def _should_apply_straight_parking_symmetry(map_matching: Dict[str, Any]) -> bool:
+    topology = _slugify(map_matching.get("topology_type"))
+    if topology not in {"straight_road", "straight_two_way"}:
+        return False
+    if map_matching.get("junction_visible") is True:
+        return False
+    if bool(map_matching.get("has_center_median")):
+        return False
+    return _safe_int(map_matching.get("opposing_lane_count"), 0) > 0
+
+
+def _apply_lane_group_parking_symmetry(
+    lane_groups: List[Dict[str, Any]],
+    map_matching: Dict[str, Any],
+) -> None:
+    if not lane_groups or not _should_apply_straight_parking_symmetry(map_matching):
+        return
+    has_left = any(
+        _safe_int(lane_group.get("left_parking_lane_count"), 0) > 0
+        for lane_group in lane_groups
+    )
+    has_right = any(
+        _safe_int(lane_group.get("right_parking_lane_count"), 0) > 0
+        for lane_group in lane_groups
+    )
+    if has_left == has_right:
+        return
+    for lane_group in lane_groups:
+        lane_group["left_parking_lane_count"] = max(
+            1,
+            _safe_int(lane_group.get("left_parking_lane_count"), 0),
+        )
+        lane_group["right_parking_lane_count"] = max(
+            1,
+            _safe_int(lane_group.get("right_parking_lane_count"), 0),
+        )
+    map_matching["left_parking_presence"] = True
+    map_matching["right_parking_presence"] = True
 
 
 def _optional_int(value: Any) -> Optional[int]:
@@ -810,7 +885,7 @@ def normalize_scene_understanding(payload: Dict[str, Any]) -> Tuple[Optional[Dic
     # before road_network normalization happens below.
     _raw_lane_groups = _coerce_list(_coerce_dict(payload.get("road_network")).get("lane_groups"))
     _raw_primary_group = _raw_lane_groups[0] if _raw_lane_groups else {}
-    _opposing_lane_count = max(1, int(_raw_primary_group.get("opposing_lane_count", 1)))
+    _opposing_lane_count = max(1, _safe_int(_raw_primary_group.get("opposing_lane_count"), 1))
     _layout_scene_kind = _map_matching_scene_kind(payload)
 
     for index, entity in enumerate(_coerce_list(payload.get("traffic_subjects"))):
@@ -845,7 +920,7 @@ def normalize_scene_understanding(payload: Dict[str, Any]) -> Tuple[Optional[Dic
                 "lane_index_relation": lane_index_relation,
                 "longitudinal_relation": str(entity.get("longitudinal_relation") or "ahead"),
                 "longitudinal_proximity": _canonical_distance_band(entity.get("longitudinal_proximity")),
-                "count": max(1, int(entity.get("count", 1))),
+                "count": max(1, _safe_int(entity.get("count"), 1)),
                 "evidence": str(entity.get("evidence") or ""),
                 "must_reconstruct": True,
                 "layout_anchor_id": str(entity.get("layout_anchor_id") or "").strip(),
@@ -946,26 +1021,28 @@ def normalize_scene_understanding(payload: Dict[str, Any]) -> Tuple[Optional[Dic
         if not isinstance(lane_group, dict):
             continue
         side = _slugify(lane_group.get("side"))
-        lanes = max(1, int(lane_group.get("lanes", 1)))
+        lanes = max(1, _safe_int(lane_group.get("lanes"), 1))
         normalized_lane_groups.append(
             {
-                "forward_lane_count": int(
+                "forward_lane_count": _safe_int(
                     lane_group.get(
                         "forward_lane_count",
                         lanes if side in {"ego_direction", "forward"} else 1,
-                    )
+                    ),
+                    lanes if side in {"ego_direction", "forward"} else 1,
                 ),
-                "opposing_lane_count": int(
+                "opposing_lane_count": _safe_int(
                     lane_group.get(
                         "opposing_lane_count",
                         lanes if side in {"opposite_direction", "opposing"} else 1,
-                    )
+                    ),
+                    lanes if side in {"opposite_direction", "opposing"} else 1,
                 ),
                 "left_parking_lane_count": max(
-                    0, int(lane_group.get("left_parking_lane_count", 0))
+                    0, _safe_int(lane_group.get("left_parking_lane_count"), 0)
                 ),
                 "right_parking_lane_count": max(
-                    0, int(lane_group.get("right_parking_lane_count", 0))
+                    0, _safe_int(lane_group.get("right_parking_lane_count"), 0)
                 ),
                 "lane_width_class": str(lane_group.get("lane_width_class") or "standard"),
                 "lane_count_evidence": str(lane_group.get("lane_count_evidence") or ""),
@@ -979,7 +1056,22 @@ def normalize_scene_understanding(payload: Dict[str, Any]) -> Tuple[Optional[Dic
     normalized_road_network = {}
     map_matching = _coerce_dict(road_network.get("map_matching"))
     if map_matching:
-        normalized_road_network["map_matching"] = _normalize_map_matching_contract(map_matching)
+        normalized_map_matching = _normalize_map_matching_contract(map_matching)
+        _apply_lane_group_parking_symmetry(
+            normalized_lane_groups,
+            normalized_map_matching,
+        )
+        if normalized_lane_groups and "left_parking_presence" not in normalized_map_matching:
+            normalized_map_matching["left_parking_presence"] = any(
+                _safe_int(lane_group.get("left_parking_lane_count"), 0) > 0
+                for lane_group in normalized_lane_groups
+            )
+        if normalized_lane_groups and "right_parking_presence" not in normalized_map_matching:
+            normalized_map_matching["right_parking_presence"] = any(
+                _safe_int(lane_group.get("right_parking_lane_count"), 0) > 0
+                for lane_group in normalized_lane_groups
+            )
+        normalized_road_network["map_matching"] = normalized_map_matching
     if "road_type" in road_network:
         normalized_road_network["road_type"] = _canonical_road_type(
             road_network.get("road_type")
@@ -1126,6 +1218,12 @@ def _lane_anchor_for_relation(
     relation = str(lane_side_relation or "same_lane")
     lane_index = _canonical_lane_index(lane_index_relation, relation)
     if category in VEHICLE_CATEGORIES:
+        if relation in {"left_parking_lane", "right_parking_lane"}:
+            side = -1 if "left" in relation else 1
+            return "parking_lane", side, "parking_lane"
+        if relation in {"left_edge", "right_edge"}:
+            side = -1 if "left" in relation else 1
+            return "curbside", side, f"road_edge_{'left' if side < 0 else 'right'}"
         if lane_index == 0:
             return "center_of_lane", 0, "same_lane"
         return "lane_center", lane_index, "relative_lane"
@@ -1186,6 +1284,8 @@ def _expected_lateral_band(entity: Dict[str, Any]) -> float:
     lane_index = float(entity.get("lane_index_relation") or 0.0)
     if lane_anchor == "lane_center":
         return lane_index
+    if lane_anchor == "parking_lane":
+        return -2.0 if "left" in str(entity.get("lane_side_relation") or "") else 2.0
     mapping = {
         "sidewalk_band": -3.0 if "left" in str(entity.get("lane_side_relation") or "") else 3.0,
         "left_curbside": -2.0,
@@ -1412,10 +1512,10 @@ def _scene_has_center_median(scene_understanding: Dict[str, Any]) -> bool:
 def _lane_context(scene_understanding: Dict[str, Any], anchor_lane: Dict[str, Any]) -> Dict[str, Any]:
     lane_groups = _coerce_list(scene_understanding.get("road_network", {}).get("lane_groups"))
     lane_group = lane_groups[0] if lane_groups else {}
-    forward_lane_count = int(lane_group.get("forward_lane_count", 1))
-    opposing_lane_count = int(lane_group.get("opposing_lane_count", 1))
-    left_parking_lane_count = int(lane_group.get("left_parking_lane_count", 0) or 0)
-    right_parking_lane_count = int(lane_group.get("right_parking_lane_count", 0) or 0)
+    forward_lane_count = _safe_int(lane_group.get("forward_lane_count"), 1)
+    opposing_lane_count = _safe_int(lane_group.get("opposing_lane_count"), 1)
+    left_parking_lane_count = _safe_int(lane_group.get("left_parking_lane_count"), 0)
+    right_parking_lane_count = _safe_int(lane_group.get("right_parking_lane_count"), 0)
     return {
         "ego_lane_id": int(anchor_lane.get("lane_id", -1)),
         "lane_catalog": {
@@ -1452,7 +1552,7 @@ def _lane_context(scene_understanding: Dict[str, Any], anchor_lane: Dict[str, An
 def _iter_expanded_entities(scene_understanding: Dict[str, Any]) -> Iterable[Dict[str, Any]]:
     total_background = 0
     for entity in _coerce_list(scene_understanding.get("traffic_subjects")):
-        count = max(1, int(entity.get("count", 1)))
+        count = max(1, _safe_int(entity.get("count"), 1))
         for instance_index in range(count):
             expanded = _deep_copy(entity)
             expanded["_source_key"] = "traffic_subjects"
@@ -1470,7 +1570,7 @@ def _iter_expanded_entities(scene_understanding: Dict[str, Any]) -> Iterable[Dic
         remaining = BACKGROUND_MAX_ACTORS - total_background
         if remaining <= 0:
             break
-        count = min(max(1, int(entity.get("representative_count", 1))), remaining)
+        count = min(max(1, _safe_int(entity.get("representative_count"), 1)), remaining)
         total_background += count
         for instance_index in range(count):
             expanded = _deep_copy(entity)
@@ -1767,6 +1867,8 @@ def _lane_anchor_offset(entity, lane_width, lane_context=None):
         return lane_index * lane_width
     if anchor == "lane_center":
         return lane_index * lane_width
+    if anchor == "parking_lane":
+        return _relation_side_sign(entity.get("lane_side_relation")) * lane_width * 2.0
     if anchor == "left_lane_center":
         return -lane_width + lane_index * lane_width
     if anchor == "right_lane_center":
@@ -1863,10 +1965,14 @@ def main():
                 "spawn_kind": entity.get("spawn_kind"),
                 "blueprint_name": entity.get("blueprint_name"),
                 "motion_state": entity.get("motion_state"),
+                "lane_index_relation": entity.get("lane_index_relation", 0),
                 "lane_side_relation": entity.get("lane_side_relation"),
                 "heading_relation": heading_relation,
                 "original_heading_relation": entity.get("original_heading_relation"),
                 "flow_compliance": entity.get("flow_compliance"),
+                "longitudinal_relation": entity.get("order_relation"),
+                "longitudinal_proximity": entity.get("distance_band"),
+                "longitudinal_m": longitudinal,
                 "road_id": entity.get("road_id"),
                 "layout_anchor_id": entity.get("layout_anchor_id"),
                 "anchor_relation": entity.get("anchor_relation"),
@@ -1937,6 +2043,8 @@ def _initial_lane_anchor_offset(
         return lane_index * lane_width
     if anchor == "lane_center":
         return lane_index * lane_width
+    if anchor == "parking_lane":
+        return _relation_side_sign(str(entity.get("lane_side_relation") or "")) * lane_width * 2.0
     if anchor == "left_lane_center":
         return -lane_width + lane_index * lane_width
     if anchor == "right_lane_center":
@@ -2048,6 +2156,8 @@ def generate_initial_coordinates_from_relation_dsl(
                 "heading_relation": heading_relation,
                 "original_heading_relation": entity.get("original_heading_relation"),
                 "flow_compliance": _canonical_flow_compliance(entity.get("flow_compliance")),
+                "longitudinal_relation": entity.get("order_relation"),
+                "longitudinal_proximity": entity.get("distance_band"),
                 "longitudinal_m": longitudinal,
                 "road_id": entity.get("road_id"),
                 "layout_anchor_id": entity.get("layout_anchor_id"),
@@ -2174,6 +2284,11 @@ def _shift_entity_longitudinal(
     )
     entity["location"]["x"] += forward_x * float(delta_m)
     entity["location"]["y"] += forward_y * float(delta_m)
+    if "longitudinal_m" in entity:
+        try:
+            entity["longitudinal_m"] = float(entity.get("longitudinal_m")) + float(delta_m)
+        except (TypeError, ValueError):
+            pass
 
 
 def apply_pairwise_ordering(
@@ -2308,13 +2423,20 @@ def _snap_entity_to_dense_waypoints(
     rot = dict(entity.get("rotation") or {})
 
     is_offset_entity = lane_side in {
-        "left_edge", "right_edge", "sidewalk_left", "sidewalk_right",
+        "left_edge",
+        "right_edge",
+        "left_parking_lane",
+        "right_parking_lane",
+        "sidewalk_left",
+        "sidewalk_right",
     }
     lane_index = _canonical_lane_index(
         entity.get("lane_index_relation"),
         entity.get("lane_side_relation"),
     )
     if lane_index != 0 and not exact_lane_candidates:
+        is_offset_entity = True
+    if entity.get("opposing_lane_fallback_to_anchor"):
         is_offset_entity = True
     loc["z"] = max(float(best.get("z") or 0.3), 0.3)
 
@@ -2339,6 +2461,12 @@ def _snap_entity_to_dense_waypoints(
 
 def _entity_min_distance(entity: Dict[str, Any]) -> float:
     category = str(entity.get("category") or "")
+    if _is_parking_lane_actor(entity):
+        if category in {"truck", "bus"}:
+            return 5.0
+        if category in {"motorcycle", "bicycle"}:
+            return 2.0
+        return PARKING_VEHICLE_MIN_DISTANCE_METERS
     if category == "pedestrian":
         return 0.8
     if category in STATIC_CATEGORIES:
@@ -2350,6 +2478,21 @@ def _entity_min_distance(entity: Dict[str, Any]) -> float:
     if category in {"motorcycle", "bicycle"}:
         return 3.0
     return 2.5
+
+
+def _is_parking_lane_actor(entity: Dict[str, Any]) -> bool:
+    lane_side = str(entity.get("lane_side_relation") or "")
+    placement_hint = str(entity.get("placement_mode_hint") or "")
+    placement_mode = str(entity.get("placement_mode") or "")
+    actor_group_type = str(entity.get("actor_group_type") or "")
+    motion_state = str(entity.get("motion_state") or "")
+    return (
+        "parking" in lane_side
+        or placement_hint == "parking_lane_actor"
+        or placement_mode == "project_to_parking_lane"
+        or actor_group_type == "parking_row"
+        or (motion_state == "parked" and lane_side in {"left_edge", "right_edge"})
+    )
 
 
 def _priority_rank(entity: Dict[str, Any]) -> int:
@@ -2364,15 +2507,35 @@ def _distance_between(entity_a: Dict[str, Any], entity_b: Dict[str, Any]) -> flo
     return math.hypot(ax - bx, ay - by)
 
 
+def _normal_driving_lane_index(entity: Dict[str, Any]) -> Optional[int]:
+    category = str(entity.get("category") or "")
+    if not _is_vehicle_like(category) or _is_parking_lane_actor(entity):
+        return None
+    lane_side = str(entity.get("lane_side_relation") or "same_lane")
+    if lane_side in {"left_edge", "right_edge", "shoulder"} or "parking" in lane_side:
+        return None
+    return _canonical_lane_index(entity.get("lane_index_relation"), lane_side)
+
+
+def _collision_spacing_needed(
+    entity: Dict[str, Any],
+    other: Dict[str, Any],
+) -> bool:
+    entity_lane = _normal_driving_lane_index(entity)
+    other_lane = _normal_driving_lane_index(other)
+    if entity_lane is not None and other_lane is not None and entity_lane != other_lane:
+        return False
+    return True
+
+
 def _resolve_collisions(entities: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     resolved = [_deep_copy(entity) for entity in entities]
     for index, entity in enumerate(resolved):
         min_distance = _entity_min_distance(entity)
-        yaw = math.radians(float(entity["rotation"]["yaw"]))
-        forward_x = math.cos(yaw)
-        forward_y = math.sin(yaw)
         for other_index in range(index):
             other = resolved[other_index]
+            if not _collision_spacing_needed(entity, other):
+                continue
             other_min = _entity_min_distance(other)
             threshold = max(min_distance, other_min)
             distance = _distance_between(entity, other)
@@ -2383,8 +2546,16 @@ def _resolve_collisions(entities: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             else:
                 mover = entity
             shift = threshold - distance + 0.1
+            yaw = math.radians(float(mover["rotation"]["yaw"]))
+            forward_x = math.cos(yaw)
+            forward_y = math.sin(yaw)
             mover["location"]["x"] += forward_x * shift
             mover["location"]["y"] += forward_y * shift
+            if "longitudinal_m" in mover:
+                try:
+                    mover["longitudinal_m"] = float(mover.get("longitudinal_m")) + shift
+                except (TypeError, ValueError):
+                    pass
     return resolved
 
 
@@ -2431,19 +2602,19 @@ def _vehicle_lateral_offset(
         entity.get("lane_index_relation"),
         entity.get("lane_side_relation"),
     )
+    side_sign = _relation_side_sign(lane_side_relation)
+    parking_lane_count = _parking_lane_count_for_relation(lane_side_relation, lane_context)
+    if lane_side_relation in {"left_parking_lane", "right_parking_lane"}:
+        return side_sign * lane_width * 2.0
+    if lane_side_relation in {"left_edge", "right_edge"}:
+        magnitude = lane_width * 0.5
+        if parking_lane_count > 0:
+            magnitude += PARKING_LANE_WIDTH_METERS * 0.5
+        return side_sign * magnitude
     if _is_vehicle_like(str(entity.get("category") or "")):
         return lane_index * lane_width
 
-    side_sign = _relation_side_sign(lane_side_relation)
-    parking_lane_count = _parking_lane_count_for_relation(lane_side_relation, lane_context)
     category = str(entity.get("category") or "")
-
-    if lane_side_relation in {"left_edge", "right_edge"}:
-        if parking_lane_count > 0:
-            magnitude = lane_width * 0.5 + PARKING_LANE_WIDTH_METERS * 0.5
-        else:
-            magnitude = lane_width * 0.5
-        return side_sign * magnitude
 
     if lane_side_relation in {"sidewalk_left", "sidewalk_right"}:
         magnitude = lane_width * 0.5
@@ -2587,12 +2758,13 @@ def _project_vehicle_entity(
     # carriageway. When a real opposing lane was selected instead, lane_id differs
     # from the anchor and the offset is already zeroed just above. lane_reversed is
     # False here (lane == anchor), so _yaw_for_heading_relation keeps the flip.
-    if (
+    opposing_fallback_to_anchor = (
         heading_relation == "opposite_direction"
         and _is_vehicle_like(str(entity.get("category") or ""))
         and int(lane.get("lane_id", 0) or 0)
         == int((anchor_lane or {}).get("lane_id", 0) or 0)
-    ):
+    )
+    if opposing_fallback_to_anchor:
         offset = _opposing_carriageway_offset(lane_index, lane_width, lane_context)
     if abs(offset) > 1e-6:
         # Keep lane-side semantics in the road frame rather than the actor frame.
@@ -2605,6 +2777,7 @@ def _project_vehicle_entity(
     projected["location"] = {"x": px, "y": py, "z": 0.3}
     projected["rotation"] = {"pitch": 0.0, "yaw": yaw, "roll": 0.0}
     projected["projected_lane_reversed_to_anchor"] = lane_reversed
+    projected["opposing_lane_fallback_to_anchor"] = opposing_fallback_to_anchor
     return projected
 
 
@@ -2871,13 +3044,23 @@ def _enrich_topology_sample(
 
 
 def _target_lane_id_for_index(anchor_lane_id: int, lane_index: int) -> int:
+    """Return a same-direction lane id for an ego-relative lane offset.
+
+    ``lane_index_relation`` is a lateral relation within ego's carriageway:
+    negative means one lane to ego-left, positive means one lane to ego-right.
+    It must not by itself cross to the opposite-sign CARLA lane ids; opposing
+    lanes are selected only from explicit opposing/oncoming semantics.
+    """
     if lane_index == 0:
         return anchor_lane_id
     anchor_sign = -1 if anchor_lane_id < 0 else 1
-    if lane_index > 0:
-        return anchor_lane_id + anchor_sign * lane_index
-    opposite_sign = -anchor_sign
-    return opposite_sign * (abs(lane_index) or 1)
+    target_abs = max(1, abs(anchor_lane_id) + int(lane_index))
+    return anchor_sign * target_abs
+
+
+def _target_opposing_lane_id(anchor_lane_id: int, lane_index: int) -> int:
+    opposite_sign = 1 if anchor_lane_id < 0 else -1
+    return opposite_sign * (abs(int(lane_index)) or 1)
 
 
 def _select_semantic_lane(
@@ -2919,6 +3102,9 @@ def _select_semantic_lane(
         lane for lane in topology_sample if lane is anchor_lane or _is_local_lane(lane)
     ]
 
+    if lane_side in {"left_parking_lane", "right_parking_lane"} or entity.get("lane_anchor") == "parking_lane":
+        return anchor_lane
+
     # Entities that stay on the ego lane use the anchor directly.
     if lane_side in {"crosswalk", "", "sidewalk_left", "sidewalk_right"}:
         return anchor_lane
@@ -2956,13 +3142,15 @@ def _select_semantic_lane(
         if r == anchor_road_id and l == target_id:
             return lane
 
-    # Opposing or left_lane: look for opposite-sign lane_id on the same road first,
-    # then fall back to a heading-based search (>135° yaw difference).
-    if lane_index == -1 and ("opposing" in lane_side or lane_side == "left_lane"):
+    # Explicit opposing/oncoming lane semantics may cross to the opposite-sign
+    # carriageway. A plain ``left_lane`` remains an ego-carriageway lane relation
+    # and falls back to anchor+offset if no same-direction sibling exists.
+    if "opposing" in lane_side or "oncoming" in lane_side:
+        target_id = _target_opposing_lane_id(anchor_lane_id, lane_index)
         for lane in topology_sample:
             r = int(lane.get("road_id", -9999) or -9999)
             l = int(lane.get("lane_id", 0) or 0)
-            if r == anchor_road_id and l != 0 and l * anchor_lane_id < 0:
+            if r == anchor_road_id and l != 0 and l == target_id:
                 return lane
         anchor_yaw = float((anchor_lane.get("start") or {}).get("yaw", 0.0) or 0.0)
         for lane in topology_sample:
@@ -2970,16 +3158,6 @@ def _select_semantic_lane(
                 continue
             ly = float((lane.get("start") or {}).get("yaw", 0.0) or 0.0)
             if abs(((ly - anchor_yaw + 180) % 360) - 180) > 135:
-                return lane
-        return anchor_lane
-
-    # Right adjacent lane: same road, lane_id one step more negative.
-    if lane_index == 1 and lane_side == "right_lane":
-        target_id = _target_lane_id_for_index(anchor_lane_id, lane_index)
-        for lane in topology_sample:
-            r = int(lane.get("road_id", -9999) or -9999)
-            l = int(lane.get("lane_id", 0) or 0)
-            if r == anchor_road_id and l == target_id:
                 return lane
         return anchor_lane
 
@@ -3083,6 +3261,10 @@ def _refine_pairwise_relation(
             mover = entity if _solve_priority(entity) > _solve_priority(other) else other
             delta = target_gap - current_gap + 0.1
             _shift_entity_longitudinal(mover, anchor_lane, -delta if mover is entity else delta)
+    elif expected_longitudinal == "aligned_with_other":
+        delta = longitudinal_b - longitudinal_a
+        if abs(delta) > 0.05:
+            _shift_entity_longitudinal(entity, anchor_lane, delta)
 
     if strength == "validation_only" or expected_lateral == "same_lateral_band":
         return
@@ -3891,6 +4073,20 @@ def _should_project_to_junction_lane(entity: Dict[str, Any]) -> bool:
     return str(projected_lane.get("source") or "").lower() == "junction_leg"
 
 
+def _should_preserve_parking_xy(entity: Dict[str, Any]) -> bool:
+    if str(entity.get("spawn_kind") or "vehicle") != "vehicle":
+        return False
+    lane_side = str(entity.get("lane_side_relation") or "")
+    placement_hint = _canonical_placement_mode_hint(
+        entity.get("placement_mode_hint"),
+        _canonical_actor_group_type(entity.get("actor_group_type")),
+    )
+    return placement_hint == "parking_lane_actor" or lane_side in {
+        "left_parking_lane",
+        "right_parking_lane",
+    }
+
+
 def build_projected_spawn_payload(projected_coordinates: Dict[str, Any]) -> Dict[str, Any]:
     payload = {"entities": []}
     aligned_entities = _coerce_list(projected_coordinates.get("entities"))
@@ -3904,8 +4100,15 @@ def build_projected_spawn_payload(projected_coordinates: Dict[str, Any]) -> Dict
         flow_compliance = _canonical_flow_compliance(entity.get("flow_compliance"))
         opposing_lane_from_median = None
         placement_mode = "project_to_lane"
+        actor_group_type = _canonical_actor_group_type(entity.get("actor_group_type"))
+        placement_hint = _canonical_placement_mode_hint(
+            entity.get("placement_mode_hint"),
+            actor_group_type,
+        )
         if category in {"cone_group", "barrier_group"}:
             placement_mode = "direct"
+        elif _should_preserve_parking_xy(entity):
+            placement_mode = "project_to_parking_lane"
         elif spawn_kind == "vehicle" and _should_project_to_junction_lane(entity):
             placement_mode = "project_to_junction_lane"
         elif (
@@ -3919,6 +4122,8 @@ def build_projected_spawn_payload(projected_coordinates: Dict[str, Any]) -> Dict
             placement_mode = "project_to_opposing_lane"
             opposing_lane_from_median = max(1, abs(lane_index) - min_opposing_abs + 1)
         explicit_color = preferred_vehicle_color(entity)
+        projected_lane = _coerce_dict(entity.get("projected_lane"))
+
         payload_entity = {
             "id": entity["id"],
             "spawn_kind": spawn_kind,
@@ -3930,19 +4135,16 @@ def build_projected_spawn_payload(projected_coordinates: Dict[str, Any]) -> Dict
             "original_heading_relation": entity.get("original_heading_relation"),
             "flow_compliance": flow_compliance,
             "motion_state": str(entity.get("motion_state") or "unknown"),
-            "projected_lane": _coerce_dict(entity.get("projected_lane")),
+            "projected_lane": projected_lane,
             "junction_direction": str(entity.get("junction_direction") or ""),
             "junction_leg": str(entity.get("junction_leg") or ""),
             "junction_motion": str(entity.get("junction_motion") or ""),
             "junction_distance_m": entity.get("junction_distance_m"),
-            "actor_group_type": _canonical_actor_group_type(entity.get("actor_group_type")),
+            "actor_group_type": actor_group_type,
             "actor_group_id": entity.get("actor_group_id"),
             "group_order_index": entity.get("group_order_index"),
             "group_order_rule": entity.get("group_order_rule"),
-            "placement_mode_hint": _canonical_placement_mode_hint(
-                entity.get("placement_mode_hint"),
-                _canonical_actor_group_type(entity.get("actor_group_type")),
-            ),
+            "placement_mode_hint": placement_hint,
             "density_role": entity.get("density_role"),
             "longitudinal_relation": entity.get("longitudinal_relation"),
             "longitudinal_proximity": entity.get("longitudinal_proximity"),

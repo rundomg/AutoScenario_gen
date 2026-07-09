@@ -520,6 +520,123 @@ def _autoscenario_project_vehicle_to_specific_lane(
     )
 
 
+def _autoscenario_waypoint_matches_lane(waypoint, road_id, lane_id):
+    if waypoint is None:
+        return False
+    try:
+        return int(waypoint.road_id) == int(road_id) and int(waypoint.lane_id) == int(lane_id)
+    except Exception:
+        return False
+
+
+def _autoscenario_lane_is_parking(waypoint):
+    if waypoint is None:
+        return False
+    try:
+        return waypoint.lane_type == carla.LaneType.Parking
+    except Exception:
+        return "parking" in str(getattr(waypoint, "lane_type", "")).lower()
+
+
+def _autoscenario_find_adjacent_waypoint_by_id(seed_waypoint, road_id, lane_id, max_depth=8):
+    if seed_waypoint is None:
+        return None
+    queue = [(seed_waypoint, 0)]
+    visited = set()
+    while queue:
+        waypoint, depth = queue.pop(0)
+        try:
+            key = (int(waypoint.road_id), int(waypoint.lane_id))
+        except Exception:
+            key = (id(waypoint), depth)
+        if key in visited:
+            continue
+        visited.add(key)
+        if _autoscenario_waypoint_matches_lane(waypoint, road_id, lane_id):
+            return waypoint
+        if depth >= max_depth:
+            continue
+        for getter in ("get_left_lane", "get_right_lane"):
+            try:
+                nxt = getattr(waypoint, getter)()
+            except Exception:
+                nxt = None
+            if nxt is not None:
+                queue.append((nxt, depth + 1))
+    return None
+
+
+def _autoscenario_get_waypoint_for_lane_type(location, lane_type):
+    try:
+        world_map = world.get_map()
+    except Exception:
+        return None
+    try:
+        if lane_type is not None:
+            return world_map.get_waypoint(
+                location,
+                project_to_road=True,
+                lane_type=lane_type,
+            )
+        return world_map.get_waypoint(location, project_to_road=True)
+    except TypeError:
+        try:
+            return world_map.get_waypoint(location, True)
+        except Exception:
+            return None
+    except Exception:
+        return None
+
+
+def _autoscenario_project_vehicle_to_parking_lane(location, rotation, projected_lane=None):
+    base_location = _autoscenario_to_location(location)
+    base_rotation = _autoscenario_to_rotation(rotation)
+    projected_lane = projected_lane if isinstance(projected_lane, dict) else {}
+
+    target_road_id = projected_lane.get("road_id")
+    target_lane_id = projected_lane.get("lane_id")
+    parking_type = getattr(carla.LaneType, "Parking", None)
+    driving_type = getattr(carla.LaneType, "Driving", None)
+
+    waypoint = _autoscenario_get_waypoint_for_lane_type(base_location, parking_type)
+    if target_road_id is not None and target_lane_id is not None:
+        if not (
+            _autoscenario_waypoint_matches_lane(waypoint, target_road_id, target_lane_id)
+            and _autoscenario_lane_is_parking(waypoint)
+        ):
+            if not _autoscenario_lane_is_parking(waypoint):
+                seed = waypoint or _autoscenario_get_waypoint_for_lane_type(base_location, driving_type)
+                waypoint = _autoscenario_find_adjacent_waypoint_by_id(
+                    seed,
+                    target_road_id,
+                    target_lane_id,
+                )
+        if not _autoscenario_lane_is_parking(waypoint):
+            waypoint = None
+
+    if waypoint is None:
+        return base_location, base_rotation
+
+    snapped_location = waypoint.transform.location
+    waypoint_yaw = float(waypoint.transform.rotation.yaw)
+    try:
+        yaw_reference = float(projected_lane.get("yaw"))
+    except Exception:
+        yaw_reference = float(base_rotation.yaw)
+    snapped_yaw = min(
+        [waypoint_yaw, waypoint_yaw + 180.0],
+        key=lambda yaw_value: _autoscenario_angle_distance(yaw_value, yaw_reference),
+    )
+    return (
+        carla.Location(snapped_location.x, snapped_location.y, snapped_location.z + 0.35),
+        carla.Rotation(
+            float(base_rotation.pitch),
+            _autoscenario_normalize_yaw(snapped_yaw),
+            float(base_rotation.roll),
+        ),
+    )
+
+
 def _autoscenario_collect_vehicle_spawn_candidates(location, rotation):
     base_location = _autoscenario_to_location(location)
     base_rotation = _autoscenario_to_rotation(rotation)
@@ -667,9 +784,16 @@ def _autoscenario_collect_strict_lane_spawn_candidates(location, rotation):
     return candidates
 
 
-def _autoscenario_try_spawn_vehicle_actor_strict_lane(blueprint, location, rotation):
+def _autoscenario_try_spawn_vehicle_actor_strict_lane(
+    blueprint, location, rotation, min_spacing_m=None
+):
     if blueprint is None:
         return None
+    min_spacing = (
+        _autoscenario_min_spawn_spacing_for_blueprint(blueprint)
+        if min_spacing_m is None
+        else float(min_spacing_m)
+    )
 
     for candidate_location, candidate_rotation in _autoscenario_collect_strict_lane_spawn_candidates(
         location,
@@ -677,7 +801,7 @@ def _autoscenario_try_spawn_vehicle_actor_strict_lane(blueprint, location, rotat
     ):
         if not _autoscenario_spawn_location_is_clear(
             candidate_location,
-            _autoscenario_min_spawn_spacing_for_blueprint(blueprint),
+            min_spacing,
         ):
             continue
         actor = world.try_spawn_actor(
@@ -785,12 +909,37 @@ def _autoscenario_spawn_vehicle_junction_lane(
     )
     if snapped_location is None or snapped_rotation is None:
         return None
+    if isinstance(projected_lane, dict) and projected_lane.get("preserve_input_yaw"):
+        snapped_rotation.yaw = float(_autoscenario_to_rotation(rotation).yaw)
     _autoscenario_record_focus_point(snapped_location)
     bp = _autoscenario_pick_blueprint("vehicle", blueprint_name)
     _autoscenario_apply_vehicle_color(bp, color)
     _autoscenario_apply_role_name(bp, role_name)
     return _autoscenario_try_spawn_vehicle_actor_strict_lane(
-        bp, snapped_location, snapped_rotation
+        bp, snapped_location, snapped_rotation, 0.5
+    )
+
+
+def _autoscenario_spawn_vehicle_parking_lane(
+    blueprint_name,
+    location,
+    rotation,
+    projected_lane=None,
+    color=None,
+    role_name=None,
+):
+    snapped_location, snapped_rotation = _autoscenario_project_vehicle_to_parking_lane(
+        location, rotation, projected_lane
+    )
+    _autoscenario_record_focus_point(snapped_location)
+    bp = _autoscenario_pick_blueprint("vehicle", blueprint_name)
+    _autoscenario_apply_vehicle_color(bp, color)
+    _autoscenario_apply_role_name(bp, role_name)
+    return _autoscenario_try_spawn_vehicle_actor_strict_lane(
+        bp,
+        snapped_location,
+        snapped_rotation,
+        3.5,
     )
 
 

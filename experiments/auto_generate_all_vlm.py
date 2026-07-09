@@ -41,7 +41,10 @@ from tools.structured_pipeline import (
     compute_cache_longitudinal_slide,
     slide_anchor_along_segment,
 )
-from tools.junction_placement import reproject_actors_for_structure
+from tools.junction_placement import (
+    reproject_actors_for_structure,
+    validate_structural_reprojection,
+)
 from tools.actor_graph_verifier import (
     build_render_actor_graph_from_spawn_payload,
     build_source_actor_graph,
@@ -75,6 +78,7 @@ class AutoGenerator:
         self.debug_artifacts = info_dict.get("debug_artifacts", False)
         self.merge_user_description = info_dict.get("merge_user_description", True)
         self.enable_scene_verify = info_dict.get("enable_scene_verify", False)
+        self.generate_quick_bev_preview = info_dict.get("generate_quick_bev_preview", True)
         self.legacy_actor_layout = bool(info_dict.get("legacy_actor_layout", False))
         self.verify_max_rounds = int(info_dict.get("verify_max_rounds", 2))
         self.verify_min_score = float(info_dict.get("verify_min_score", 0.70))
@@ -405,6 +409,9 @@ class AutoGenerator:
     def _bev_path(self, scene_id: str, round_index: int) -> str:
         return join(self.output_folder, f"{scene_id}_bev_r{round_index}.png")
 
+    def _quick_bev_path(self, scene_id: str) -> str:
+        return join(self.output_folder, f"{scene_id}_quick_bev.png")
+
     def _ego_view_path(self, scene_id: str, round_index: int) -> str:
         return join(self.output_folder, f"{scene_id}_ego_r{round_index}.png")
 
@@ -660,6 +667,17 @@ class AutoGenerator:
                 self._require_junction_structure("Junction actor layout")
             return refined
         refined = reproject_actors_for_structure(refined, matched_structure)
+        structural_validation = validate_structural_reprojection(refined)
+        refined.setdefault("metadata", {})["structural_validation"] = {
+            "status": structural_validation.get("status"),
+            "summary": structural_validation.get("summary", {}),
+        }
+        if structural_validation.get("status") == "fail":
+            print(
+                "  [structural_validation] failed: "
+                f"{structural_validation.get('summary', {}).get('failed', 0)} issue(s)"
+            )
+        self._write_debug_json(scene_id, "structural_validation", structural_validation)
         self._write_debug_json(scene_id, "coordinates_structural_reprojected", refined)
         return refined
 
@@ -1467,6 +1485,81 @@ class AutoGenerator:
             "error": "Final scene script completed but did not produce ego-view or BEV image.",
         }
 
+    def _capture_quick_bev_preview(
+        self,
+        scene_id: str,
+        final_scene_path: str,
+    ) -> dict:
+        preview_path = self._quick_bev_path(scene_id)
+        if not self.generate_quick_bev_preview:
+            return {
+                "enabled": False,
+                "bev_path": None,
+                "error": "Quick BEV preview disabled.",
+            }
+        if not self.require_carla_connection:
+            return {
+                "enabled": True,
+                "bev_path": None,
+                "error": "CARLA connection disabled (require_carla_connection=False).",
+            }
+        if (self.carla_spawn_context or {}).get("status") == "unavailable":
+            return {
+                "enabled": True,
+                "bev_path": None,
+                "error": (self.carla_spawn_context or {}).get(
+                    "failure_reason",
+                    "CARLA connection unavailable.",
+                ),
+            }
+
+        try:
+            if os.path.exists(preview_path):
+                os.remove(preview_path)
+        except Exception:
+            pass
+
+        env = os.environ.copy()
+        env["AUTOSCENARIO_BEV_OUTPUT"] = preview_path
+        env.setdefault("AUTOSCENARIO_BEV_SIZE", "1024")
+        env.setdefault("AUTOSCENARIO_BEV_HEIGHT", "80")
+        try:
+            completed = subprocess.run(
+                [sys.executable, final_scene_path],
+                cwd=self.output_folder,
+                env=env,
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=self.verify_script_timeout,
+            )
+        except Exception as exc:
+            return {
+                "enabled": True,
+                "bev_path": None,
+                "error": f"Failed to run final scene script for quick BEV preview: {exc}",
+            }
+
+        if completed.returncode != 0:
+            stderr = (completed.stderr or completed.stdout or "").strip()
+            return {
+                "enabled": True,
+                "bev_path": None,
+                "error": f"Final scene script exited with {completed.returncode}: {stderr}",
+            }
+        if not os.path.exists(preview_path):
+            return {
+                "enabled": True,
+                "bev_path": None,
+                "error": "Final scene script completed but did not produce quick BEV preview.",
+            }
+        shutil.copyfile(preview_path, join(self.output_folder, "image.png"))
+        return {
+            "enabled": True,
+            "bev_path": preview_path,
+            "error": None,
+        }
+
     def _write_verification_skipped(
         self,
         scene_id: str,
@@ -2184,6 +2277,12 @@ class AutoGenerator:
     @staticmethod
     def _spawn_min_spacing(entity: dict) -> float:
         category = str(entity.get("category") or "")
+        if AutoGenerator._is_parking_spawn_entity(entity):
+            if category in {"truck", "bus"}:
+                return 5.0
+            if category in {"motorcycle", "bicycle"}:
+                return 2.0
+            return 3.5
         if category in {"truck", "bus"}:
             return 7.0
         if category == "car":
@@ -2193,6 +2292,21 @@ class AutoGenerator:
         if category == "pedestrian":
             return 0.8
         return 2.5
+
+    @staticmethod
+    def _is_parking_spawn_entity(entity: dict) -> bool:
+        lane_side = str(entity.get("lane_side_relation") or "")
+        placement_hint = str(entity.get("placement_mode_hint") or "")
+        placement_mode = str(entity.get("placement_mode") or "")
+        actor_group_type = str(entity.get("actor_group_type") or "")
+        motion_state = str(entity.get("motion_state") or "")
+        return (
+            "parking" in lane_side
+            or placement_hint == "parking_lane_actor"
+            or placement_mode == "project_to_parking_lane"
+            or actor_group_type == "parking_row"
+            or (motion_state == "parked" and lane_side in {"left_edge", "right_edge"})
+        )
 
     def _post_repair_spawn_payload_layout(self, spawn_payload: dict) -> None:
         entities = spawn_payload.get("entities") or []
@@ -2684,8 +2798,9 @@ class AutoGenerator:
         refined = self.reproject_junction_step(scene_id, refined)
         self.build_spawn_payload_from_match_or_fallback(scene_id, refined, match_report_path)
         final_scene_path = self.generate_final_scene_script(scene_id, match_report_path)
+        repair_summary = None
         if self.enable_scene_verify:
-            self.verify_and_repair_spawn_layout(
+            repair_summary = self.verify_and_repair_spawn_layout(
                 scene_id,
                 image_path,
                 user_scene_description,
@@ -2697,10 +2812,21 @@ class AutoGenerator:
             )
         else:
             print("Spawn layout verify-repair skipped.")
+        quick_bev = self._capture_quick_bev_preview(scene_id, final_scene_path)
         print(f"  Scene match report: {match_report_path}")
         print(f"  Spawn script:       {final_scene_path}")
         if self.enable_scene_verify:
             print(f"  Repair summary:     {self._spawn_layout_repair_summary_path(scene_id)}")
+        if quick_bev.get("bev_path"):
+            print(f"  Quick BEV preview:  {quick_bev['bev_path']}")
+        elif quick_bev.get("error"):
+            print(f"  Quick BEV preview:  skipped ({quick_bev['error']})")
+        if repair_summary is not None:
+            repair_summary["quick_bev_preview"] = quick_bev
+            write_to_file(
+                self._spawn_layout_repair_summary_path(scene_id),
+                json.dumps(repair_summary, indent=2, sort_keys=True, ensure_ascii=False),
+            )
 
     def generate_interpretation(self, user_request, input_dict):
         """
@@ -2797,7 +2923,7 @@ if __name__ == "__main__":
             )
             print(f"Generated scene understanding: {auto_generator._scene_understanding_path(scene_id)}")
 
-            # Collect up to top-3 candidate map regions via progressive blacklisting.
+            # Collect candidate map regions. Increase num_candidates for alternatives.
             num_candidates = 1
             candidate_matches: list = []  # list of (cand_scene_id, match_report_path)
             blacklist: list = []
