@@ -5350,6 +5350,8 @@ class TestGenerationPipelineHelpers(unittest.TestCase):
     def test_v2_cache_open_road_rejects_junction_and_selects_open_candidate(self):
         with tempfile.TemporaryDirectory() as tmp:
             cache = {
+                "schema_version": 2,
+                "feature_set": "physical-junction-arms-v1",
                 "world_name": "FakeTown",
                 "candidates": [
                     {
@@ -5409,6 +5411,8 @@ class TestGenerationPipelineHelpers(unittest.TestCase):
     def test_v2_cache_open_road_rejects_parking_lane_when_target_has_none(self):
         with tempfile.TemporaryDirectory() as tmp:
             cache = {
+                "schema_version": 2,
+                "feature_set": "physical-junction-arms-v1",
                 "world_name": "FakeTown",
                 "candidates": [
                     {
@@ -5581,6 +5585,8 @@ class TestGenerationPipelineHelpers(unittest.TestCase):
     def test_v2_cache_open_road_prefers_expected_parking_side(self):
         with tempfile.TemporaryDirectory() as tmp:
             cache = {
+                "schema_version": 2,
+                "feature_set": "physical-junction-arms-v1",
                 "world_name": "FakeTown",
                 "candidates": [
                     {
@@ -5667,6 +5673,8 @@ class TestGenerationPipelineHelpers(unittest.TestCase):
     def test_v2_cache_junction_parking_lane_does_not_hard_reject_candidate(self):
         with tempfile.TemporaryDirectory() as tmp:
             cache = {
+                "schema_version": 2,
+                "feature_set": "physical-junction-arms-v1",
                 "world_name": "FakeTown",
                 "candidates": [
                     {
@@ -5933,6 +5941,8 @@ class TestGenerationPipelineHelpers(unittest.TestCase):
     def test_v2_cache_does_not_match_when_only_rejected_candidate_exists(self):
         with tempfile.TemporaryDirectory() as tmp:
             cache = {
+                "schema_version": 2,
+                "feature_set": "physical-junction-arms-v1",
                 "world_name": "FakeTown",
                 "candidates": [
                     {

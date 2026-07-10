@@ -144,6 +144,47 @@ Use uncertainty conservatively: when evidence is insufficient, use unknown/low c
         self.road_scene_prompt = """
 You inspect one traffic image for road-scene structure.
 
+
+
+Road-network contract:
+- Fill road_network.map_matching with topology_type, junction_visible, junction_type,
+  junction_branches, target_branch_count, forward_lane_count, opposing_lane_count,
+  driving_lane_count, has_center_median, has_crosswalk, has_traffic_light,
+  curve_direction, ego_lane_from_right, ego_to_junction_distance_m,
+  left_parking_presence, and right_parking_presence.
+- Fill road_network.lane_groups with the same travel-lane counts plus
+  left_parking_lane_count and right_parking_lane_count. Keep map_matching
+  parking presence consistent with lane_groups: count > 0 means presence=true;
+  count == 0 means presence=false.
+- Classify junction only from visible road-geometry branches. Do not classify as
+  junction because of traffic lights, crosswalks, stop lines, traffic signs, lane
+  arrows, roadside entrances, driveways, parking-lot mouths, or crossing vehicles.
+- If the main visible road body is straight and no left/right branch road is clearly
+  visible, set topology_type=straight_road, junction_visible=false, junction_type=none,
+  and junction_branches={"ahead": false, "left": false, "right": false, "known": false},
+  even if traffic lights or crosswalks are visible ahead.
+- Do not upgrade a straight road into a junction without visible branch-road geometry.
+- On undivided two-way straight/open urban roads, apply parking symmetry: if one
+  curb has curbside parked vehicles, set both left_parking_lane_count and
+  right_parking_lane_count to 1 unless the opposite curb clearly cannot support
+  parking. Do not treat "not evident", weak visibility, or occlusion as hard
+  absence.
+- When no curbside parking lane is visible, explicitly set
+  left_parking_lane_count=0, right_parking_lane_count=0,
+  left_parking_presence=false, and right_parking_presence=false.
+
+Actor-layout frame contract:
+- Do not output vehicle actors in traffic_subjects.
+- Do not output vehicle orientation; that is handled by the vehicle crop pass.
+- For junctions, output actor_layout anchors for junction_center, ego_approach,
+  left_arm, right_arm, ahead_arm, and oncoming_arm only when applicable.
+- For open roads, actor_layout may describe global_anchor and lane-frame hints only.
+- metadata.ego_localization is strongly preferred.
+- metadata.ego_localization must include ego_lane_confidence and a short
+  ego_lane_evidence string. Use ego_lane_from_right=null when lane boundaries
+  cannot support a confident count.
+
+
 Output JSON only:
 {
   "road_scene_brief": {
@@ -195,44 +236,6 @@ Output JSON only:
   },
   "metadata": {}
 }
-
-Road-network contract:
-- Fill road_network.map_matching with topology_type, junction_visible, junction_type,
-  junction_branches, target_branch_count, forward_lane_count, opposing_lane_count,
-  driving_lane_count, has_center_median, has_crosswalk, has_traffic_light,
-  curve_direction, ego_lane_from_right, ego_to_junction_distance_m,
-  left_parking_presence, and right_parking_presence.
-- Fill road_network.lane_groups with the same travel-lane counts plus
-  left_parking_lane_count and right_parking_lane_count. Keep map_matching
-  parking presence consistent with lane_groups: count > 0 means presence=true;
-  count == 0 means presence=false.
-- Classify junction only from visible road-geometry branches. Do not classify as
-  junction because of traffic lights, crosswalks, stop lines, traffic signs, lane
-  arrows, roadside entrances, driveways, parking-lot mouths, or crossing vehicles.
-- If the main visible road body is straight and no left/right branch road is clearly
-  visible, set topology_type=straight_road, junction_visible=false, junction_type=none,
-  and junction_branches={"ahead": false, "left": false, "right": false, "known": false},
-  even if traffic lights or crosswalks are visible ahead.
-- Do not upgrade a straight road into a junction without visible branch-road geometry.
-- On undivided two-way straight/open urban roads, apply parking symmetry: if one
-  curb has curbside parked vehicles, set both left_parking_lane_count and
-  right_parking_lane_count to 1 unless the opposite curb clearly cannot support
-  parking. Do not treat "not evident", weak visibility, or occlusion as hard
-  absence.
-- When no curbside parking lane is visible, explicitly set
-  left_parking_lane_count=0, right_parking_lane_count=0,
-  left_parking_presence=false, and right_parking_presence=false.
-
-Actor-layout frame contract:
-- Do not output vehicle actors in traffic_subjects.
-- Do not output vehicle orientation; that is handled by the vehicle crop pass.
-- For junctions, output actor_layout anchors for junction_center, ego_approach,
-  left_arm, right_arm, ahead_arm, and oncoming_arm only when applicable.
-- For open roads, actor_layout may describe global_anchor and lane-frame hints only.
-- metadata.ego_localization is strongly preferred.
-- metadata.ego_localization must include ego_lane_confidence and a short
-  ego_lane_evidence string. Use ego_lane_from_right=null when lane boundaries
-  cannot support a confident count.
         """
 
     @staticmethod

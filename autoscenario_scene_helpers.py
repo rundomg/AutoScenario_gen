@@ -12,6 +12,11 @@ except ImportError:
 _AUTOSCENARIO_SPAWNED_ACTORS = []
 _AUTOSCENARIO_FOCUS_POINTS = []
 _AUTOSCENARIO_EXISTING_VEHICLES = []
+_AUTOSCENARIO_PARKING_PROJECTION_RESULTS = {}
+_AUTOSCENARIO_LAST_PARKING_PROJECTION_RESULT = {
+    "result": "unavailable",
+    "lane": None,
+}
 
 _AUTOSCENARIO_VEHICLE_BLUEPRINTS = {
     "bike": [
@@ -65,6 +70,7 @@ def _autoscenario_init(w, bl):
     global world, blueprint_library
     world = w
     blueprint_library = bl
+    _AUTOSCENARIO_PARKING_PROJECTION_RESULTS.clear()
 
 
 def _autoscenario_normalize_key(value):
@@ -566,6 +572,65 @@ def _autoscenario_find_adjacent_waypoint_by_id(seed_waypoint, road_id, lane_id, 
     return None
 
 
+def _autoscenario_find_adjacent_parking_waypoint(seed_waypoint, road_id=None, max_depth=8):
+    if seed_waypoint is None:
+        return None
+    queue = [(seed_waypoint, 0)]
+    visited = set()
+    while queue:
+        waypoint, depth = queue.pop(0)
+        try:
+            key = (int(waypoint.road_id), int(waypoint.lane_id))
+        except Exception:
+            key = (id(waypoint), depth)
+        if key in visited:
+            continue
+        visited.add(key)
+        same_road = road_id is None
+        try:
+            same_road = same_road or int(waypoint.road_id) == int(road_id)
+        except Exception:
+            pass
+        if same_road and _autoscenario_lane_is_parking(waypoint):
+            return waypoint
+        if depth >= max_depth:
+            continue
+        for getter in ("get_left_lane", "get_right_lane"):
+            try:
+                nxt = getattr(waypoint, getter)()
+            except Exception:
+                nxt = None
+            if nxt is not None:
+                queue.append((nxt, depth + 1))
+    return None
+
+
+def _autoscenario_rightmost_same_direction_driving_waypoint(seed_waypoint, max_depth=8):
+    if seed_waypoint is None or not _autoscenario_lane_is_driving(seed_waypoint):
+        return None
+    current = seed_waypoint
+    try:
+        base_yaw = float(current.transform.rotation.yaw)
+    except Exception:
+        base_yaw = None
+    for _ in range(max_depth):
+        try:
+            candidate = current.get_right_lane()
+        except Exception:
+            candidate = None
+        if candidate is None or not _autoscenario_lane_is_driving(candidate):
+            break
+        if base_yaw is not None:
+            try:
+                candidate_yaw = float(candidate.transform.rotation.yaw)
+                if _autoscenario_angle_distance(candidate_yaw, base_yaw) > 45.0:
+                    break
+            except Exception:
+                pass
+        current = candidate
+    return current
+
+
 def _autoscenario_get_waypoint_for_lane_type(location, lane_type):
     try:
         world_map = world.get_map()
@@ -588,7 +653,13 @@ def _autoscenario_get_waypoint_for_lane_type(location, lane_type):
         return None
 
 
-def _autoscenario_project_vehicle_to_parking_lane(location, rotation, projected_lane=None):
+def _autoscenario_project_vehicle_to_parking_lane(
+    location,
+    rotation,
+    projected_lane=None,
+    lane_side_relation=None,
+):
+    global _AUTOSCENARIO_LAST_PARKING_PROJECTION_RESULT
     base_location = _autoscenario_to_location(location)
     base_rotation = _autoscenario_to_rotation(rotation)
     projected_lane = projected_lane if isinstance(projected_lane, dict) else {}
@@ -599,22 +670,41 @@ def _autoscenario_project_vehicle_to_parking_lane(location, rotation, projected_
     driving_type = getattr(carla.LaneType, "Driving", None)
 
     waypoint = _autoscenario_get_waypoint_for_lane_type(base_location, parking_type)
-    if target_road_id is not None and target_lane_id is not None:
-        if not (
-            _autoscenario_waypoint_matches_lane(waypoint, target_road_id, target_lane_id)
-            and _autoscenario_lane_is_parking(waypoint)
-        ):
-            if not _autoscenario_lane_is_parking(waypoint):
-                seed = waypoint or _autoscenario_get_waypoint_for_lane_type(base_location, driving_type)
-                waypoint = _autoscenario_find_adjacent_waypoint_by_id(
-                    seed,
-                    target_road_id,
-                    target_lane_id,
-                )
-        if not _autoscenario_lane_is_parking(waypoint):
+    if _autoscenario_lane_is_parking(waypoint) and target_road_id is not None:
+        try:
+            if int(waypoint.road_id) != int(target_road_id):
+                waypoint = None
+        except Exception:
             waypoint = None
 
+    driving_seed = _autoscenario_get_waypoint_for_lane_type(base_location, driving_type)
+    if target_road_id is not None and target_lane_id is not None:
+        exact_seed = _autoscenario_find_adjacent_waypoint_by_id(
+            driving_seed,
+            target_road_id,
+            target_lane_id,
+        )
+        if exact_seed is not None:
+            driving_seed = exact_seed
+
+    if not _autoscenario_lane_is_parking(waypoint):
+        waypoint = _autoscenario_find_adjacent_parking_waypoint(
+            driving_seed,
+            target_road_id,
+        )
+
+    projection_result = "parking_lane"
+    if waypoint is None and str(lane_side_relation or "") == "right_parking_lane":
+        waypoint = _autoscenario_rightmost_same_direction_driving_waypoint(
+            driving_seed
+        )
+        projection_result = "rightmost_driving_fallback"
+
     if waypoint is None:
+        _AUTOSCENARIO_LAST_PARKING_PROJECTION_RESULT = {
+            "result": "unavailable",
+            "lane": None,
+        }
         return base_location, base_rotation
 
     snapped_location = waypoint.transform.location
@@ -627,6 +717,17 @@ def _autoscenario_project_vehicle_to_parking_lane(location, rotation, projected_
         [waypoint_yaw, waypoint_yaw + 180.0],
         key=lambda yaw_value: _autoscenario_angle_distance(yaw_value, yaw_reference),
     )
+    try:
+        projection_lane = {
+            "road_id": int(waypoint.road_id),
+            "lane_id": int(waypoint.lane_id),
+        }
+    except Exception:
+        projection_lane = None
+    _AUTOSCENARIO_LAST_PARKING_PROJECTION_RESULT = {
+        "result": projection_result,
+        "lane": projection_lane,
+    }
     return (
         carla.Location(snapped_location.x, snapped_location.y, snapped_location.z + 0.35),
         carla.Rotation(
@@ -927,10 +1028,20 @@ def _autoscenario_spawn_vehicle_parking_lane(
     projected_lane=None,
     color=None,
     role_name=None,
+    entity_id=None,
+    lane_side_relation=None,
 ):
     snapped_location, snapped_rotation = _autoscenario_project_vehicle_to_parking_lane(
-        location, rotation, projected_lane
+        location,
+        rotation,
+        projected_lane,
+        lane_side_relation=lane_side_relation,
     )
+    projection_key = str(entity_id or role_name or "")
+    if projection_key:
+        _AUTOSCENARIO_PARKING_PROJECTION_RESULTS[projection_key] = dict(
+            _AUTOSCENARIO_LAST_PARKING_PROJECTION_RESULT
+        )
     _autoscenario_record_focus_point(snapped_location)
     bp = _autoscenario_pick_blueprint("vehicle", blueprint_name)
     _autoscenario_apply_vehicle_color(bp, color)
@@ -1387,6 +1498,10 @@ def _autoscenario_capture_render_actor_graph_if_requested(spawn_payload, actor_b
             "projected_lane": entity.get("projected_lane") or {},
             "truth_source": "carla_actor_transform",
         }
+        parking_projection = _AUTOSCENARIO_PARKING_PROJECTION_RESULTS.get(entity_id)
+        if isinstance(parking_projection, dict):
+            record["parking_projection_result"] = parking_projection.get("result")
+            record["parking_projection_lane"] = parking_projection.get("lane")
         if actor is None:
             record["spawned"] = False
             record["spawn_failure_reason"] = "try_spawn_actor_returned_none_or_collision"

@@ -222,8 +222,11 @@ def build_render_actor_graph_from_spawn_payload(
                 entity.get("lane_index_relation"),
                 entity.get("lane_side_relation"),
             ),
-            "lane_side_relation": _lane_side_from_index(
-                _coerce_lane_index(entity.get("lane_index_relation"), entity.get("lane_side_relation"))
+            "lane_side_relation": str(
+                entity.get("lane_side_relation")
+                or _lane_side_from_index(
+                    _coerce_lane_index(entity.get("lane_index_relation"))
+                )
             ),
             "heading_relation_to_ego": str(entity.get("heading_relation") or "unknown"),
             "location": _coerce_dict(entity.get("location")),
@@ -283,8 +286,11 @@ def build_render_actor_graph_from_carla_records(
                 entity.get("lane_index_relation"),
                 entity.get("lane_side_relation"),
             ),
-            "lane_side_relation": _lane_side_from_index(
-                _coerce_lane_index(entity.get("lane_index_relation"), entity.get("lane_side_relation"))
+            "lane_side_relation": str(
+                entity.get("lane_side_relation")
+                or _lane_side_from_index(
+                    _coerce_lane_index(entity.get("lane_index_relation"))
+                )
             ),
             "truth_source": CARLA_TRUTH_SOURCE,
         }
@@ -299,6 +305,13 @@ def build_render_actor_graph_from_carla_records(
             })
             if isinstance(record.get("actual_waypoint"), dict):
                 actor["actual_waypoint"] = record.get("actual_waypoint")
+            if record.get("parking_projection_result"):
+                actor["parking_projection_result"] = str(
+                    record.get("parking_projection_result")
+                )
+                actor["parking_projection_lane"] = _coerce_dict(
+                    record.get("parking_projection_lane")
+                )
             longitudinal, lateral = _relative_metrics({"location": loc}, ego)
             actor["ego_frame"] = {
                 "longitudinal_m": round(longitudinal, 3),
@@ -664,9 +677,29 @@ def compare_actor_graphs(
             source_actor.get("lane_side_relation"),
         )
         source_heading = str(source_actor.get("heading_relation") or "unknown")
+        parking_fallback_lane = _coerce_dict(
+            render_actor.get("parking_projection_lane")
+        )
+        actual_waypoint = _coerce_dict(render_actor.get("actual_waypoint"))
+        parking_fallback_valid = (
+            str(render_actor.get("parking_projection_result") or "")
+            == "rightmost_driving_fallback"
+            and parking_fallback_lane.get("road_id") is not None
+            and parking_fallback_lane.get("lane_id") is not None
+            and str(parking_fallback_lane.get("road_id"))
+            == str(actual_waypoint.get("road_id"))
+            and str(parking_fallback_lane.get("lane_id"))
+            == str(actual_waypoint.get("lane_id"))
+        )
         if junction_local_frame:
             # Side-arm lane slots live in the arm's local frame. Structural
             # validation compares them; ego lateral metres are not comparable.
+            pass
+        elif parking_fallback_valid:
+            # The source semantic remains right_parking_lane, but the selected
+            # CARLA map has no usable Parking lane at this longitudinal point.
+            # An explicit, verified fallback to the rightmost same-direction
+            # Driving lane is an allowed reconstruction, not a lane mismatch.
             pass
         elif source_heading == "opposite_direction":
             # Oncoming actors live on the opposing carriageway across the median.

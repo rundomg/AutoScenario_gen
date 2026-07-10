@@ -179,7 +179,8 @@ secrets.json
 *.hdf5
 
 # Data files (if large)
-data/map_cache/
+kitti/
+data/
 *.csv
 *.json
 *.xml
@@ -192,3 +193,7 @@ data/map_cache/
 *.gif
 *.bmp
 *.tiff
+
+# Test and temporary files
+experiments/mono3d_eval/
+experiments/monocular_depth_eval/

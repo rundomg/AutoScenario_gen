@@ -633,6 +633,92 @@ class TestActorGraphVerifyRepairIntegration(unittest.TestCase):
             self.assertTrue(metadata["blocked_for_code_fix"])
             self.assertEqual(metadata["blocked_repairs"][0]["entity_id"], "car_1")
 
+    def test_right_parking_actor_ignores_generic_offlane_repair(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            generator = _make_generator(tmp)
+            scene_id, _relation_dsl, spawn_payload, _match_path = self._basic_inputs(tmp)
+            entity = spawn_payload["entities"][0]
+            entity.update(
+                {
+                    "lane_side_relation": "right_parking_lane",
+                    "placement_mode_hint": "parking_lane_actor",
+                    "placement_mode": "project_to_parking_lane",
+                }
+            )
+            original_location = dict(entity["location"])
+            Path(generator._spawn_payload_path(scene_id)).write_text(
+                json.dumps(spawn_payload),
+                encoding="utf-8",
+            )
+            report = {
+                "repair_actions": [
+                    {
+                        "type": "off_lane_spawn",
+                        "entity_id": "car_1",
+                        "nearest_waypoint": {
+                            "x": 99.0,
+                            "y": 99.0,
+                            "z": 0.0,
+                            "yaw": 0.0,
+                            "road_id": 76,
+                            "lane_id": -1,
+                        },
+                    }
+                ]
+            }
+
+            result = generator._apply_layout_repair_actions(scene_id, {}, report)
+            repaired = result["entities"][0]
+
+            self.assertEqual(repaired["location"], original_location)
+            self.assertEqual(repaired["placement_mode"], "project_to_parking_lane")
+            self.assertNotIn(
+                "off_lane_snap",
+                [
+                    item["type"]
+                    for item in result["repair_metadata"]["last_applied_repairs"]
+                ],
+            )
+
+    def test_valid_rightmost_driving_fallback_is_not_offlane(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            generator = _make_generator(tmp)
+            generator.carla_spawn_context = {
+                "dense_local_waypoints": [
+                    {"x": 0.0, "y": 0.0, "z": 0.0, "yaw": 0.0, "road_id": 76, "lane_id": -2}
+                ]
+            }
+            render_graph = {
+                "actors": [
+                    {
+                        "id": "car_1",
+                        "spawn_kind": "vehicle",
+                        "spawned": True,
+                        "location": {"x": 0.0, "y": 0.0, "z": 0.3},
+                        "actual_waypoint": {"road_id": 76, "lane_id": -2},
+                        "parking_projection_result": "rightmost_driving_fallback",
+                        "parking_projection_lane": {"road_id": 76, "lane_id": -2},
+                    }
+                ]
+            }
+            spawn_payload = {
+                "entities": [
+                    {
+                        "id": "car_1",
+                        "spawn_kind": "vehicle",
+                        "lane_side_relation": "right_parking_lane",
+                    }
+                ]
+            }
+
+            issues = generator._offlane_spawn_issues(
+                render_graph,
+                spawn_payload,
+                {"lane_width_m": 3.5},
+            )
+
+            self.assertEqual(issues, [])
+
 
 class TestFallbackCarlaSpawnContext(unittest.TestCase):
     def setUp(self):

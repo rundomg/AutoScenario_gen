@@ -957,6 +957,8 @@ class ExistingWorldScenarioGenerator(ScenarioGenerator):
             "            rotation,\n"
             "            entity.get('projected_lane'),\n"
             "            entity.get('color'),\n"
+            "            entity_id=entity_id,\n"
+            "            lane_side_relation=entity.get('lane_side_relation'),\n"
             "        )\n"
             "        if actor is not None and entity_id:\n"
             "            _autoscenario_actor_by_id[entity_id] = actor\n"
@@ -1069,6 +1071,8 @@ class ExistingWorldScenarioGenerator(ScenarioGenerator):
                                 entity.get('projected_lane'),
                                 entity.get('color'),
                                 role_name=role_name,
+                                entity_id=entity_id,
+                                lane_side_relation=entity.get('lane_side_relation'),
                             )
                         elif placement_mode == 'project_to_junction_lane':
                             actor = _autoscenario_spawn_vehicle_junction_lane(
@@ -1634,6 +1638,8 @@ class ExistingWorldScenarioGenerator(ScenarioGenerator):
                                 entity.get('projected_lane'),
                                 entity.get('color'),
                                 role_name=role_name,
+                                entity_id=entity_id,
+                                lane_side_relation=entity.get('lane_side_relation'),
                             )
                         elif placement_mode == 'project_to_junction_lane':
                             actor = _autoscenario_spawn_vehicle_junction_lane(

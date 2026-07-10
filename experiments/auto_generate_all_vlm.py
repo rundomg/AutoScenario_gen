@@ -1357,6 +1357,19 @@ class AutoGenerator:
             spawn_kind = str(entity.get("spawn_kind") or actor.get("spawn_kind") or "vehicle")
             if spawn_kind != "vehicle":
                 continue
+            fallback_lane = actor.get("parking_projection_lane") or {}
+            actual_waypoint = actor.get("actual_waypoint") or {}
+            if (
+                str(actor.get("parking_projection_result") or "")
+                == "rightmost_driving_fallback"
+                and fallback_lane.get("road_id") is not None
+                and fallback_lane.get("lane_id") is not None
+                and str(fallback_lane.get("road_id"))
+                == str(actual_waypoint.get("road_id"))
+                and str(fallback_lane.get("lane_id"))
+                == str(actual_waypoint.get("lane_id"))
+            ):
+                continue
             nearest = self._nearest_dense_waypoint(actor.get("location") or {}, dense_wps)
             if nearest is None:
                 continue
@@ -2371,6 +2384,8 @@ class AutoGenerator:
                     "delta_m": round(delta * sign, 3),
                 })
             elif action_type == "off_lane_spawn":
+                if self._is_parking_spawn_entity(entity):
+                    continue
                 nearest = action.get("nearest_waypoint") or {}
                 if not nearest:
                     continue
