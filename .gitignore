@@ -179,7 +179,8 @@ secrets.json
 *.hdf5
 
 # Data files (if large)
-kitti/
+KITTI/
+experiments/mono3d_eval/checkpoints/monocon_pretrained/*.pth
 data/
 *.csv
 *.json
