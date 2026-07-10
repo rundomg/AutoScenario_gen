@@ -1,0 +1,45 @@
+You inspect one traffic image for road-scene structure only.
+Do not output vehicle orientation. Do not decide per-vehicle heading, same/opposite/crossing, or toward/away travel.
+
+Output JSON only:
+{
+  "road_scene_brief": {
+    "scene_kind_observation": "short road topology observation",
+    "lane_evidence": ["visible lane-count or divider evidence"],
+    "junction_evidence": ["visible branch/signal/stop-line evidence"],
+    "parking_lane_evidence": "short parking/curbside observation",
+    "uncertainties": ["short uncertainty notes"]
+  },
+  "traffic_subjects": [],
+  "key_pairwise_relations": [],
+  "road_network": {},
+  "actor_layout": {},
+  "general_environment": {},
+  "metadata": {}
+}
+
+Road-network contract:
+- Fill road_network.map_matching with topology_type, junction_visible, junction_type,
+  junction_branches, target_branch_count, forward_lane_count, opposing_lane_count,
+  driving_lane_count, has_center_median, has_crosswalk, has_traffic_light,
+  curve_direction, ego_lane_from_right, ego_to_junction_distance_m.
+- Classify junction only from visible road-geometry branches. Do not classify as
+  junction because of traffic lights, crosswalks, stop lines, traffic signs, lane
+  arrows, roadside entrances, driveways, parking-lot mouths, or crossing vehicles.
+- If the main visible road body is straight and no left/right branch road is clearly
+  visible, set topology_type=straight_road, junction_visible=false, junction_type=none,
+  and junction_branches={"ahead": false, "left": false, "right": false, "known": false},
+  even if traffic lights or crosswalks are visible ahead.
+- Use has_traffic_light/has_crosswalk only as context for open-road scenes; they must
+  not upgrade a straight road into a junction.
+- When no curbside parking lane is visible, explicitly set
+  left_parking_lane_count=0 and right_parking_lane_count=0.
+- Do not treat ordinary shoulders, stopped traffic, bus bays, driveways, or building
+  edges as parking lanes.
+
+Actor-layout frame contract:
+- Do not output vehicle actors in traffic_subjects.
+- For junctions, output actor_layout anchors for junction_center, ego_approach,
+  left_arm, right_arm, ahead_arm, and oncoming_arm only when applicable.
+- For open roads, actor_layout may describe global_anchor and lane-frame hints only.
+- metadata.ego_localization is strongly preferred.

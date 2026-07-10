@@ -638,6 +638,7 @@ def reproject_actors_for_junction(
         entity["junction_leg"] = leg.name
         entity["junction_motion"] = motion
         entity["junction_distance_m"] = distance_m
+        entity["junction_lane_from_right"] = lane_slot
         entity["layout_version"] = entity.get("layout_version") or "v2"
         entity["layout_scene_kind"] = "junction"
         entity["placement_reason"] = "junction arm placement"

@@ -96,7 +96,12 @@ def _angle_distance(yaw_a: Any, yaw_b: Any) -> float:
 def _heading_relation(yaw: Any, ego_yaw: Any) -> str:
     if yaw is None or ego_yaw is None:
         return "unknown"
-    return "opposite_direction" if _angle_distance(yaw, ego_yaw) > 90.0 else "same_direction"
+    delta = _angle_distance(yaw, ego_yaw)
+    if delta <= 45.0:
+        return "same_direction"
+    if delta < 135.0:
+        return "crossing"
+    return "opposite_direction"
 
 
 def _relative_metrics(entity: Dict[str, Any], ego: Dict[str, Any]) -> Tuple[float, float]:
@@ -116,9 +121,15 @@ def _relative_metrics(entity: Dict[str, Any], ego: Dict[str, Any]) -> Tuple[floa
 def build_source_actor_graph(
     scene_understanding: Dict[str, Any],
     relation_dsl: Dict[str, Any],
+    spawn_payload: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Build a compact expected vehicle graph from relation DSL entities."""
     del scene_understanding  # relation_dsl already contains expanded actor semantics.
+    payload_by_id = {
+        str(item.get("id")): item
+        for item in _coerce_list(_coerce_dict(spawn_payload).get("entities"))
+        if isinstance(item, dict) and item.get("id")
+    }
     actors = []
     ignored = []
     for entity in _coerce_list(
@@ -140,7 +151,28 @@ def build_source_actor_graph(
             "distance_band": str(entity.get("distance_band") or "near"),
             "heading_relation": str(entity.get("heading_relation") or "unknown"),
             "visual_confidence": str(entity.get("visual_confidence") or "medium"),
+            "layout_anchor_id": str(entity.get("layout_anchor_id") or ""),
+            "anchor_relation": _coerce_dict(entity.get("anchor_relation")),
         }
+        payload_entity = payload_by_id.get(actor["id"], {})
+        if payload_entity:
+            actor["expected_longitudinal_m"] = payload_entity.get("longitudinal_m")
+            actor["junction_direction"] = str(
+                payload_entity.get("junction_direction") or ""
+            )
+            actor["junction_motion"] = str(
+                payload_entity.get("junction_motion") or ""
+            )
+            actor["junction_lane_from_right"] = payload_entity.get(
+                "junction_lane_from_right"
+            )
+            actor["layout_anchor_id"] = str(
+                payload_entity.get("layout_anchor_id") or actor["layout_anchor_id"]
+            )
+            actor["anchor_relation"] = _coerce_dict(
+                payload_entity.get("anchor_relation") or actor["anchor_relation"]
+            )
+        actor["lane_from_right"] = actor["anchor_relation"].get("lane_from_right")
         if actor["id"] and _is_vehicle_actor(actor):
             actors.append(actor)
         elif actor["id"]:
@@ -181,6 +213,11 @@ def build_render_actor_graph_from_spawn_payload(
             "blueprint_name": entity.get("blueprint_name"),
             "placement_mode": str(entity.get("placement_mode") or "project_to_lane"),
             "projected_lane": _coerce_dict(entity.get("projected_lane")),
+            "layout_anchor_id": str(entity.get("layout_anchor_id") or ""),
+            "anchor_relation": _coerce_dict(entity.get("anchor_relation")),
+            "junction_direction": str(entity.get("junction_direction") or ""),
+            "junction_motion": str(entity.get("junction_motion") or ""),
+            "junction_lane_from_right": entity.get("junction_lane_from_right"),
             "lane_index_relation": _coerce_lane_index(
                 entity.get("lane_index_relation"),
                 entity.get("lane_side_relation"),
@@ -237,6 +274,11 @@ def build_render_actor_graph_from_carla_records(
             "blueprint_name": entity.get("blueprint_name"),
             "placement_mode": str(entity.get("placement_mode") or "project_to_lane"),
             "projected_lane": _coerce_dict(entity.get("projected_lane")),
+            "layout_anchor_id": str(entity.get("layout_anchor_id") or ""),
+            "anchor_relation": _coerce_dict(entity.get("anchor_relation")),
+            "junction_direction": str(entity.get("junction_direction") or ""),
+            "junction_motion": str(entity.get("junction_motion") or ""),
+            "junction_lane_from_right": entity.get("junction_lane_from_right"),
             "lane_index_relation": _coerce_lane_index(
                 entity.get("lane_index_relation"),
                 entity.get("lane_side_relation"),
@@ -398,7 +440,15 @@ def _detect_systematic_issues(
     previous_plan: Optional[Dict[str, Any]],
 ) -> Tuple[bool, Optional[str]]:
     grouped: Dict[Tuple[str, str], set] = defaultdict(set)
+    systematic_types = {
+        "lane_side_mismatch",
+        "heading_mismatch",
+        "off_lane_spawn",
+        "spawn_failure",
+    }
     for item in issues:
+        if str(item.get("issue_type")) not in systematic_types:
+            continue
         direction = str(item.get("direction") or "")
         if not direction:
             continue
@@ -409,6 +459,8 @@ def _detect_systematic_issues(
 
     previous_issues = _coerce_list((previous_plan or {}).get("issues"))
     for item in issues:
+        if str(item.get("issue_type")) not in systematic_types:
+            continue
         if any(_same_previous_issue(item, prev) for prev in previous_issues):
             return True, f"{item.get('issue_type')}:{item.get('source_entity_id')}:repeated"
     return False, None
@@ -565,10 +617,11 @@ def compare_actor_graphs(
             actual_lane_id = actual_waypoint.get("lane_id")
             expected_yaw = expected_lane.get("yaw")
             actual_yaw = actual_waypoint.get("yaw")
+            # OpenDRIVE road ids can change at a connector boundary while the
+            # actor remains on the same physical junction leg.
             lane_matches = (
-                expected_road is not None
-                and expected_lane_id is not None
-                and str(expected_road) == str(actual_road)
+                expected_lane_id is not None
+                and actual_lane_id is not None
                 and str(expected_lane_id) == str(actual_lane_id)
             )
             yaw_matches = True
@@ -594,6 +647,14 @@ def compare_actor_graphs(
                     "actual_waypoint": actual_waypoint,
                 })
         render_ego = _coerce_dict(render_actor.get("ego_frame"))
+        layout_anchor = str(source_actor.get("layout_anchor_id") or "").lower()
+        junction_local_frame = layout_anchor in {
+            "left_arm",
+            "right_arm",
+            "ahead_arm",
+            "oncoming_arm",
+            "opposite_arm",
+        }
         render_lane_index = _coerce_lane_index(
             render_ego.get("lane_index_relation"),
             render_ego.get("lane_side_relation") or render_actor.get("lane_side_relation"),
@@ -603,7 +664,11 @@ def compare_actor_graphs(
             source_actor.get("lane_side_relation"),
         )
         source_heading = str(source_actor.get("heading_relation") or "unknown")
-        if source_heading == "opposite_direction":
+        if junction_local_frame:
+            # Side-arm lane slots live in the arm's local frame. Structural
+            # validation compares them; ego lateral metres are not comparable.
+            pass
+        elif source_heading == "opposite_direction":
             # Oncoming actors live on the opposing carriageway across the median.
             # Their exact lane index is not meaningful in the ego frame (the
             # divider adds lateral distance the VLM cannot count), so validate by
@@ -642,7 +707,34 @@ def compare_actor_graphs(
             ))
         source_band = str(source_actor.get("distance_band") or "")
         render_band = str(render_ego.get("distance_band") or "")
-        if source_band and render_band and source_band != render_band:
+        expected_longitudinal = source_actor.get("expected_longitudinal_m")
+        actual_longitudinal = render_ego.get("longitudinal_m")
+        longitudinal_mismatch = False
+        longitudinal_evidence = ""
+        if (
+            not junction_local_frame
+            and isinstance(expected_longitudinal, (int, float))
+            and isinstance(actual_longitudinal, (int, float))
+        ):
+            error_m = abs(float(expected_longitudinal) - float(actual_longitudinal))
+            longitudinal_mismatch = error_m > 3.0
+            longitudinal_evidence = (
+                f"{actor_id} longitudinal expected={float(expected_longitudinal):.2f}m "
+                f"actual={float(actual_longitudinal):.2f}m error={error_m:.2f}m"
+            )
+        elif source_band and render_band:
+            band_rank = {"immediate": 0, "near": 1, "mid": 2, "far": 3}
+            source_rank = band_rank.get(source_band)
+            render_rank = band_rank.get(render_band)
+            longitudinal_mismatch = (
+                source_rank is not None
+                and render_rank is not None
+                and abs(source_rank - render_rank) >= 2
+            )
+            longitudinal_evidence = (
+                f"{actor_id} distance band source={source_band} render={render_band}"
+            )
+        if longitudinal_mismatch:
             issues.append(_issue(
                 "longitudinal_mismatch",
                 "spawn_payload",
@@ -650,7 +742,7 @@ def compare_actor_graphs(
                 source_actor,
                 render_actor,
                 "medium",
-                f"{actor_id} distance band source={source_band} render={render_band}",
+                longitudinal_evidence,
                 direction=f"{source_band}->{render_band}",
             ))
         render_heading = str(render_actor.get("heading_relation_to_ego") or "unknown")

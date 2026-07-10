@@ -18,7 +18,11 @@ from agents.net_generator import NetGenerator
 from agents.obstacle_generator import ObstacleGenerator
 from agents.universal_interpreter import UniInterpreter
 from agents.scenario_generator import ScenarioGenerator
-from tools.scene_map_matcher import SceneMapMatcher
+from tools.scene_map_matcher import (
+    SceneMapMatcher,
+    TOPOLOGY_CACHE_FEATURE_SET,
+    TOPOLOGY_CACHE_SCHEMA_VERSION,
+)
 from agents.scene_understanding_interpreter import SceneUnderstandingInterpreter
 from agents.existing_world_scenario_generator import ExistingWorldScenarioGenerator
 from agents.scene_verification_agent import SceneVerificationAgent
@@ -54,6 +58,10 @@ from tools.actor_graph_verifier import (
 load_dotenv()
 
 
+class CandidateValidationError(RuntimeError):
+    """A matched map candidate is incompatible with the requested scene."""
+
+
 class AutoGenerator:
     """
     A class responsible for generating road network descriptions, obstacles, and full simulation scenarios.
@@ -67,6 +75,7 @@ class AutoGenerator:
             info_dict = {"input_type": "image"}
         self.input_type = info_dict["input_type"]
 
+        output_folder = os.path.abspath(output_folder)
         os.makedirs(output_folder, exist_ok=True)
 
         self.carla_host = info_dict.get("carla_host", "localhost")
@@ -83,11 +92,13 @@ class AutoGenerator:
         self.verify_max_rounds = int(info_dict.get("verify_max_rounds", 2))
         self.verify_min_score = float(info_dict.get("verify_min_score", 0.70))
         self.verify_mode = info_dict.get("verify_mode", "actor_graph")
+        self.strict_validation = bool(info_dict.get("strict_validation", False))
         self.verify_script_timeout = float(info_dict.get("verify_script_timeout", 120.0))
         self.map_match_blacklist_radius_m = float(
             info_dict.get("map_match_blacklist_radius_m", 35.0)
         )
         self.topology_cache_dir = info_dict.get("topology_cache_dir")
+        self._active_scene_understanding = {}
 
         self.scene_understanding_interpreter = SceneUnderstandingInterpreter()
         self.scene_verification_agent = SceneVerificationAgent()
@@ -186,16 +197,71 @@ class AutoGenerator:
         matched_structure = (self.carla_spawn_context or {}).get("matched_structure")
         if not isinstance(matched_structure, dict) or matched_structure.get("error"):
             source = (self.carla_spawn_context or {}).get("matched_structure_source") or "missing"
-            raise RuntimeError(
+            raise CandidateValidationError(
                 f"{context} requires matched_structure for junction placement, "
                 f"but none is available (source={source})."
             )
         if str(matched_structure.get("kind") or "").lower() != "junction":
-            raise RuntimeError(
+            raise CandidateValidationError(
                 f"{context} requires junction matched_structure, "
                 f"but got kind={matched_structure.get('kind')!r}."
             )
         return matched_structure
+
+    def _validate_matched_structure_for_scene(
+        self,
+        scene_understanding: dict,
+    ) -> list:
+        """Return structural incompatibilities that require candidate rematching."""
+        if not self._scene_requires_junction_structure(scene_understanding):
+            return []
+        structure = self._require_junction_structure("Junction scene")
+        legs = [leg for leg in structure.get("legs") or [] if isinstance(leg, dict)]
+        leg_names = {str(leg.get("name") or "").strip().lower() for leg in legs}
+        issues = []
+        map_matching = ((scene_understanding.get("road_network") or {}).get("map_matching") or {})
+        branches = map_matching.get("junction_branches") or {}
+        required_by_branch = {
+            "ahead": "opposite",
+            "left": "left",
+            "right": "right",
+        }
+        if bool(branches.get("known")):
+            for branch, leg_name in required_by_branch.items():
+                if bool(branches.get(branch)) and leg_name not in leg_names:
+                    issues.append(f"missing_required_{branch}_branch")
+        target_branch_count = map_matching.get("target_branch_count")
+        if isinstance(target_branch_count, (int, float)) and len(legs) < int(target_branch_count):
+            issues.append(
+                f"insufficient_physical_arms:{len(legs)}<{int(target_branch_count)}"
+            )
+        required_anchor_legs = {
+            "ego_approach": "ego",
+            "ego": "ego",
+            "left_arm": "left",
+            "right_arm": "right",
+            "ahead_arm": "opposite",
+            "oncoming_arm": "opposite",
+            "opposite_arm": "opposite",
+        }
+        for entity in scene_understanding.get("traffic_subjects") or []:
+            if not isinstance(entity, dict):
+                continue
+            anchor = str(entity.get("layout_anchor_id") or "").strip().lower()
+            required_leg = required_anchor_legs.get(anchor)
+            if required_leg and required_leg not in leg_names:
+                issues.append(
+                    f"entity_anchor_missing:{entity.get('id')}:{anchor}:{required_leg}"
+                )
+        forward_lane_count = map_matching.get("forward_lane_count")
+        ego_leg = next((leg for leg in legs if str(leg.get("name") or "") == "ego"), None)
+        if isinstance(forward_lane_count, (int, float)) and isinstance(ego_leg, dict):
+            inbound_count = len(ego_leg.get("inbound_lanes") or [])
+            if inbound_count and inbound_count < int(forward_lane_count):
+                issues.append(
+                    f"insufficient_ego_inbound_lanes:{inbound_count}<{int(forward_lane_count)}"
+                )
+        return sorted(set(issues))
 
     @staticmethod
     def _matched_structure_summary(matched_structure: dict, source: str = None) -> dict:
@@ -598,6 +664,7 @@ class AutoGenerator:
             output_fn,
             json.dumps(scene_understanding, indent=2, sort_keys=True),
         )
+        self._active_scene_understanding = deepcopy(scene_understanding)
         self.adapt_generation_params_for_scene(scene_understanding)
         return scene_understanding
 
@@ -642,7 +709,7 @@ class AutoGenerator:
         self._write_debug_json(scene_id, "coordinates_projected_refined", refined)
         return refined
 
-    def reproject_junction_step(self, scene_id, refined):
+    def reproject_junction_step(self, scene_id, refined, *, reject_on_failure=False):
         """Re-place actors inside the matched structural reference frame (Phase 4).
 
         Junction scenes are re-placed onto real legs (cross/oncoming/turning
@@ -668,15 +735,32 @@ class AutoGenerator:
             return refined
         refined = reproject_actors_for_structure(refined, matched_structure)
         structural_validation = validate_structural_reprojection(refined)
-        refined.setdefault("metadata", {})["structural_validation"] = {
-            "status": structural_validation.get("status"),
-            "summary": structural_validation.get("summary", {}),
-        }
+        refined.setdefault("metadata", {})["structural_validation"] = structural_validation
+        structural_validation_path = join(
+            self.output_folder,
+            f"{scene_id}_structural_validation.json",
+        )
+        write_to_file(
+            structural_validation_path,
+            json.dumps(structural_validation, indent=2, sort_keys=True),
+        )
         if structural_validation.get("status") == "fail":
             print(
                 "  [structural_validation] failed: "
                 f"{structural_validation.get('summary', {}).get('failed', 0)} issue(s)"
             )
+            if reject_on_failure:
+                issue_types = sorted(
+                    {
+                        str(issue.get("issue_type") or "structural_mismatch")
+                        for issue in structural_validation.get("issues") or []
+                        if isinstance(issue, dict)
+                    }
+                )
+                raise CandidateValidationError(
+                    "Structural reprojection rejected matched candidate: "
+                    + ", ".join(issue_types or ["unknown_structural_mismatch"])
+                )
         self._write_debug_json(scene_id, "structural_validation", structural_validation)
         self._write_debug_json(scene_id, "coordinates_structural_reprojected", refined)
         return refined
@@ -826,11 +910,35 @@ class AutoGenerator:
                 location["y"] = float(location.get("y", 0.0)) + dy
 
         payload = build_projected_spawn_payload(coordinates_for_payload)
+        general_environment = deepcopy(
+            (self._active_scene_understanding or {}).get("general_environment") or {}
+        )
+        payload.setdefault("metadata", {})["general_environment"] = general_environment
+        payload["metadata"]["carla_weather_preset"] = self._carla_weather_preset(
+            general_environment
+        )
         write_to_file(
             self._spawn_payload_path(scene_id),
             json.dumps(payload, indent=2, sort_keys=True),
         )
         return payload
+
+    @staticmethod
+    def _carla_weather_preset(general_environment: dict) -> str:
+        weather = str(general_environment.get("weather_hint") or "unknown").lower()
+        lighting = str(general_environment.get("lighting_hint") or "unknown").lower()
+        time_of_day = str(general_environment.get("time_of_day_hint") or "unknown").lower()
+        surface = str(general_environment.get("road_surface_hint") or "unknown").lower()
+        is_night = "night" in lighting or time_of_day == "night"
+        if "rain" in weather:
+            return "MidRainyNight" if is_night else "MidRainyNoon"
+        if "fog" in weather:
+            return "CloudyNight" if is_night else "CloudyNoon"
+        if surface == "wet":
+            return "WetNight" if is_night else "WetNoon"
+        if is_night:
+            return "ClearNight"
+        return "ClearNoon"
 
     @staticmethod
     def _apply_projected_layout_from_match(
@@ -950,7 +1058,7 @@ class AutoGenerator:
         # ------------------------------------------------------------------
         # Step 1: lateral – select the driving lane ego belongs to.
         # ------------------------------------------------------------------
-        lane_offset = _infer_ego_lane_offset(scene_understanding)
+        lane_offset = self._trusted_ego_lane_offset(scene_understanding)
         corrected_wp = _find_lane_in_dense(candidate_lane, lane_offset, dense_wps)
         if corrected_wp is not None:
             end_wp = _next_wp_along_lane(corrected_wp, dense_wps, lookahead_m=20.0)
@@ -1026,7 +1134,7 @@ class AutoGenerator:
         candidate_lane = topology_sample[0]
         if not isinstance(candidate_lane, dict):
             return
-        lane_offset = _infer_ego_lane_offset(scene_understanding)
+        lane_offset = self._trusted_ego_lane_offset(scene_understanding)
         target = _select_sibling_lane_cache_only(candidate_lane, lane_offset)
         if target is None:
             return
@@ -1189,7 +1297,7 @@ class AutoGenerator:
         except ValueError:
             return None
 
-        expected_offset = _infer_ego_lane_offset(scene_understanding)
+        expected_offset = self._trusted_ego_lane_offset(scene_understanding)
         if actual_offset == expected_offset:
             return None
         return {
@@ -1416,6 +1524,7 @@ class AutoGenerator:
         env["AUTOSCENARIO_EGO_VIEW_OUTPUT"] = ego_view_path
         env["AUTOSCENARIO_BEV_OUTPUT"] = bev_path
         env["AUTOSCENARIO_RENDER_ACTOR_GRAPH_OUTPUT"] = render_actor_graph_path
+        env["AUTOSCENARIO_WEATHER_OVERRIDE"] = "ClearNoon"
         env.setdefault("AUTOSCENARIO_EGO_VIEW_SIZE", "1024")
         env.setdefault("AUTOSCENARIO_EGO_VIEW_FOV", "90")
         env.setdefault("AUTOSCENARIO_BEV_SIZE", "1024")
@@ -1642,7 +1751,12 @@ class AutoGenerator:
         scene_understanding: dict,
         relation_dsl: dict,
     ) -> dict:
-        graph = build_source_actor_graph(scene_understanding, relation_dsl)
+        spawn_payload = self._load_json_if_exists(self._spawn_payload_path(scene_id))
+        graph = build_source_actor_graph(
+            scene_understanding,
+            relation_dsl,
+            spawn_payload=spawn_payload,
+        )
         write_to_file(
             self._source_actor_graph_path(scene_id),
             json.dumps(graph, indent=2, sort_keys=True, ensure_ascii=False),
@@ -1750,6 +1864,7 @@ class AutoGenerator:
         match_report_path: str,
         anchor_location_dict: dict,
         best_match: dict,
+        scene_understanding: dict = None,
     ) -> dict:
         """Build the structural description (junction centre+legs / road segment)
         from the loaded matched world, for reference-frame reprojection.
@@ -1793,10 +1908,21 @@ class AutoGenerator:
                 )
                 return structure
             ego_yaw = best_match.get("yaw")
+            map_matching = (((scene_understanding or {}).get("road_network") or {}).get("map_matching") or {})
+            target_distance = map_matching.get("ego_to_junction_distance_m")
+            if not isinstance(target_distance, (int, float)):
+                target_distance = ((scene_understanding or {}).get("metadata") or {}).get(
+                    "ego_to_junction_distance_m"
+                )
+            junction_lookahead_m = 40.0
+            if isinstance(target_distance, (int, float)):
+                junction_lookahead_m = min(100.0, max(40.0, float(target_distance) + 15.0))
             structure = build_matched_structure_from_waypoint(
                 waypoint,
                 ego_inbound_yaw=float(ego_yaw) if isinstance(ego_yaw, (int, float)) else None,
+                junction_lookahead_m=junction_lookahead_m,
             )
+
             self.carla_spawn_context["matched_structure"] = structure
             self.carla_spawn_context["matched_structure_source"] = "live_carla"
             self._persist_matched_structure(
@@ -1818,6 +1944,39 @@ class AutoGenerator:
                 scene_id, match_report_path, structure, "missing"
             )
             return structure
+
+    @staticmethod
+    def _trusted_ego_lane_offset(scene_understanding: dict) -> int:
+        """Use an explicit ego lane only when the VLM supplied confidence."""
+        metadata = scene_understanding.get("metadata") or {}
+        ego_loc = metadata.get("ego_localization")
+        ego_loc = ego_loc if isinstance(ego_loc, dict) else {}
+        map_matching = (
+            (scene_understanding.get("road_network") or {}).get("map_matching") or {}
+        )
+        confidence = str(
+            ego_loc.get("ego_lane_confidence")
+            or map_matching.get("ego_lane_confidence")
+            or ""
+        ).strip().lower()
+        evidence = str(
+            ego_loc.get("ego_lane_evidence")
+            or map_matching.get("ego_lane_evidence")
+            or ""
+        ).strip()
+        if confidence in {"high", "medium"} and evidence:
+            return _infer_ego_lane_offset(scene_understanding)
+
+        sanitized = deepcopy(scene_understanding)
+        sanitized_metadata = sanitized.setdefault("metadata", {})
+        sanitized_ego = sanitized_metadata.get("ego_localization")
+        if isinstance(sanitized_ego, dict):
+            sanitized_ego.pop("ego_lane_from_right", None)
+        sanitized_map_matching = (
+            sanitized.setdefault("road_network", {}).setdefault("map_matching", {})
+        )
+        sanitized_map_matching.pop("ego_lane_from_right", None)
+        return _infer_ego_lane_offset(sanitized)
 
     def _sample_dense_local_waypoints(
         self,
@@ -1906,6 +2065,7 @@ class AutoGenerator:
         entity positions change but the map location stays fixed.
         Returns (relation_dsl, refined_coordinates, validation, final_scene_path).
         """
+        self._active_scene_understanding = deepcopy(scene_understanding)
         relation_dsl = self.generate_relation_dsl(scene_id, scene_understanding)
         raw_initial = self.generate_initial_coordinates(scene_id, relation_dsl)
         ordered = self.apply_pairwise_ordering_step(scene_id, raw_initial, relation_dsl)
@@ -2386,6 +2546,26 @@ class AutoGenerator:
     def _spawn_layout_repair_summary_path(self, scene_id: str) -> str:
         return join(self.output_folder, f"{scene_id}_spawn_repair.json")
 
+    def _run_summary_path(self) -> str:
+        return join(self.output_folder, "run_summary.json")
+
+    def _write_run_summary(self, payload: dict) -> dict:
+        summary = {
+            "status": str(payload.get("status") or "unknown"),
+            "output_folder": self.output_folder,
+            "strict_validation": self.strict_validation,
+            "prompt_version": "vlm-static-v2-balanced",
+            "topology_cache_schema_version": TOPOLOGY_CACHE_SCHEMA_VERSION,
+            "topology_cache_feature_set": TOPOLOGY_CACHE_FEATURE_SET,
+            "openai_model": os.getenv("OPENAI_MODEL", "unknown"),
+            **payload,
+        }
+        write_to_file(
+            self._run_summary_path(),
+            json.dumps(summary, indent=2, sort_keys=True, ensure_ascii=False),
+        )
+        return summary
+
     def verify_and_repair_spawn_layout(
         self,
         scene_id: str,
@@ -2775,10 +2955,18 @@ class AutoGenerator:
                 match_report_path,
                 anchor_loc,
                 best_match,
+                scene_understanding,
             )
         self._index_ego_on_candidate_lane(scene_understanding)
         if self._scene_requires_junction_structure(scene_understanding):
-            self._require_junction_structure("Junction scene")
+            structural_issues = self._validate_matched_structure_for_scene(
+                scene_understanding
+            )
+            if structural_issues:
+                raise CandidateValidationError(
+                    "Live matched structure is incompatible with scene: "
+                    + "; ".join(structural_issues)
+                )
         matched_structure = (self.carla_spawn_context or {}).get("matched_structure")
         if isinstance(matched_structure, dict):
             self._persist_matched_structure(
@@ -2795,7 +2983,11 @@ class AutoGenerator:
         projected = self.project_entities_step(scene_id, ordered, scene_understanding)
         refined = self.refine_coordinates_step(scene_id, projected, relation_dsl)
         validation = self.validate_layout_step(scene_id, relation_dsl, refined)
-        refined = self.reproject_junction_step(scene_id, refined)
+        refined = self.reproject_junction_step(
+            scene_id,
+            refined,
+            reject_on_failure=True,
+        )
         self.build_spawn_payload_from_match_or_fallback(scene_id, refined, match_report_path)
         final_scene_path = self.generate_final_scene_script(scene_id, match_report_path)
         repair_summary = None
@@ -2826,6 +3018,52 @@ class AutoGenerator:
             write_to_file(
                 self._spawn_layout_repair_summary_path(scene_id),
                 json.dumps(repair_summary, indent=2, sort_keys=True, ensure_ascii=False),
+            )
+        rounds = (repair_summary or {}).get("rounds") or []
+        last_round = rounds[-1] if rounds else {}
+        actor_plan = last_round.get("actor_graph_repair_plan") or {}
+        actor_issues = actor_plan.get("issues") or []
+        high_issues = [
+            issue
+            for issue in actor_issues
+            if str((issue or {}).get("severity") or "").lower() == "high"
+        ]
+        truth_unavailable = bool(actor_plan.get("truth_unavailable"))
+        if high_issues:
+            final_status = "failed"
+        elif actor_issues or truth_unavailable or quick_bev.get("error"):
+            final_status = "degraded"
+        else:
+            final_status = "passed"
+        self._write_run_summary(
+            {
+                "status": final_status,
+                "scene_id": scene_id,
+                "image_path": os.path.abspath(image_path),
+                "map_match_path": os.path.abspath(match_report_path),
+                "world_name": match_report.get("world_name"),
+                "static_script": os.path.abspath(final_scene_path),
+                "quick_bev": quick_bev,
+                "vehicle_detection": deepcopy(
+                    ((scene_understanding.get("metadata") or {}).get("vehicle_detection") or {})
+                ),
+                "traffic_subject_count": len(scene_understanding.get("traffic_subjects") or []),
+                "matched_structure": self._matched_structure_summary(
+                    matched_structure,
+                    (self.carla_spawn_context or {}).get("matched_structure_source"),
+                ),
+                "actor_graph": {
+                    "status": actor_plan.get("status"),
+                    "passed": actor_plan.get("passed"),
+                    "truth_unavailable": truth_unavailable,
+                    "issue_count": len(actor_issues),
+                    "high_issue_count": len(high_issues),
+                },
+            }
+        )
+        if self.strict_validation and high_issues:
+            raise RuntimeError(
+                f"Strict validation failed with {len(high_issues)} high-severity issue(s)."
             )
 
     def generate_interpretation(self, user_request, input_dict):
@@ -2868,6 +3106,11 @@ if __name__ == "__main__":
         default="",
         help="Optional extra scene description merged into the interpreter request.",
     )
+    parser.add_argument(
+        "--strict-validation",
+        action="store_true",
+        help="Exit non-zero when structural or high-severity actor validation fails.",
+    )
     args = parser.parse_args()
 
     output_folder = args.output_folder
@@ -2886,10 +3129,11 @@ if __name__ == "__main__":
         "require_carla_connection": True,
         "spawn_point_limit": 12,
         "enable_scene_match": True,
-        "enable_scene_verify": False,
+        "enable_scene_verify": True,
         "verify_max_rounds": 2,
         "verify_min_score": 0.70,
         "verify_mode": "actor_graph",
+        "strict_validation": args.strict_validation,
         "map_match_blacklist_radius_m": 35.0,
         "map_match_topology_weight": 0.70,
         "map_match_side_context_weight": 0.20,
@@ -2899,6 +3143,12 @@ if __name__ == "__main__":
         "topology_cache_dir": os.path.join(os.getcwd(), "data", "map_cache"),
     }
     auto_generator = AutoGenerator(output_folder, input_info)
+    auto_generator._write_run_summary(
+        {
+            "status": "running",
+            "image_path": os.path.abspath(image_path),
+        }
+    )
 
     for i in range(num_generated_scenes):
         scene_id = f"s{i:04d}"
@@ -2923,13 +3173,16 @@ if __name__ == "__main__":
             )
             print(f"Generated scene understanding: {auto_generator._scene_understanding_path(scene_id)}")
 
-            # Collect candidate map regions. Increase num_candidates for alternatives.
-            num_candidates = 1
-            candidate_matches: list = []  # list of (cand_scene_id, match_report_path)
+            # Balanced rematching: score one candidate at a time and only pay for
+            # another map load when live structural validation rejects the first.
+            num_candidates = 3
             blacklist: list = []
             user_desc = additional_info.get("user_scene_description", "")
+            base_spawn_context = deepcopy(auto_generator.carla_spawn_context)
+            built_candidate = False
             for cand_idx in range(num_candidates):
                 cand_scene_id = f"{scene_id}_c{cand_idx}"
+                match_path = ""
                 try:
                     match_path = auto_generator.analyze_topology_scene_match(
                         cand_scene_id,
@@ -2937,38 +3190,51 @@ if __name__ == "__main__":
                         blacklist_locations=blacklist,
                         image_path=image_path,
                     )
+                    report = auto_generator._load_json_if_exists(match_path)
+                    if report.get("status") != "matched" or not report.get("best_match"):
+                        raise CandidateValidationError(
+                            report.get("reason") or "No accepted map candidate."
+                        )
+                    print(f"\n=== Building scenario for {cand_scene_id} ===")
+                    auto_generator.carla_spawn_context = deepcopy(base_spawn_context)
+                    auto_generator._apply_match_to_spawn_context(match_path)
+                    auto_generator._build_scenario_for_match(
+                        cand_scene_id,
+                        match_path,
+                        scene_understanding,
+                        image_path,
+                        user_desc,
+                    )
+                    built_candidate = True
+                    break
+                except CandidateValidationError as exc:
+                    print(f"Candidate {cand_idx} rejected after validation: {exc}")
+                    report = auto_generator._load_json_if_exists(match_path)
+                    failed_location = ((report.get("best_match") or {}).get("location") or {})
+                    if failed_location:
+                        blacklist.append(
+                            {
+                                "x": failed_location.get("x"),
+                                "y": failed_location.get("y"),
+                                "radius": auto_generator.map_match_blacklist_radius_m,
+                                "reason": f"Live candidate validation failed: {exc}",
+                            }
+                        )
+                    continue
                 except RuntimeError as exc:
                     print(f"Candidate {cand_idx} map match failed: {exc}")
                     break
-                candidate_matches.append((cand_scene_id, match_path))
-                report = auto_generator._load_json_if_exists(match_path)
-                # Blacklist the entire world so the next candidate comes from a different map.
-                world_name = report.get("world_name")
-                if world_name:
-                    blacklist.append({
-                        "world": world_name,
-                        "reason": f"Reserved for candidate {cand_idx}.",
-                    })
-
-            if not candidate_matches:
-                print("No valid map candidates found. Exiting.")
-                sys.exit(1)
-
-            # Save spawn context before per-candidate mutations.
-            base_spawn_context = deepcopy(auto_generator.carla_spawn_context)
-
-            for cand_scene_id, match_path in candidate_matches:
-                print(f"\n=== Building scenario for {cand_scene_id} ===")
-                # Restore base context, then inject this candidate's anchor lane.
-                auto_generator.carla_spawn_context = deepcopy(base_spawn_context)
-                auto_generator._apply_match_to_spawn_context(match_path)
-                auto_generator._build_scenario_for_match(
-                    cand_scene_id,
-                    match_path,
-                    scene_understanding,
-                    image_path,
-                    user_desc,
+            if not built_candidate:
+                auto_generator._write_run_summary(
+                    {
+                        "status": "failed",
+                        "image_path": os.path.abspath(image_path),
+                        "failure_reason": "No structurally valid map candidates found.",
+                        "candidate_attempts": num_candidates,
+                    }
                 )
+                print("No structurally valid map candidates found. Exiting.")
+                sys.exit(1)
 
         elif mode == "AfterInterpreter":
             road_net_description, scenario_description = (

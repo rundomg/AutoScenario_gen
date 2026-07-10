@@ -121,6 +121,20 @@ class _EchoTaskAgent(TaskAgent):
 
 
 class TestGenerationPipelineHelpers(unittest.TestCase):
+    def test_vehicle_detector_balanced_retries_once_at_point_fifteen(self):
+        recovered = [{"id": "det_1", "label": "car", "conf": 0.243}]
+        with mock.patch.object(
+            vehicle_detector,
+            "detect_vehicles",
+            side_effect=[[], recovered],
+        ) as detect:
+            detections, metadata = vehicle_detector.detect_vehicles_balanced("night.png")
+
+        self.assertEqual(detections, recovered)
+        self.assertEqual([call.args[1] for call in detect.call_args_list], [0.25, 0.15])
+        self.assertTrue(metadata["fallback_used"])
+        self.assertEqual(metadata["used_conf"], 0.15)
+
     def test_vehicle_detector_dedupes_overlapping_boxes_and_keeps_row_hint(self):
         detections = [
             {
@@ -5672,6 +5686,13 @@ class TestGenerationPipelineHelpers(unittest.TestCase):
                             "left": False,
                             "right": True,
                         },
+                        "physical_junction_arms": {
+                            "ahead": True,
+                            "left": False,
+                            "right": True,
+                            "known": True,
+                            "arm_count": 3,
+                        },
                         "right_parking_lane_present": True,
                     },
                 ],
@@ -5749,7 +5770,7 @@ class TestGenerationPipelineHelpers(unittest.TestCase):
         )
         self.assertLess(score, 0.9)
 
-    def test_v2_ignores_legacy_lane_maneuvers_for_physical_junction_gate(self):
+    def test_v2_rejects_legacy_lane_maneuvers_without_physical_junction_arms(self):
         score, details = score_candidate_v2(
             {
                 "topology_type": "cross_intersection",
@@ -5780,11 +5801,14 @@ class TestGenerationPipelineHelpers(unittest.TestCase):
             },
         )
 
-        self.assertFalse(details["hard_reject"])
-        self.assertFalse(
-            any("branch mismatch" in reason for reason in details["reject_reasons"])
+        self.assertTrue(details["hard_reject"])
+        self.assertTrue(
+            any(
+                "physical_junction_arms_missing" in reason
+                for reason in details["reject_reasons"]
+            )
         )
-        self.assertGreater(score, 0.5)
+        self.assertEqual(details["gate_result"], "rejected")
 
     def test_v2_uses_physical_arms_over_lane_maneuvers(self):
         _score, details = score_candidate_v2(

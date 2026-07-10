@@ -223,7 +223,11 @@ def build_cache(
     except ImportError:
         sys.exit("ERROR: carla module not found. Activate the autoscenario conda env.")
 
-    from tools.scene_map_matcher import SceneMapMatcher
+    from tools.scene_map_matcher import (
+        SceneMapMatcher,
+        TOPOLOGY_CACHE_FEATURE_SET,
+        TOPOLOGY_CACHE_SCHEMA_VERSION,
+    )
 
     client = carla.Client(host, port)
     client.set_timeout(timeout)
@@ -351,6 +355,8 @@ def build_cache(
     os.makedirs(cache_dir, exist_ok=True)
     out_path = os.path.join(cache_dir, _safe_map_filename(world_name))
     payload = {
+        "schema_version": TOPOLOGY_CACHE_SCHEMA_VERSION,
+        "feature_set": TOPOLOGY_CACHE_FEATURE_SET,
         "world_name": world_name,
         "sample_step": sample_step,
         "large_map": large_map,

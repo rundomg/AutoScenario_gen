@@ -1275,11 +1275,12 @@ def _autoscenario_lane_side_from_lateral(lateral_m):
 def _autoscenario_heading_relation_to_ego(actor_yaw, ego_yaw):
     if actor_yaw is None or ego_yaw is None:
         return "unknown"
-    return (
-        "opposite_direction"
-        if _autoscenario_angle_distance(float(actor_yaw), float(ego_yaw)) > 90.0
-        else "same_direction"
-    )
+    delta = _autoscenario_angle_distance(float(actor_yaw), float(ego_yaw))
+    if delta <= 45.0:
+        return "same_direction"
+    if delta < 135.0:
+        return "crossing"
+    return "opposite_direction"
 
 
 def _autoscenario_actor_transform_record(actor):

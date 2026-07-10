@@ -25,6 +25,7 @@ class SceneUnderstandingInterpreter(TaskAgent):
 
     def __init__(self) -> None:
         super().__init__()
+        self._last_detection_metadata = {}
         self.pre_prompt = """
 You convert one traffic image into Scene Understanding JSON for CARLA existing-map reconstruction.
 The JSON is consumed by two downstream modules: map matching and actor layout. Do not write a generic scene caption.
@@ -70,6 +71,10 @@ Use road-symmetry reasoning on ordinary straight/open roads. When the ego-side c
 For straight_road / straight_two_way, set curve_direction="straight" or "unknown" and ego_to_junction_distance_m=null unless a junction/stop line/crosswalk/traffic light is visibly ahead. For curve, set curve_direction to left/right only when the road itself bends; otherwise unknown.
 On ordinary straight/open roads, curbside parked vehicles lined along the road edge are evidence of a curbside parking lane/parking strip on that side even if lane markings are weak: set the matching left_parking_lane_count or right_parking_lane_count in lane_groups and left_parking_presence or right_parking_presence in map_matching. When no curbside parked vehicles, parking lane, or parking strip is visible on a side, set that side's parking count to 0 and parking_presence=false. Do not treat moving/stopped traffic queues, ordinary shoulders, building edges, bus bays, or driveways as parking lanes.
 For ego_lane_from_right, count only same-direction travel lanes on ego's own carriageway from the right/curb side: 0=rightmost, 1=next lane left, 2=third lane from right. Never count side-road mouths, crossing-road lanes, parking lanes/rows, shoulders, bus bays, driveways, or opposing lanes.
+Infer ego_lane_from_right from lane boundaries, road edge, and the vanishing point,
+not from where other vehicles happen to sit. On a two-lane same-direction road,
+if the camera is between the right road edge and the first dashed divider, use 0.
+When those boundaries are not visible, use null and ego_lane_confidence=low.
 
 2) Actor Layout Contract
 `traffic_subjects` contains every clearly visible spawnable actor or vehicle row. Each item uses:
@@ -99,6 +104,9 @@ For junctions, do NOT rely only on ego as the anchor. Add `actor_layout` and per
 For each actor at or beyond a junction, set layout_anchor_id to the relevant arm and use:
 anchor_relation = {"travel_direction": "toward_junction | away_from_junction | unknown"}.
 For actors on a junction arm, infer travel_direction from the actor's visible facing on that arm: front/facing toward the junction means toward_junction; rear/facing away from the junction means away_from_junction. This is what selects the inbound vs outbound lane on that arm, so do not omit it when the vehicle orientation is visible.
+For side-arm actors, lane_index_relation is not an ego-frame lateral offset.
+Put the arm-local lane slot in anchor_relation.lane_from_right, counted from the
+actor's travel-right edge: 0=rightmost lane on that arm, 1=one lane left.
 When multiple actors occupy the same junction arm or side-road mouth, add key_pairwise_relations for staggered/overlapping vehicles so downstream placement does not collapse them into one spot.
 
 3) Ego Localization
@@ -128,11 +136,13 @@ entity_id, other_entity_id, longitudinal_relation, optional longitudinal_gap_ban
 
 6) Environment
 general_environment is context only: weather_hint, lighting_hint, time_of_day_hint, urban_density, roadside_context_left, roadside_context_right, occlusion_notes, non_spawnable_landmarks. Do not put spawnable actors here.
+Read weather and lighting from the actual image. Night scenes must not default to
+day/daylight. Wet reflective pavement should set road_surface_hint=wet even when
+active rainfall is uncertain. Use unknown instead of a daylight/clear guess.
 Use uncertainty conservatively: when evidence is insufficient, use unknown/low confidence instead of guessing.
         """
         self.road_scene_prompt = """
-You inspect one traffic image for road-scene structure only.
-Do not output vehicle orientation. Do not decide per-vehicle heading, same/opposite/crossing, or toward/away travel.
+You inspect one traffic image for road-scene structure.
 
 Output JSON only:
 {
@@ -176,7 +186,13 @@ Output JSON only:
     ]
   },
   "actor_layout": {},
-  "general_environment": {},
+  "general_environment": {
+    "weather_hint": "clear | rain | fog | snow",
+    "lighting_hint": "daylight | night | twilight",
+    "time_of_day_hint": "day | night | dawn | dusk",
+    "road_surface_hint": "dry | wet | snow",
+    "urban_density": "urban | suburban | rural"
+  },
   "metadata": {}
 }
 
@@ -197,12 +213,7 @@ Road-network contract:
   visible, set topology_type=straight_road, junction_visible=false, junction_type=none,
   and junction_branches={"ahead": false, "left": false, "right": false, "known": false},
   even if traffic lights or crosswalks are visible ahead.
-- Use has_traffic_light/has_crosswalk only as context for open-road scenes; they must
-  not upgrade a straight road into a junction.
-- On ordinary straight/open roads, curbside parked vehicles lined along the road
-  edge are evidence of a curbside parking lane/parking strip on that side even
-  if lane markings are weak. Set the matching parking_lane_count to 1 and
-  parking_presence to true.
+- Do not upgrade a straight road into a junction without visible branch-road geometry.
 - On undivided two-way straight/open urban roads, apply parking symmetry: if one
   curb has curbside parked vehicles, set both left_parking_lane_count and
   right_parking_lane_count to 1 unless the opposite curb clearly cannot support
@@ -211,15 +222,17 @@ Road-network contract:
 - When no curbside parking lane is visible, explicitly set
   left_parking_lane_count=0, right_parking_lane_count=0,
   left_parking_presence=false, and right_parking_presence=false.
-- Do not treat moving/stopped traffic queues, ordinary shoulders, bus bays,
-  driveways, or building edges as parking lanes.
 
 Actor-layout frame contract:
 - Do not output vehicle actors in traffic_subjects.
+- Do not output vehicle orientation; that is handled by the vehicle crop pass.
 - For junctions, output actor_layout anchors for junction_center, ego_approach,
   left_arm, right_arm, ahead_arm, and oncoming_arm only when applicable.
 - For open roads, actor_layout may describe global_anchor and lane-frame hints only.
 - metadata.ego_localization is strongly preferred.
+- metadata.ego_localization must include ego_lane_confidence and a short
+  ego_lane_evidence string. Use ego_lane_from_right=null when lane boundaries
+  cannot support a confident count.
         """
 
     @staticmethod
@@ -309,7 +322,9 @@ Actor-layout frame contract:
         # is unavailable or finds nothing.
         vlm_image_path = image_path
         if (not road_scene_only) and add_info.get("use_vehicle_detector", True):
-            detections = vehicle_detector.detect_vehicles(image_path)
+            detections, _detection_metadata = vehicle_detector.detect_vehicles_balanced(
+                image_path
+            )
             if detections:
                 detections = vehicle_detector.select_representative_detections(detections)
                 row_hints = vehicle_detector.infer_row_group_hints(detections)
@@ -865,6 +880,7 @@ Actor-layout frame contract:
             row_hints=row_hints,
             orientation_payload=orientation_payload,
             position_payload=position_payload,
+            detection_metadata=self._last_detection_metadata,
         )
         normalized, validation_error = normalize_scene_understanding(final_payload)
         if validation_error is not None:
@@ -901,10 +917,23 @@ Actor-layout frame contract:
     def _prepare_detection_evidence(self, *, image_path: str, output_fn: str, add_info: dict):
         if not add_info.get("use_vehicle_detector", True):
             return [], [], image_path
-        detections = vehicle_detector.detect_vehicles(image_path)
+        detections, detection_metadata = vehicle_detector.detect_vehicles_balanced(
+            image_path
+        )
+        self._last_detection_metadata = detection_metadata
         if not detections:
             return [], [], image_path
         detections = vehicle_detector.select_representative_detections(detections)
+        self._last_detection_metadata["selected_detection_count"] = len(detections)
+        self._last_detection_metadata["selected_detections"] = [
+            {
+                "id": item.get("id"),
+                "label": item.get("label"),
+                "conf": item.get("conf"),
+                "bbox_norm": item.get("bbox_norm"),
+            }
+            for item in detections
+        ]
         row_hints = vehicle_detector.infer_row_group_hints(detections)
         annotated_path = self._derive_annotated_path({"output_fn": output_fn}, image_path)
         if not vehicle_detector.annotate_image(image_path, detections, annotated_path):
@@ -984,15 +1013,6 @@ Actor-layout frame contract:
         output_fn: str,
         request_timeout: float,
     ) -> dict:
-        if not detections:
-            payload = self._fallback_vehicle_position_payload(
-                detections=[],
-                row_hints=row_hints,
-                orientation_payload=orientation_payload,
-                road_payload=road_payload,
-            )
-            write_to_file(output_fn, json.dumps(payload, indent=2, sort_keys=True))
-            return payload
         try:
             agent = VehiclePositionInterpreter()
             response = agent.send_request(
@@ -1004,6 +1024,7 @@ Actor-layout frame contract:
                     "road_scene": road_payload,
                     "orientation_payload": orientation_payload,
                     "row_hints": row_hints,
+                    "inventory_without_detections": not bool(detections),
                     "request_label": "vehicle-position",
                     "request_timeout": request_timeout,
                     "request_max_tokens": 3200,
@@ -1042,6 +1063,7 @@ Actor-layout frame contract:
         row_hints: list,
         orientation_payload: dict,
         position_payload: dict,
+        detection_metadata: dict = None,
     ) -> dict:
         merged = deepcopy(road_payload)
         hints = orientation_payload.get("vehicle_orientation_hints") or []
@@ -1124,6 +1146,39 @@ Actor-layout frame contract:
         metadata["vehicle_position_brief"] = (position_payload or {}).get(
             "vehicle_position_brief", {}
         )
+        ego_lane_review = (position_payload or {}).get("ego_lane_review") or {}
+        metadata["ego_lane_review"] = deepcopy(ego_lane_review)
+        if isinstance(ego_lane_review, dict):
+            reviewed_lane = ego_lane_review.get("ego_lane_from_right")
+            reviewed_confidence = str(
+                ego_lane_review.get("confidence") or ""
+            ).lower()
+            road_lane = map_matching.get("ego_lane_from_right")
+            ego_localization = metadata.get("ego_localization")
+            if not isinstance(ego_localization, dict):
+                ego_localization = {}
+                metadata["ego_localization"] = ego_localization
+            if (
+                reviewed_lane is not None
+                and reviewed_confidence in {"high", "medium"}
+            ):
+                try:
+                    lanes_agree = int(reviewed_lane) == int(road_lane)
+                except (TypeError, ValueError):
+                    lanes_agree = road_lane is None
+                if lanes_agree:
+                    ego_localization["ego_lane_from_right"] = int(reviewed_lane)
+                    ego_localization["ego_lane_confidence"] = reviewed_confidence
+                    ego_localization["ego_lane_evidence"] = str(
+                        ego_lane_review.get("evidence") or "position-agent agreement"
+                    )
+                else:
+                    map_matching["ego_lane_from_right"] = None
+                    ego_localization["ego_lane_from_right"] = None
+                    ego_localization["ego_lane_confidence"] = "low"
+                    ego_localization["ego_lane_evidence"] = (
+                        f"road/position disagreement: {road_lane} vs {reviewed_lane}"
+                    )
         metadata["vehicle_position_graph"] = (
             SceneUnderstandingInterpreter._derive_vehicle_position_graph(
                 subjects,
@@ -1131,6 +1186,8 @@ Actor-layout frame contract:
             )
         )
         metadata["detector_row_hints"] = row_hints
+        metadata["vehicle_detection"] = deepcopy(detection_metadata or {})
+        metadata["prompt_version"] = "vlm-static-v2-balanced"
         metadata["split_scene_agents"] = True
         return merged
 
