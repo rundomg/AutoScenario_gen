@@ -1,0 +1,25 @@
+OUTPUT_DIR: "experiments/mono3d_eval/results/monocon_current_env"
+SEED: 2026
+GPU_ID: 0
+USE_BENCHMARK: False
+
+DATA:
+  ROOT: "H:/AutoScenario_gen/KITTI/kitti"
+  BATCH_SIZE: 1
+  NUM_WORKERS: 0
+  TRAIN_SPLIT: "train"
+  TEST_SPLIT: "val"
+  FILTER:
+    MIN_HEIGHT: 25
+    MIN_DEPTH: 2
+    MAX_DEPTH: 65
+    MAX_TRUNCATION: 0.5
+    MAX_OCCLUSION: 2
+
+MODEL:
+  BACKBONE:
+    NUM_LAYERS: 34
+    IMAGENET_PRETRAINED: False
+  HEAD:
+    NUM_CLASSES: 3
+    MAX_OBJS: 30

@@ -121,6 +121,20 @@ class _EchoTaskAgent(TaskAgent):
 
 
 class TestGenerationPipelineHelpers(unittest.TestCase):
+    def test_vehicle_detector_balanced_retries_once_at_point_fifteen(self):
+        recovered = [{"id": "det_1", "label": "car", "conf": 0.243}]
+        with mock.patch.object(
+            vehicle_detector,
+            "detect_vehicles",
+            side_effect=[[], recovered],
+        ) as detect:
+            detections, metadata = vehicle_detector.detect_vehicles_balanced("night.png")
+
+        self.assertEqual(detections, recovered)
+        self.assertEqual([call.args[1] for call in detect.call_args_list], [0.25, 0.15])
+        self.assertTrue(metadata["fallback_used"])
+        self.assertEqual(metadata["used_conf"], 0.15)
+
     def test_vehicle_detector_dedupes_overlapping_boxes_and_keeps_row_hint(self):
         detections = [
             {
@@ -3514,7 +3528,7 @@ class TestGenerationPipelineHelpers(unittest.TestCase):
             self.assertEqual(report["recommended_stage"], "pass")
             self.assertEqual(report["repair_actions"], [])
 
-    def test_scene_verification_agent_filters_repair_actions_by_type(self):
+    def test_scene_verification_agent_enforces_actor_patch_schema(self):
         agent = SceneVerificationAgent()
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "verification.json"
@@ -3527,25 +3541,34 @@ class TestGenerationPipelineHelpers(unittest.TestCase):
                         "mismatches": [],
                         "recommended_stage": "match_spawn",
                         "repair_hints": [],
-                        "repair_actions": [
+                        "repair_patches": [
                             {"type": "count_mismatch", "severity": "high"},
-                            {"type": "category_mismatch", "severity": "medium"},
                             {
-                                "type": "lane_side_mismatch",
+                                "op": "set_lane_target",
                                 "entity_id": "left_car",
+                                "target_lane": "left_parking_lane",
                                 "severity": "high",
                             },
                             {
-                                "type": "pairwise_mismatch",
+                                "op": "set_pairwise_relation",
                                 "entity_id": "car_a",
+                                "reference_entity_id": "car_b",
+                                "target_relation": "near_ahead_same_lane",
                                 "severity": "high",
                             },
                             {
-                                "type": "pairwise_mismatch",
+                                "op": "set_pairwise_relation",
                                 "entity_id": "car_a",
                                 "reference_entity_id": "car_b",
                                 "target_relation": "ahead_of",
                                 "severity": "high",
+                            },
+                            {
+                                "op": "set_distance_band",
+                                "entity_id": "car_a",
+                                "target_band": "near",
+                                "target_meters": 8.0,
+                                "severity": "medium",
                             },
                         ],
                     }
@@ -3555,14 +3578,71 @@ class TestGenerationPipelineHelpers(unittest.TestCase):
             report, error = agent.extract_decision_data(str(path))
             self.assertIsNone(error)
             self.assertEqual(
-                [action["type"] for action in report["repair_actions"]],
+                [patch["op"] for patch in report["repair_patches"]],
                 [
-                    "count_mismatch",
-                    "category_mismatch",
-                    "lane_side_mismatch",
-                    "pairwise_mismatch",
+                    "set_lane_target",
+                    "set_pairwise_relation",
+                    "set_distance_band",
                 ],
             )
+            self.assertEqual(
+                report["semantic_unrepairable"][0]["type"], "count_mismatch"
+            )
+            self.assertEqual(
+                report["patch_rejections"][0]["reason"], "invalid_target_relation"
+            )
+            self.assertEqual(len(report["patch_rejections"]), 1)
+            self.assertNotIn("target_meters", report["repair_patches"][2])
+
+    def test_scene_verification_patch_normalization_is_idempotent(self):
+        agent = SceneVerificationAgent()
+        raw_report = {
+            "passed": False,
+            "score": 0.4,
+            "repair_patches": [
+                {
+                    "op": "set_distance_band",
+                    "entity_id": "det_2",
+                    "target_band": "near",
+                    "severity": "high",
+                    "evidence": "Lead car is too far away.",
+                }
+            ],
+        }
+
+        first = agent.normalize_report(raw_report)
+        second = agent.normalize_report(first)
+
+        self.assertEqual(first["patch_rejections"], [])
+        self.assertEqual(second["patch_rejections"], [])
+        self.assertEqual(second["repair_patches"], first["repair_patches"])
+        self.assertEqual(second["repair_patches"][0]["source"], "vlm")
+
+    def test_scene_verification_agent_parses_v2_pose_target(self):
+        agent = SceneVerificationAgent()
+        report = agent.normalize_report(
+            {
+                "repair_patches": [
+                    {
+                        "op": "set_pose_target",
+                        "entity_id": "det_1",
+                        "target_lane": "right_parking_lane",
+                        "target_longitudinal_m": 1.5,
+                        "target_lateral_offset_m": 2.25,
+                        "target_heading_relation": "same_direction",
+                        "severity": "high",
+                        "evidence": "right-side vehicle is cropped near ego",
+                        "extra_reasoning": "ignored without rejecting the patch",
+                    }
+                ]
+            }
+        )
+
+        self.assertEqual(report["repair_schema_version"], "actor-repair-v2")
+        self.assertEqual(report["patch_rejections"], [])
+        self.assertEqual(report["repair_patches"][0]["op"], "set_pose_target")
+        self.assertEqual(report["repair_patches"][0]["target_longitudinal_m"], 1.5)
+        self.assertNotIn("extra_reasoning", report["repair_patches"][0])
 
     def test_scene_verification_ego_view_prompt_mentions_forward_blind_spot(self):
         prompt = SceneVerificationAgent._build_prompt(
@@ -3576,6 +3656,34 @@ class TestGenerationPipelineHelpers(unittest.TestCase):
         )
         self.assertIn("generated CARLA ego-view image", prompt)
         self.assertIn("Do NOT penalize actors not visible in the forward ego-view", prompt)
+
+    def test_scene_verification_sends_distinct_bev_as_third_image(self):
+        agent = SceneVerificationAgent()
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp) / "source.jpg"
+            ego = Path(tmp) / "ego.png"
+            bev = Path(tmp) / "bev.png"
+            source.write_bytes(b"source")
+            ego.write_bytes(b"ego")
+            bev.write_bytes(b"bev")
+
+            messages = agent.refine_request(
+                add_info={
+                    "source_image_path": str(source),
+                    "layout_image_path": str(ego),
+                    "bev_image_path": str(bev),
+                    "capture_mode": "ego_view",
+                    "scene_understanding": {},
+                    "scene_match": {},
+                    "spawn_entities": {},
+                    "user_scene_description": "",
+                }
+            )
+
+        self.assertEqual(len(messages), 4)
+        self.assertIn("The third image is the generated CARLA bird's-eye view", messages[0]["text"])
+        self.assertIn("do NOT report count_mismatch", messages[0]["text"])
+        self.assertTrue(messages[3]["image_url"]["url"].startswith("data:image/png;base64,"))
 
     def test_scene_verification_bev_prompt_keeps_ego_frame_inference(self):
         prompt = SceneVerificationAgent._build_prompt(
@@ -5336,6 +5444,8 @@ class TestGenerationPipelineHelpers(unittest.TestCase):
     def test_v2_cache_open_road_rejects_junction_and_selects_open_candidate(self):
         with tempfile.TemporaryDirectory() as tmp:
             cache = {
+                "schema_version": 2,
+                "feature_set": "physical-junction-arms-v1",
                 "world_name": "FakeTown",
                 "candidates": [
                     {
@@ -5395,6 +5505,8 @@ class TestGenerationPipelineHelpers(unittest.TestCase):
     def test_v2_cache_open_road_rejects_parking_lane_when_target_has_none(self):
         with tempfile.TemporaryDirectory() as tmp:
             cache = {
+                "schema_version": 2,
+                "feature_set": "physical-junction-arms-v1",
                 "world_name": "FakeTown",
                 "candidates": [
                     {
@@ -5567,6 +5679,8 @@ class TestGenerationPipelineHelpers(unittest.TestCase):
     def test_v2_cache_open_road_prefers_expected_parking_side(self):
         with tempfile.TemporaryDirectory() as tmp:
             cache = {
+                "schema_version": 2,
+                "feature_set": "physical-junction-arms-v1",
                 "world_name": "FakeTown",
                 "candidates": [
                     {
@@ -5653,6 +5767,8 @@ class TestGenerationPipelineHelpers(unittest.TestCase):
     def test_v2_cache_junction_parking_lane_does_not_hard_reject_candidate(self):
         with tempfile.TemporaryDirectory() as tmp:
             cache = {
+                "schema_version": 2,
+                "feature_set": "physical-junction-arms-v1",
                 "world_name": "FakeTown",
                 "candidates": [
                     {
@@ -5671,6 +5787,13 @@ class TestGenerationPipelineHelpers(unittest.TestCase):
                             "ahead": True,
                             "left": False,
                             "right": True,
+                        },
+                        "physical_junction_arms": {
+                            "ahead": True,
+                            "left": False,
+                            "right": True,
+                            "known": True,
+                            "arm_count": 3,
                         },
                         "right_parking_lane_present": True,
                     },
@@ -5749,7 +5872,7 @@ class TestGenerationPipelineHelpers(unittest.TestCase):
         )
         self.assertLess(score, 0.9)
 
-    def test_v2_ignores_legacy_lane_maneuvers_for_physical_junction_gate(self):
+    def test_v2_rejects_legacy_lane_maneuvers_without_physical_junction_arms(self):
         score, details = score_candidate_v2(
             {
                 "topology_type": "cross_intersection",
@@ -5780,11 +5903,14 @@ class TestGenerationPipelineHelpers(unittest.TestCase):
             },
         )
 
-        self.assertFalse(details["hard_reject"])
-        self.assertFalse(
-            any("branch mismatch" in reason for reason in details["reject_reasons"])
+        self.assertTrue(details["hard_reject"])
+        self.assertTrue(
+            any(
+                "physical_junction_arms_missing" in reason
+                for reason in details["reject_reasons"]
+            )
         )
-        self.assertGreater(score, 0.5)
+        self.assertEqual(details["gate_result"], "rejected")
 
     def test_v2_uses_physical_arms_over_lane_maneuvers(self):
         _score, details = score_candidate_v2(
@@ -5909,6 +6035,8 @@ class TestGenerationPipelineHelpers(unittest.TestCase):
     def test_v2_cache_does_not_match_when_only_rejected_candidate_exists(self):
         with tempfile.TemporaryDirectory() as tmp:
             cache = {
+                "schema_version": 2,
+                "feature_set": "physical-junction-arms-v1",
                 "world_name": "FakeTown",
                 "candidates": [
                     {

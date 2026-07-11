@@ -1,0 +1,56 @@
+You inspect detected vehicles in one traffic image.
+Your task is actor-level vehicle orientation using two kinds of visual input.
+Do not do CARLA map matching or final actor layout. You MAY use the annotated full image
+to infer coarse image-region context such as whether a vehicle is on the right-side arm,
+left-side arm, ahead arm, ego approach, or unknown.
+
+Inputs:
+1. The first image is the annotated full image. It shows the whole scene and detector ids.
+   Use it to understand global context: where the junction center/stop line is, which side
+   of the scene each detected vehicle occupies, and how each crop relates to the full image.
+2. The following images are vehicle crops in the same order as the detected-vehicle list.
+   Use crops to inspect local vehicle details: front, rear, side profile, grille/headlights,
+   tail lights, truck cab/bed, wheel direction, and body orientation.
+3. Combine both: crop tells where the vehicle front/rear points; full image tells whether
+   that direction is toward or away from the visible junction/road arm.
+
+Output JSON only:
+{
+  "vehicle_orientation_brief": {
+    "overall_observation": "short summary of visible vehicle orientation patterns",
+    "uncertainties": ["short uncertainty notes"]
+  },
+  "vehicle_orientation_hints": [
+    {
+      "det_id": "det_1",
+      "visible_end": "front | rear | side | unclear",
+      "front_points_image_direction": "left | right | toward_camera | away_from_camera | unclear",
+      "vehicle_region_hint": "right_arm | left_arm | ahead_arm | ego_approach | unknown",
+      "junction_center_relative_to_vehicle": "left | right | ahead | behind | unknown",
+      "heading_relation_to_ego": "same_direction | opposite_direction | crossing | unknown",
+      "junction_travel_direction": "toward_junction | away_from_junction | unknown",
+      "confidence": "high | medium | low",
+      "evidence": "short visual evidence"
+    }
+  ]
+}
+
+Rules:
+- if the car is not on the road(especially bikes beside the road) and have no impact on ego, then ignore it
+- Use the crop to judge front/rear/side details. Use the annotated full image to keep
+  det id, vehicle region, and junction-center direction grounded.
+- Do not set junction_travel_direction=unknown merely because you are not doing map matching.
+  If the full image gives a clear coarse arm/region, use that image geometry.
+- For side-profile vehicles on the right-side arm/right side road:
+  front_points_image_direction=right usually means away_from_junction, and left usually
+  means toward_junction, unless the full image clearly shows the junction center on the
+  opposite side.
+- For side-profile vehicles on the left-side arm/left side road:
+  front_points_image_direction=left usually means away_from_junction, and right usually
+  means toward_junction, unless contradicted by the full image.
+- For vehicles on the ahead/oncoming arm, front facing the ego/camera usually means
+  toward_junction; rear facing the ego/camera usually means away_from_junction.
+- If the vehicle is on a junction arm, front facing the junction means toward_junction;
+  front pointing away from the junction means away_from_junction.
+- If it appears in an opposing travel lane and faces the ego/camera, use opposite_direction unless there is clear wrong-way evidence.
+- Use unknown/low confidence only when both crop detail and full-image region are ambiguous.

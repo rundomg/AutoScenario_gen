@@ -1127,9 +1127,12 @@ def normalize_scene_understanding(payload: Dict[str, Any]) -> Tuple[Optional[Dic
     general_environment = _coerce_dict(payload.get("general_environment"))
     normalized["general_environment"] = {
         "weather_hint": str(general_environment.get("weather_hint") or "unknown"),
-        "lighting_hint": str(general_environment.get("lighting_hint") or "daylight"),
-        "time_of_day_hint": str(general_environment.get("time_of_day_hint") or "day"),
-        "urban_density": str(general_environment.get("urban_density") or "urban"),
+        "lighting_hint": str(general_environment.get("lighting_hint") or "unknown"),
+        "time_of_day_hint": str(general_environment.get("time_of_day_hint") or "unknown"),
+        "road_surface_hint": str(
+            general_environment.get("road_surface_hint") or "unknown"
+        ),
+        "urban_density": str(general_environment.get("urban_density") or "unknown"),
         "roadside_context_left": _coerce_list(general_environment.get("roadside_context_left")),
         "roadside_context_right": _coerce_list(general_environment.get("roadside_context_right")),
         "occlusion_notes": _coerce_list(general_environment.get("occlusion_notes")),
@@ -4140,6 +4143,12 @@ def build_projected_spawn_payload(projected_coordinates: Dict[str, Any]) -> Dict
             "junction_leg": str(entity.get("junction_leg") or ""),
             "junction_motion": str(entity.get("junction_motion") or ""),
             "junction_distance_m": entity.get("junction_distance_m"),
+            "junction_lane_from_right": entity.get("junction_lane_from_right"),
+            "layout_anchor_id": str(entity.get("layout_anchor_id") or ""),
+            "anchor_relation": _deep_copy(_coerce_dict(entity.get("anchor_relation"))),
+            "lane_from_right": _coerce_dict(entity.get("anchor_relation")).get(
+                "lane_from_right"
+            ),
             "actor_group_type": actor_group_type,
             "actor_group_id": entity.get("actor_group_id"),
             "group_order_index": entity.get("group_order_index"),

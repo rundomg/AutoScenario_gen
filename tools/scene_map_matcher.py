@@ -28,6 +28,8 @@ JUNCTION_AHEAD_STEP_M = 5.0
 # as a false positive. Kept in sync with build_matched_structure_from_waypoint's
 # junction lookahead so an accepted approach candidate yields a junction frame.
 JUNCTION_TARGET_REACH_M = 40.0
+TOPOLOGY_CACHE_SCHEMA_VERSION = 2
+TOPOLOGY_CACHE_FEATURE_SET = "physical-junction-arms-v1"
 # Traffic-light alignment gate. When the scene clearly shows a signalized
 # junction ahead of ego, a junction-target candidate is multiplicatively
 # rewarded/penalised by how close it actually sits to a real traffic light
@@ -199,7 +201,7 @@ class SceneMapMatcher:
         self,
         host: str = "localhost",
         port: int = 2000,
-        timeout: float = 10.0,
+        timeout: float = 30.0,
         sample_step: float = 5.0,
         search_radius: float = 30.0,
         coarse_top_k: int = 20,
@@ -2253,6 +2255,7 @@ class SceneMapMatcher:
         top_candidates_summary: List[Dict[str, Any]] = []
         accepted_summary: List[Dict[str, Any]] = []
         rejected_summary: List[Dict[str, Any]] = []
+        incompatible_caches: List[Dict[str, Any]] = []
         # Full per-map best entries, kept so an optional LLM re-ranker can choose
         # among a closed set without re-loading caches.
         map_best_entries: List[Dict[str, Any]] = []
@@ -2271,6 +2274,20 @@ class SceneMapMatcher:
             except Exception:
                 continue
             world_name = cache.get("world_name", os.path.basename(cache_path))
+            if (
+                cache.get("schema_version") != TOPOLOGY_CACHE_SCHEMA_VERSION
+                or cache.get("feature_set") != TOPOLOGY_CACHE_FEATURE_SET
+            ):
+                incompatible_caches.append(
+                    {
+                        "path": os.path.basename(cache_path),
+                        "world_name": world_name,
+                        "schema_version": cache.get("schema_version"),
+                        "feature_set": cache.get("feature_set"),
+                        "reason": "topology_cache_schema_incompatible",
+                    }
+                )
+                continue
             if world_name in blacklisted_worlds:
                 continue
             candidates = cache.get("candidates") or []
@@ -2365,6 +2382,7 @@ class SceneMapMatcher:
                     "accepted": accepted_summary[:20],
                     "rejected": rejected_summary[:20],
                     "top_candidates": top_candidates_summary,
+                    "incompatible_caches": incompatible_caches,
                 },
                 "candidate_debug": {
                     "accepted": accepted_summary[:50],
@@ -2374,6 +2392,7 @@ class SceneMapMatcher:
                     if best_rejected is not None
                     else None,
                     "blacklist_locations": blacklist_locations or [],
+                    "incompatible_caches": incompatible_caches,
                 },
                 "best_match": None,
                 "projected_layout": {},
@@ -2391,6 +2410,7 @@ class SceneMapMatcher:
                 "accepted": accepted_summary[:20],
                 "rejected": rejected_summary[:20],
                 "top_candidates": top_candidates_summary,
+                "incompatible_caches": incompatible_caches,
             },
             "candidate_debug": {
                 "accepted": accepted_summary[:50],
@@ -2400,6 +2420,7 @@ class SceneMapMatcher:
                 if best_rejected is not None
                 else None,
                 "blacklist_locations": blacklist_locations or [],
+                "incompatible_caches": incompatible_caches,
             },
             "reason": None,
         }

@@ -281,6 +281,25 @@ def _orientation_schema_block(is_junction: bool) -> str:
     if is_junction:
         return """
 
+
+
+Junction rules:
+- Treat ignored_detections as soft ignore candidates for downstream review.
+- Use ignored_detections only when a detector id is clearly outside the
+  reconstructable road scene, duplicate/false positive, or has no visible scene role.
+- Assign arm labels only because the road-scene agent classified this as a junction.
+- Do not use image-left/image-right or bbox center-x alone to choose left_arm/right_arm.
+- A vehicle ahead of ego in an ego-approach left/right/same lane is still
+  vehicle_region_hint=ego_approach, not left_arm/right_arm.
+- Use left_arm/right_arm only for vehicles physically on the cross street or side-road
+  branch, with visible road/lane geometry supporting that branch membership.
+- For side-profile vehicles on the right-side arm, front_points_image_direction=right
+  usually means away_from_junction, and left usually means toward_junction.
+- For side-profile vehicles on the left-side arm, front_points_image_direction=left
+  usually means away_from_junction, and right usually means toward_junction.
+- For vehicles on the ahead/oncoming arm, front facing ego/camera usually means
+  toward_junction; rear facing ego/camera usually means away_from_junction.
+
 Road-scene branch: JUNCTION. Output JSON only:
 {
   "vehicle_orientation_brief": {
@@ -307,23 +326,6 @@ Road-scene branch: JUNCTION. Output JSON only:
     }
   ]
 }
-
-Junction rules:
-- Treat ignored_detections as soft ignore candidates for downstream review.
-- Use ignored_detections only when a detector id is clearly outside the
-  reconstructable road scene, duplicate/false positive, or has no visible scene role.
-- Assign arm labels only because the road-scene agent classified this as a junction.
-- Do not use image-left/image-right or bbox center-x alone to choose left_arm/right_arm.
-- A vehicle ahead of ego in an ego-approach left/right/same lane is still
-  vehicle_region_hint=ego_approach, not left_arm/right_arm.
-- Use left_arm/right_arm only for vehicles physically on the cross street or side-road
-  branch, with visible road/lane geometry supporting that branch membership.
-- For side-profile vehicles on the right-side arm, front_points_image_direction=right
-  usually means away_from_junction, and left usually means toward_junction.
-- For side-profile vehicles on the left-side arm, front_points_image_direction=left
-  usually means away_from_junction, and right usually means toward_junction.
-- For vehicles on the ahead/oncoming arm, front facing ego/camera usually means
-  toward_junction; rear facing ego/camera usually means away_from_junction.
 """
     return """
 

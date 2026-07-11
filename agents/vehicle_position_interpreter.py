@@ -31,6 +31,10 @@ Inputs:
 4. Vehicle orientation payload from the crop pass, including ignored_detections
    soft candidates.
 
+When the detector list is empty, inspect the original full image anyway. Add each
+clearly visible vehicle as vlm_1, vlm_2, ... with visual_confidence=low or medium.
+An empty detector list is not evidence that the road contains no vehicles.
+
 Output JSON only. Keep it compact. Include vehicle_position_brief first as a
 short visible reasoning summary for debugging; do not include hidden
 step-by-step reasoning, graph nodes/edges, or long evidence prose:
@@ -40,6 +44,12 @@ step-by-step reasoning, graph nodes/edges, or long evidence prose:
     "lane_assignment_basis": "short cue summary for lane/parking bands",
     "pairwise_relation_basis": "short cue summary for key relation ordering",
     "uncertainties": ["short uncertainty notes"]
+  },
+  "ego_lane_review": {
+    "ego_lane_from_right": 0,
+    "confidence": "high, medium, or low",
+    "evidence": "short lane-boundary evidence",
+    "agrees_with_road_scene": true
   },
   "traffic_subjects": [
     {
@@ -72,19 +82,13 @@ step-by-step reasoning, graph nodes/edges, or long evidence prose:
 
 Rules:
 - By default, cover every detector id exactly once in traffic_subjects. You may
-  omit a detector only when it appears in ignored_detections AND the image plus
-  road-scene context confirms it should not be reconstructed. When uncertain,
-  keep the detector as a traffic_subject.
+  omit a detector only when it appears in ignored_detections.
 - Do not omit curbside parked vehicles, motorcycles, or bicycles merely because
   the orientation payload says parked/no impact; keep them when they define
   parking rows, road-edge activity, traffic context, or any plausible scene role.
-- Keep vehicle_position_brief concise: one sentence per string field and short
-  uncertainty bullets only.
 - Omit fields that are empty/default. For open roads, do not output
   layout_anchor_id or anchor_relation. For junction vehicles, include only
   non-empty layout_anchor_id and anchor_relation.
-- Do not output evidence unless needed to disambiguate a low-confidence field;
-  if used, keep evidence under 8 words.
 - Use bbox coordinates as evidence for image ordering. On open/straight roads,
   use bbox center-x and horizontal overlap as auxiliary cues for pairwise
   vehicle left/right ordering, then express the result in the ego-centric road
@@ -93,10 +97,11 @@ Rules:
 - Output only pairwise relations that affect placement: same parking row/queue
   order, overlap/tight spacing, adjacent-lane constraints, or important
   ahead/behind constraints. Do not build a complete all-pairs relation set.
-- Follow the Road-scene branch instructions appended below. Do not re-classify
-  the road topology yourself.
 - Do not call a curbside parking row same_lane unless it is truly in a travel lane.
 - Use orientation_hints only for heading; do not let them override road topology.
+- Independently review ego_lane_from_right from the right road edge, dashed lane
+  dividers, and vanishing point. When uncertain, do not infer it from actor positions. Use null
+  and low confidence when lane boundaries are unclear.
         """
 
     @staticmethod
@@ -116,10 +121,16 @@ Rules:
         prompt += json.dumps(road_scene, ensure_ascii=False, indent=2)
         prompt += _position_branch_block(_is_junction_scene(road_scene))
         prompt += "\n\nDetected vehicles:\n"
-        for det in add_info.get("detections") or []:
+        detections = add_info.get("detections") or []
+        for det in detections:
             prompt += (
                 f"- {det.get('id')} label={det.get('label')} conf={det.get('conf')} "
                 f"bbox={det.get('bbox_norm')} center={det.get('center_norm')}\n"
+            )
+        if not detections:
+            prompt += (
+                "- No detector boxes survived the balanced detector passes. "
+                "Perform a full-image vehicle inventory and assign vlm_N ids.\n"
             )
         prompt += "\n\nOrientation payload including ignored_detections soft candidates:\n"
         prompt += json.dumps(add_info.get("orientation_payload") or {}, ensure_ascii=False, indent=2)
@@ -177,6 +188,9 @@ Rules:
             ),
             "traffic_subjects": subjects,
             "key_pairwise_relations": relations,
+            "ego_lane_review": _compact_ego_lane_review(
+                payload.get("ego_lane_review")
+            ),
         }
 
 
@@ -185,7 +199,26 @@ def _empty_position_payload() -> dict:
         "vehicle_position_brief": {},
         "traffic_subjects": [],
         "key_pairwise_relations": [],
+        "ego_lane_review": {},
     }
+
+
+def _compact_ego_lane_review(value: object) -> dict:
+    if not isinstance(value, dict):
+        return {}
+    result = {
+        key: value.get(key)
+        for key in (
+            "ego_lane_from_right",
+            "confidence",
+            "evidence",
+            "agrees_with_road_scene",
+        )
+        if key in value
+    }
+    _drop_empty_defaults(result)
+    _truncate_evidence(result, max_words=14)
+    return result
 
 
 def _compact_position_brief(brief: object) -> dict:
@@ -334,6 +367,8 @@ Road-scene branch: JUNCTION. Position logic:
   branch, with lane markings/curbs/road continuation showing that branch membership.
 - Include non-empty layout_anchor_id and anchor_relation for vehicles on junction arms.
 - Use anchor_relation.position_along_anchor as near_mouth, mid_arm, or far_arm when visible.
+- For actors outside ego_approach, set anchor_relation.lane_from_right in the
+  actor arm's local travel frame. Do not reinterpret that slot as ego-left/right.
 - Key pairwise relations should focus on same-arm queue order or overlap/tight spacing.
 """
     return """

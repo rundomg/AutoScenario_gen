@@ -319,6 +319,7 @@ class TestRealCodegenCompiles(unittest.TestCase):
                 risk_metrics_filename=str(Path(tmp) / f"{scene_id}_r000_metrics.json"),
                 carla_map="Town06",
             )
+            self.assertIn("client.set_timeout(30.0)", script)
             script_path = Path(tmp) / f"{scene_id}_r000.py"
             script_path.write_text(script, encoding="utf-8")
             result = check_python_compile(str(script_path))

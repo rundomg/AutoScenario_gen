@@ -28,6 +28,7 @@ _COCO_VEHICLE_CLASSES = {
 
 _DEFAULT_MODEL = os.environ.get("YOLO_MODEL", "yolo11m.pt")
 _DEFAULT_CONF = float(os.environ.get("YOLO_CONF", "0.25"))
+_FALLBACK_CONF = float(os.environ.get("YOLO_FALLBACK_CONF", "0.15"))
 
 _model = None
 _model_lock = threading.Lock()
@@ -131,6 +132,30 @@ def detect_vehicles(image_path: str, conf: float = _DEFAULT_CONF) -> list:
     for index, det in enumerate(detections, start=1):
         det["id"] = f"det_{index}"
     return detections
+
+
+def detect_vehicles_balanced(
+    image_path: str,
+    *,
+    primary_conf: float = _DEFAULT_CONF,
+    fallback_conf: float = _FALLBACK_CONF,
+) -> tuple[list, dict]:
+    """Run a single lower-threshold retry only when the primary pass is empty."""
+    detections = detect_vehicles(image_path, primary_conf)
+    used_conf = float(primary_conf)
+    fallback_used = False
+    if not detections and fallback_conf < primary_conf:
+        detections = detect_vehicles(image_path, fallback_conf)
+        used_conf = float(fallback_conf)
+        fallback_used = True
+    return detections, {
+        "primary_conf": float(primary_conf),
+        "fallback_conf": float(fallback_conf),
+        "fallback_used": fallback_used,
+        "used_conf": used_conf,
+        "raw_detection_count": len(detections),
+        "status": "detected" if detections else "empty_after_fallback",
+    }
 
 
 def _bbox_area(box: list) -> float:

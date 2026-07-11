@@ -208,6 +208,406 @@ class TestActorGraphVerifyRepairIntegration(unittest.TestCase):
 
             self.assertEqual(generator.verify_mode, "actor_graph")
 
+    def test_actor_patch_executor_updates_semantic_targets_and_audit_log(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            generator = _make_generator(tmp)
+            scene_id, relation_dsl, spawn_payload, _match_path = self._basic_inputs(tmp)
+            Path(generator._spawn_payload_path(scene_id)).write_text(
+                json.dumps(spawn_payload), encoding="utf-8"
+            )
+            compiled = {
+                "schema_version": "actor-repair-v1",
+                "patches": [
+                    {
+                        "op": "set_distance_band",
+                        "entity_id": "car_1",
+                        "target_band": "mid",
+                        "severity": "high",
+                    },
+                    {
+                        "op": "set_heading_relation",
+                        "entity_id": "car_1",
+                        "target_heading": "opposite_direction",
+                        "severity": "medium",
+                    },
+                ],
+                "rejected": [
+                    {
+                        "requested_patch": {"op": "bad"},
+                        "reason": "unsupported_patch_type",
+                    }
+                ],
+                "semantic_unrepairable": [],
+            }
+
+            result = generator._apply_actor_repair_patches(scene_id, {}, compiled)
+            repaired = json.loads(
+                Path(generator._spawn_payload_path(scene_id)).read_text(encoding="utf-8")
+            )
+            car = repaired["entities"][0]
+
+            self.assertEqual(result["applied_count"], 2)
+            self.assertEqual(result["rejected_count"], 1)
+            self.assertEqual(car["heading_relation"], "opposite_direction")
+            self.assertEqual(car["longitudinal_m"], 12.5)
+            self.assertEqual(
+                repaired["repair_metadata"]["target_overrides"]["car_1"]["distance_band"],
+                "mid",
+            )
+            self.assertEqual(
+                [item["status"] for item in repaired["repair_metadata"]["patch_outcomes"]],
+                ["rejected", "applied", "applied"],
+            )
+            target_graph = generator._write_source_actor_graph(
+                scene_id, {}, relation_dsl
+            )
+            target_actor = target_graph["actors"][0]
+            self.assertEqual(target_actor["distance_band"], "mid")
+            self.assertEqual(
+                target_actor["heading_relation"], "opposite_direction"
+            )
+
+    def test_pose_target_uses_actual_render_ego_frame_not_payload_longitudinal(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            generator = _make_generator(tmp)
+            scene_id, _relation_dsl, spawn_payload, _match_path = self._basic_inputs(tmp)
+            spawn_payload["entities"].append(
+                {
+                    "id": "ego",
+                    "category": "car",
+                    "location": {"x": 0.0, "y": 0.0, "z": 0.3},
+                    "rotation": {"yaw": 0.0},
+                }
+            )
+            Path(generator._spawn_payload_path(scene_id)).write_text(
+                json.dumps(spawn_payload), encoding="utf-8"
+            )
+            render_graph = {
+                "metadata": {
+                    "ego": {"location": {"x": 100.0, "y": 200.0, "z": 0.3}, "yaw": 90.0}
+                },
+                "actors": [
+                    {
+                        "id": "car_1",
+                        "ego_frame": {"longitudinal_m": 30.0},
+                        "heading_relation_to_ego": "same_direction",
+                    }
+                ],
+            }
+            result = generator._apply_actor_repair_patches(
+                scene_id,
+                {"lane_width_m": 3.5},
+                {
+                    "patches": [
+                        {
+                            "op": "set_pose_target",
+                            "entity_id": "car_1",
+                            "target_lane": "right_parking_lane",
+                            "target_longitudinal_m": 8.0,
+                            "target_lateral_offset_m": 1.0,
+                            "target_heading_relation": "opposite_direction",
+                            "severity": "high",
+                        }
+                    ],
+                    "rejected": [],
+                    "semantic_unrepairable": [],
+                },
+                render_graph=render_graph,
+            )
+            repaired = json.loads(
+                Path(generator._spawn_payload_path(scene_id)).read_text(encoding="utf-8")
+            )
+            car = next(item for item in repaired["entities"] if item["id"] == "car_1")
+
+            self.assertEqual(result["applied_count"], 1)
+            self.assertEqual(car["placement_mode"], "project_to_visual_pose")
+            self.assertEqual(car["longitudinal_m"], 8.0)
+            self.assertAlmostEqual(car["location"]["x"], 95.5)
+            self.assertAlmostEqual(car["location"]["y"], 208.0)
+            self.assertEqual(car["heading_relation"], "opposite_direction")
+            self.assertEqual(
+                car["visual_position_override"]["target_lateral_offset_m"], 1.0
+            )
+
+    def test_actor_graph_heading_patch_is_merged_when_vlm_omits_it(self):
+        spawn_payload = {
+            "entities": [
+                {"id": "car_1", "heading_relation": "same_direction"}
+            ]
+        }
+        source_graph = {
+            "actors": [
+                {
+                    "id": "car_1",
+                    "heading_relation": "opposite_direction",
+                    "distance_band": "near",
+                    "lane_side_relation": "same_lane",
+                }
+            ]
+        }
+        plan = {
+            "issues": [
+                {
+                    "issue_type": "heading_mismatch",
+                    "source_entity_id": "car_1",
+                    "severity": "medium",
+                }
+            ]
+        }
+
+        compiled = AutoGenerator._compile_actor_repair_patches(
+            {"repair_patches": [], "patch_rejections": [], "semantic_unrepairable": []},
+            plan,
+            source_graph,
+            spawn_payload,
+        )
+
+        self.assertEqual(compiled["patches"][0]["op"], "set_heading_relation")
+        self.assertEqual(
+            compiled["patches"][0]["target_heading"], "opposite_direction"
+        )
+
+    def test_live_actor_graph_geometry_compiles_to_pose_target(self):
+        compiled = AutoGenerator._compile_actor_repair_patches(
+            {"repair_patches": [], "patch_rejections": [], "semantic_unrepairable": []},
+            {
+                "issues": [
+                    {
+                        "issue_type": "longitudinal_mismatch",
+                        "source_entity_id": "car_1",
+                        "severity": "medium",
+                        "evidence": "actual pose is too near",
+                    }
+                ]
+            },
+            {
+                "actors": [
+                    {
+                        "id": "car_1",
+                        "lane_side_relation": "right_lane",
+                        "heading_relation": "same_direction",
+                        "expected_longitudinal_m": 18.0,
+                    }
+                ]
+            },
+            {"entities": [{"id": "car_1"}]},
+            render_graph={
+                "actors": [
+                    {"id": "car_1", "ego_frame": {"longitudinal_m": 8.0}}
+                ]
+            },
+        )
+
+        self.assertEqual(compiled["patches"][0]["op"], "set_pose_target")
+        self.assertEqual(compiled["patches"][0]["target_longitudinal_m"], 18.0)
+        self.assertEqual(compiled["patches"][0]["target_lane"], "right_lane")
+
+    def test_distance_band_patch_uses_nearest_position_with_minimum_spacing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            generator = _make_generator(tmp)
+            scene_id = "spacing"
+            spawn_payload = {
+                "entities": [
+                    {
+                        "id": "car_1",
+                        "category": "car",
+                        "lane_index_relation": 0,
+                        "location": {"x": 10.0, "y": 0.0, "z": 0.3},
+                        "rotation": {"yaw": 0.0},
+                    },
+                    {
+                        "id": "car_2",
+                        "category": "car",
+                        "lane_index_relation": 0,
+                        "longitudinal_m": 12.5,
+                        "location": {"x": 12.5, "y": 0.0, "z": 0.3},
+                        "rotation": {"yaw": 0.0},
+                    },
+                ]
+            }
+            Path(generator._spawn_payload_path(scene_id)).write_text(
+                json.dumps(spawn_payload), encoding="utf-8"
+            )
+            result = generator._apply_actor_repair_patches(
+                scene_id,
+                {},
+                {
+                    "patches": [
+                        {
+                            "op": "set_distance_band",
+                            "entity_id": "car_1",
+                            "target_band": "mid",
+                            "severity": "medium",
+                        }
+                    ],
+                    "rejected": [],
+                    "semantic_unrepairable": [],
+                },
+            )
+            repaired = json.loads(
+                Path(generator._spawn_payload_path(scene_id)).read_text(encoding="utf-8")
+            )
+
+            self.assertEqual(result["applied_count"], 1)
+            self.assertEqual(repaired["entities"][0]["longitudinal_m"], 18.0)
+
+    def test_layered_rollback_compares_fact_vector_before_visual_score(self):
+        baseline = {
+            "high_fact_issue_count": 0,
+            "spawn_failure_count": 0,
+            "medium_geometry_issue_count": 1,
+            "visual_available": True,
+            "visual_score": 0.8,
+        }
+        better_geometry = {
+            **baseline,
+            "medium_geometry_issue_count": 0,
+            "visual_score": 0.6,
+        }
+        worse_geometry = {
+            **baseline,
+            "high_fact_issue_count": 1,
+            "visual_score": 0.95,
+        }
+
+        self.assertFalse(
+            AutoGenerator._evaluation_is_worse(better_geometry, baseline)
+        )
+        self.assertTrue(AutoGenerator._evaluation_is_worse(worse_geometry, baseline))
+        self.assertTrue(
+            AutoGenerator._evaluation_is_worse(
+                {**baseline, "visual_available": False, "visual_score": None},
+                baseline,
+            )
+        )
+        self.assertFalse(
+            AutoGenerator._evaluation_is_worse(
+                baseline,
+                {**baseline, "visual_available": False, "visual_score": None},
+            )
+        )
+
+    def test_unconfirmed_inventory_feedback_is_rejected_not_repaired(self):
+        compiled = AutoGenerator._compile_actor_repair_patches(
+            {
+                "repair_patches": [],
+                "patch_rejections": [],
+                "semantic_unrepairable": [
+                    {"type": "count_mismatch", "severity": "high"}
+                ],
+            },
+            {"issues": []},
+            {"actors": [{"id": "car_1"}]},
+            {"entities": [{"id": "car_1"}]},
+        )
+
+        self.assertEqual(compiled["semantic_unrepairable"], [])
+        self.assertEqual(
+            compiled["rejected"][0]["reason"],
+            "semantic_issue_not_confirmed_by_actor_graph",
+        )
+
+    def test_two_round_regression_reverts_payload_and_selects_baseline(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            generator = _make_generator(
+                tmp,
+                {
+                    "enable_scene_verify": True,
+                    "verify_mode": "vlm",
+                    "verify_max_rounds": 2,
+                },
+            )
+            scene_id, relation_dsl, spawn_payload, match_path = self._basic_inputs(tmp)
+            payload_path = Path(generator._spawn_payload_path(scene_id))
+            payload_path.write_text(json.dumps(spawn_payload), encoding="utf-8")
+            capture = {
+                "layout_image_path": str(Path(tmp) / "ego.png"),
+                "ego_view_path": str(Path(tmp) / "ego.png"),
+                "bev_path": str(Path(tmp) / "bev.png"),
+                "capture_mode": "ego_view",
+                "error": None,
+            }
+            baseline_plan = {
+                "passed": False,
+                "score": 0.8,
+                "status": "failed",
+                "truth_source": "carla_actor_transform",
+                "issues": [
+                    {
+                        "issue_type": "heading_mismatch",
+                        "source_entity_id": "car_1",
+                        "severity": "medium",
+                    }
+                ],
+                "repair_actions": [],
+            }
+            regressed_plan = {
+                "passed": False,
+                "score": 0.0,
+                "status": "failed",
+                "truth_source": "carla_actor_transform",
+                "issues": [
+                    {
+                        "issue_type": "spawn_failure",
+                        "source_entity_id": "car_1",
+                        "severity": "high",
+                    }
+                ],
+                "repair_actions": [],
+            }
+            reports = [
+                {
+                    "passed": False,
+                    "score": 0.5,
+                    "recommended_stage": "match_spawn",
+                    "repair_patches": [
+                        {
+                            "op": "set_heading_relation",
+                            "entity_id": "car_1",
+                            "target_heading": "opposite_direction",
+                            "severity": "medium",
+                        }
+                    ],
+                },
+                {
+                    "passed": True,
+                    "score": 0.95,
+                    "recommended_stage": "pass",
+                    "repair_patches": [],
+                },
+            ]
+
+            with mock.patch.object(
+                generator, "_capture_layout_images", return_value=capture
+            ), mock.patch.object(
+                generator,
+                "_write_actor_graph_repair_plan",
+                side_effect=[baseline_plan, regressed_plan],
+            ), mock.patch.object(
+                generator, "_verify_scene_round", side_effect=reports
+            ), mock.patch.object(
+                generator, "generate_final_scene_script", return_value="final.py"
+            ):
+                summary = generator.verify_and_repair_spawn_layout(
+                    scene_id,
+                    "source.jpg",
+                    "",
+                    {},
+                    relation_dsl,
+                    {},
+                    match_path,
+                    "final.py",
+                )
+
+            restored = json.loads(payload_path.read_text(encoding="utf-8"))
+            self.assertTrue(summary["regression_reverted"])
+            self.assertEqual(summary["selected_round"], 1)
+            self.assertEqual(summary["rounds"][1]["repair"], "reverted_regression")
+            self.assertEqual(
+                restored["entities"][0]["heading_relation"], "same_direction"
+            )
+            self.assertNotIn("repair_metadata", restored)
+
     def test_vlm_mode_writes_actor_graph_artifacts_without_replacing_vlm_decision(self):
         with tempfile.TemporaryDirectory() as tmp:
             generator = _make_generator(
@@ -233,12 +633,24 @@ class TestActorGraphVerifyRepairIntegration(unittest.TestCase):
             with mock.patch.object(generator, "_capture_layout_images", return_value=capture), \
                 mock.patch.object(
                     generator,
+                    "_write_actor_graph_repair_plan",
+                    return_value={
+                        "passed": True,
+                        "score": 1.0,
+                        "status": "passed",
+                        "truth_source": "carla_actor_transform",
+                        "issues": [],
+                        "repair_actions": [],
+                    },
+                ), \
+                mock.patch.object(
+                    generator,
                     "_verify_scene_round",
                     return_value={
                         "passed": True,
                         "score": 0.9,
                         "recommended_stage": "pass",
-                        "repair_actions": [],
+                        "repair_patches": [],
                     },
                 ) as verify_mock:
                 summary = generator.verify_and_repair_spawn_layout(
@@ -257,7 +669,7 @@ class TestActorGraphVerifyRepairIntegration(unittest.TestCase):
             self.assertTrue(Path(generator._source_actor_graph_path(scene_id)).exists())
             self.assertTrue(Path(generator._actor_graph_repair_plan_path(scene_id, 1)).exists())
 
-    def test_vlm_mode_still_honors_actor_graph_code_fix_stop(self):
+    def test_vlm_mode_still_records_visual_evidence_for_high_fact_issue(self):
         with tempfile.TemporaryDirectory() as tmp:
             generator = _make_generator(
                 tmp,
@@ -303,8 +715,17 @@ class TestActorGraphVerifyRepairIntegration(unittest.TestCase):
             }
             with mock.patch.object(generator, "_capture_layout_images", return_value=capture), \
                 mock.patch.object(generator, "_write_actor_graph_repair_plan", return_value=blocked_plan), \
-                mock.patch.object(generator, "_verify_scene_round") as verify_mock, \
-                mock.patch.object(generator, "_apply_layout_repair_actions") as repair_mock:
+                mock.patch.object(
+                    generator,
+                    "_verify_scene_round",
+                    return_value={
+                        "passed": False,
+                        "score": 0.2,
+                        "recommended_stage": "match_spawn",
+                        "repair_patches": [],
+                    },
+                ) as verify_mock, \
+                mock.patch.object(generator, "_apply_actor_repair_patches") as repair_mock:
                 summary = generator.verify_and_repair_spawn_layout(
                     scene_id,
                     "source.jpg",
@@ -316,11 +737,11 @@ class TestActorGraphVerifyRepairIntegration(unittest.TestCase):
                     "final.py",
                 )
 
-            self.assertEqual(summary["rounds"][0]["repair"], "blocked_for_code_fix")
-            verify_mock.assert_not_called()
+            self.assertEqual(summary["rounds"][0]["repair"], "blocked_high_fact_issue")
+            verify_mock.assert_called_once()
             repair_mock.assert_not_called()
 
-    def test_vlm_scene_understanding_stage_preempts_geometry_repair(self):
+    def test_vlm_semantic_feedback_never_rewrites_scene_understanding(self):
         with tempfile.TemporaryDirectory() as tmp:
             generator = _make_generator(
                 tmp,
@@ -356,9 +777,16 @@ class TestActorGraphVerifyRepairIntegration(unittest.TestCase):
                 "passed": False,
                 "score": 0.4,
                 "recommended_stage": "scene_understanding",
-                "repair_actions": [
-                    {"type": "lane_side_mismatch", "entity_id": "car_1"},
-                    {"type": "count_mismatch", "severity": "high"},
+                "repair_patches": [
+                    {
+                        "op": "set_lane_target",
+                        "entity_id": "car_1",
+                        "target_lane": "right_lane",
+                        "severity": "high",
+                    },
+                ],
+                "semantic_unrepairable": [
+                    {"type": "count_mismatch", "severity": "high"}
                 ],
             }
             pass_report = {
@@ -380,7 +808,18 @@ class TestActorGraphVerifyRepairIntegration(unittest.TestCase):
                     "_rerun_structured_tail_no_remap",
                     return_value=(relation_dsl, {}, {}, "final2.py"),
                 ), \
-                mock.patch.object(generator, "_apply_layout_repair_actions") as repair_mock:
+                mock.patch.object(
+                    generator,
+                    "_apply_actor_repair_patches",
+                    return_value={
+                        "applied_count": 1,
+                        "no_op_count": 0,
+                        "rejected_count": 0,
+                        "blocked_count": 0,
+                        "patch_outcomes": [],
+                    },
+                ) as repair_mock, \
+                mock.patch.object(generator, "generate_final_scene_script", return_value="final2.py"):
                 summary = generator.verify_and_repair_spawn_layout(
                     scene_id,
                     "source.jpg",
@@ -392,9 +831,9 @@ class TestActorGraphVerifyRepairIntegration(unittest.TestCase):
                     "final.py",
                 )
 
-            self.assertEqual(summary["rounds"][0]["repair"], "scene_understanding_revision")
-            revise_mock.assert_called_once()
-            repair_mock.assert_not_called()
+            self.assertEqual(summary["rounds"][0]["repair"], "actor_patch_repair")
+            revise_mock.assert_not_called()
+            repair_mock.assert_called_once()
 
     def test_actor_graph_mode_stops_on_projection_code_fix_plan(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -447,7 +886,7 @@ class TestActorGraphVerifyRepairIntegration(unittest.TestCase):
                     "final.py",
                 )
 
-            self.assertEqual(summary["rounds"][0]["repair"], "blocked_for_code_fix")
+            self.assertEqual(summary["rounds"][0]["repair"], "blocked_high_fact_issue")
 
     def test_actor_graph_mode_routes_geometry_actions_to_spawn_payload_repair(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -477,7 +916,13 @@ class TestActorGraphVerifyRepairIntegration(unittest.TestCase):
                 "status": "failed",
                 "truth_source": "carla_actor_transform",
                 "stop_repair_loop": False,
-                "issues": [{"issue_type": "heading_mismatch", "severity": "medium"}],
+                "issues": [
+                    {
+                        "issue_type": "heading_mismatch",
+                        "severity": "medium",
+                        "source_entity_id": "car_1",
+                    }
+                ],
                 "repair_actions": [
                     {
                         "type": "heading_mismatch",
@@ -501,7 +946,17 @@ class TestActorGraphVerifyRepairIntegration(unittest.TestCase):
                     "_write_actor_graph_repair_plan",
                     side_effect=[repair_plan, pass_plan],
                 ), \
-                mock.patch.object(generator, "_apply_layout_repair_actions") as repair_mock, \
+                mock.patch.object(
+                    generator,
+                    "_apply_actor_repair_patches",
+                    return_value={
+                        "applied_count": 1,
+                        "no_op_count": 0,
+                        "rejected_count": 0,
+                        "blocked_count": 0,
+                        "patch_outcomes": [],
+                    },
+                ) as repair_mock, \
                 mock.patch.object(generator, "generate_final_scene_script", return_value="final2.py"):
                 summary = generator.verify_and_repair_spawn_layout(
                     scene_id,
@@ -515,8 +970,8 @@ class TestActorGraphVerifyRepairIntegration(unittest.TestCase):
                 )
 
             repair_mock.assert_called_once()
-            self.assertEqual(summary["rounds"][0]["repair"], "deterministic_layout_repair")
-            self.assertEqual(summary["rounds"][1]["repair"], "none")
+            self.assertEqual(summary["rounds"][0]["repair"], "actor_patch_repair")
+            self.assertEqual(summary["rounds"][1]["repair"], "final_verification")
 
     def test_actor_graph_mode_repairs_static_overlap_without_carla_capture(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -563,12 +1018,14 @@ class TestActorGraphVerifyRepairIntegration(unittest.TestCase):
 
             repaired = json.loads(Path(generator._spawn_payload_path(scene_id)).read_text())
             by_id = {entity["id"]: entity for entity in repaired["entities"]}
-            self.assertEqual(summary["rounds"][0]["repair"], "deterministic_layout_repair")
-            self.assertGreater(by_id["car_2"]["location"]["x"] - by_id["car_1"]["location"]["x"], 4.5)
             self.assertEqual(
-                repaired["repair_metadata"]["last_applied_repairs"][0]["type"],
-                "overlap_action",
+                summary["rounds"][0]["repair"], "blocked_high_fact_issue"
             )
+            self.assertAlmostEqual(
+                by_id["car_2"]["location"]["x"] - by_id["car_1"]["location"]["x"],
+                0.2,
+            )
+            self.assertNotIn("repair_metadata", repaired)
 
     def test_pairwise_lateral_repairs_are_aggregated_per_entity(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -632,6 +1089,129 @@ class TestActorGraphVerifyRepairIntegration(unittest.TestCase):
             self.assertAlmostEqual(entity["location"]["y"], 0.0)
             self.assertTrue(metadata["blocked_for_code_fix"])
             self.assertEqual(metadata["blocked_repairs"][0]["entity_id"], "car_1")
+
+    def test_right_parking_actor_ignores_generic_offlane_repair(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            generator = _make_generator(tmp)
+            scene_id, _relation_dsl, spawn_payload, _match_path = self._basic_inputs(tmp)
+            entity = spawn_payload["entities"][0]
+            entity.update(
+                {
+                    "lane_side_relation": "right_parking_lane",
+                    "placement_mode_hint": "parking_lane_actor",
+                    "placement_mode": "project_to_parking_lane",
+                }
+            )
+            original_location = dict(entity["location"])
+            Path(generator._spawn_payload_path(scene_id)).write_text(
+                json.dumps(spawn_payload),
+                encoding="utf-8",
+            )
+            report = {
+                "repair_actions": [
+                    {
+                        "type": "off_lane_spawn",
+                        "entity_id": "car_1",
+                        "nearest_waypoint": {
+                            "x": 99.0,
+                            "y": 99.0,
+                            "z": 0.0,
+                            "yaw": 0.0,
+                            "road_id": 76,
+                            "lane_id": -1,
+                        },
+                    }
+                ]
+            }
+
+            result = generator._apply_layout_repair_actions(scene_id, {}, report)
+            repaired = result["entities"][0]
+
+            self.assertEqual(repaired["location"], original_location)
+            self.assertEqual(repaired["placement_mode"], "project_to_parking_lane")
+            self.assertNotIn(
+                "off_lane_snap",
+                [
+                    item["type"]
+                    for item in result["repair_metadata"]["last_applied_repairs"]
+                ],
+            )
+
+    def test_valid_rightmost_driving_fallback_is_not_offlane(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            generator = _make_generator(tmp)
+            generator.carla_spawn_context = {
+                "dense_local_waypoints": [
+                    {"x": 0.0, "y": 0.0, "z": 0.0, "yaw": 0.0, "road_id": 76, "lane_id": -2}
+                ]
+            }
+            render_graph = {
+                "actors": [
+                    {
+                        "id": "car_1",
+                        "spawn_kind": "vehicle",
+                        "spawned": True,
+                        "location": {"x": 0.0, "y": 0.0, "z": 0.3},
+                        "actual_waypoint": {"road_id": 76, "lane_id": -2},
+                        "parking_projection_result": "rightmost_driving_fallback",
+                        "parking_projection_lane": {"road_id": 76, "lane_id": -2},
+                    }
+                ]
+            }
+            spawn_payload = {
+                "entities": [
+                    {
+                        "id": "car_1",
+                        "spawn_kind": "vehicle",
+                        "lane_side_relation": "right_parking_lane",
+                    }
+                ]
+            }
+
+            issues = generator._offlane_spawn_issues(
+                render_graph,
+                spawn_payload,
+                {"lane_width_m": 3.5},
+            )
+
+            self.assertEqual(issues, [])
+
+    def test_valid_real_parking_projection_is_not_offlane(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            generator = _make_generator(tmp)
+            generator.carla_spawn_context = {
+                "dense_local_waypoints": [
+                    {"x": 0.0, "y": 0.0, "z": 0.0, "yaw": 0.0, "road_id": 76, "lane_id": -1}
+                ]
+            }
+            render_graph = {
+                "actors": [
+                    {
+                        "id": "car_1",
+                        "spawn_kind": "vehicle",
+                        "spawned": True,
+                        "location": {"x": 0.0, "y": 3.5, "z": 0.3},
+                        "actual_waypoint": {"road_id": 76, "lane_id": -2},
+                        "parking_projection_result": "parking_lane",
+                        "parking_projection_lane": {"road_id": 76, "lane_id": -2},
+                    }
+                ]
+            }
+            spawn_payload = {
+                "entities": [
+                    {
+                        "id": "car_1",
+                        "spawn_kind": "vehicle",
+                        "lane_side_relation": "right_parking_lane",
+                    }
+                ]
+            }
+
+            issues = generator._offlane_spawn_issues(
+                render_graph, spawn_payload, {"lane_width_m": 3.5}
+            )
+
+            self.assertEqual(issues, [])
 
 
 class TestFallbackCarlaSpawnContext(unittest.TestCase):

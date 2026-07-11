@@ -294,9 +294,9 @@ def _branch_direction_fit(
         candidate_dirs = None
     if not isinstance(candidate_dirs, dict):
         # Older caches only have ``junction_branch_dirs``, which describes the
-        # current lane's reachable maneuvers. Do not compare that lane-level
-        # field to the target's physical junction arms.
-        return 0.72, []
+        # current lane's reachable maneuvers.  It cannot prove that a physical
+        # left/right/ahead arm exists, so a junction target must not accept it.
+        return 0.0, ["physical_junction_arms_missing"]
     errors = []
     for side in ("ahead", "left", "right"):
         target_has = bool(target_branches.get(side))
