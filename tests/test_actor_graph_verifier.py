@@ -263,6 +263,32 @@ class TestActorGraphVerifier(unittest.TestCase):
         self.assertIn("longitudinal_mismatch", issue_types)
         self.assertIn("heading_mismatch", issue_types)
 
+    def test_visual_position_override_skips_lane_checks_and_validates_target(self):
+        source = build_source_actor_graph(
+            {}, _relation_dsl(_source_entity("car_1", lane="same_lane"))
+        )
+        source_actor = source["actors"][0]
+        source_actor["visual_position_override"] = {
+            "target_longitudinal_m": 10.0,
+            "target_lateral_offset_m": 4.0,
+            "target_heading_relation": "same_direction",
+            "requested_world_location": {"x": 10.0, "y": 4.0, "z": 0.3},
+            "longitudinal_tolerance_m": 1.5,
+            "lateral_tolerance_m": 0.75,
+        }
+        render_actor = _render_actor("car_1", lane="left_lane")
+        render_actor["ego_frame"]["lane_index_relation"] = -2
+        render_actor["ego_frame"]["lateral_m"] = -7.0
+        render_actor["location"] = {"x": 10.0, "y": 4.0, "z": 0.3}
+        render = _render_graph(render_actor)
+
+        plan = compare_actor_graphs(source, render)
+
+        issue_types = [issue["issue_type"] for issue in plan["issues"]]
+        self.assertNotIn("lane_side_mismatch", issue_types)
+        self.assertNotIn("longitudinal_mismatch", issue_types)
+        self.assertNotIn("visual_target_deviation", issue_types)
+
     def test_right_edge_source_is_compatible_with_right_lane_render(self):
         source = build_source_actor_graph(
             {},
@@ -293,6 +319,30 @@ class TestActorGraphVerifier(unittest.TestCase):
         render_actor["parking_projection_result"] = "rightmost_driving_fallback"
         render_actor["parking_projection_lane"] = {"road_id": 76, "lane_id": -2}
         render_actor["actual_waypoint"] = {"road_id": 76, "lane_id": -2}
+
+        plan = compare_actor_graphs(source, _render_graph(render_actor))
+
+        self.assertNotIn(
+            "lane_side_mismatch",
+            [issue["issue_type"] for issue in plan["issues"]],
+        )
+
+    def test_real_parking_lane_is_not_lane_mismatch(self):
+        source = build_source_actor_graph(
+            {},
+            _relation_dsl(
+                _source_entity("car_1", lane="right_parking_lane", lane_index=1)
+            ),
+        )
+        render_actor = _render_actor("car_1", lane="same_lane")
+        render_actor["ego_frame"]["lane_index_relation"] = 0
+        render_actor["parking_projection_result"] = "parking_lane"
+        render_actor["parking_projection_lane"] = {"road_id": 76, "lane_id": -2}
+        render_actor["actual_waypoint"] = {
+            "road_id": 76,
+            "lane_id": -2,
+            "lane_type": "LaneType.Parking",
+        }
 
         plan = compare_actor_graphs(source, _render_graph(render_actor))
 

@@ -929,6 +929,20 @@ class ExistingWorldScenarioGenerator(ScenarioGenerator):
             "            _autoscenario_actor_by_id[entity_id] = actor\n"
             "        continue\n"
             "    placement_mode = str(entity.get('placement_mode') or 'project_to_lane')\n"
+            "    if placement_mode == 'project_to_visual_pose':\n"
+            "        actor = _autoscenario_spawn_vehicle_visual_pose(\n"
+            "            blueprint_name,\n"
+            "            location,\n"
+            "            rotation,\n"
+            "            entity.get('visual_position_override'),\n"
+            "            entity.get('projected_lane'),\n"
+            "            entity.get('color'),\n"
+            "            entity_id=entity_id,\n"
+            "            lane_side_relation=entity.get('lane_side_relation'),\n"
+            "        )\n"
+            "        if actor is not None and entity_id:\n"
+            "            _autoscenario_actor_by_id[entity_id] = actor\n"
+            "        continue\n"
             "    if placement_mode in {'direct', 'preserve_xy'}:\n"
             "        actor = _autoscenario_spawn_vehicle_direct(\n"
             "            blueprint_name,\n"
@@ -2282,6 +2296,7 @@ class ExistingWorldScenarioGenerator(ScenarioGenerator):
         carla_map: Optional[str] = None,
         scene_match_status: Optional[str] = None,
         scene_match_reason: Optional[str] = None,
+        carla_timeout: float = 30.0,
     ) -> str:
         helper_block = self._build_scene_helper_block()
         status_comment = f"# scene_match_status: {scene_match_status or 'unknown'}"
@@ -2302,7 +2317,7 @@ class ExistingWorldScenarioGenerator(ScenarioGenerator):
             "import time\n\n"
             f"_AUTOSCENARIO_SPAWN_PAYLOAD = {spawn_payload_filename!r}\n\n"
             f"client = carla.Client({carla_host!r}, {int(carla_port)})\n"
-            "client.set_timeout(10.0)\n"
+            f"client.set_timeout({float(carla_timeout)!r})\n"
             f"{world_loader}"
             "try:\n"
             "    world.wait_for_tick()\n"
@@ -2323,6 +2338,7 @@ class ExistingWorldScenarioGenerator(ScenarioGenerator):
         carla_map: Optional[str] = None,
         scene_match_status: Optional[str] = None,
         scene_match_reason: Optional[str] = None,
+        carla_timeout: float = 30.0,
     ) -> str:
         helper_block = self._build_scene_helper_block()
         status_comment = f"# scene_match_status: {scene_match_status or 'unknown'}"
@@ -2347,7 +2363,7 @@ class ExistingWorldScenarioGenerator(ScenarioGenerator):
             f"_AUTOSCENARIO_RISK_SAMPLE = {risk_sample_filename!r}\n"
             f"_AUTOSCENARIO_RISK_METRICS = {risk_metrics_filename!r}\n\n"
             f"client = carla.Client({carla_host!r}, {int(carla_port)})\n"
-            "client.set_timeout(10.0)\n"
+            f"client.set_timeout({float(carla_timeout)!r})\n"
             f"{world_loader}"
             "try:\n"
             "    world.wait_for_tick()\n"
@@ -2368,6 +2384,7 @@ class ExistingWorldScenarioGenerator(ScenarioGenerator):
         carla_map: Optional[str] = None,
         scene_match_status: Optional[str] = None,
         scene_match_reason: Optional[str] = None,
+        carla_timeout: float = 30.0,
     ) -> str:
         helper_block = self._build_scene_helper_block()
         status_comment = f"# scene_match_status: {scene_match_status or 'unknown'}"
@@ -2392,7 +2409,7 @@ class ExistingWorldScenarioGenerator(ScenarioGenerator):
             f"_AUTOSCENARIO_RISK_DSL = {dsl_filename!r}\n"
             f"_AUTOSCENARIO_RISK_METRICS = {risk_metrics_filename!r}\n\n"
             f"client = carla.Client({carla_host!r}, {int(carla_port)})\n"
-            "client.set_timeout(10.0)\n"
+            f"client.set_timeout({float(carla_timeout)!r})\n"
             f"{world_loader}"
             "try:\n"
             "    world.wait_for_tick()\n"

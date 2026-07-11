@@ -213,6 +213,9 @@ def build_render_actor_graph_from_spawn_payload(
             "blueprint_name": entity.get("blueprint_name"),
             "placement_mode": str(entity.get("placement_mode") or "project_to_lane"),
             "projected_lane": _coerce_dict(entity.get("projected_lane")),
+            "visual_position_override": _coerce_dict(
+                entity.get("visual_position_override")
+            ),
             "layout_anchor_id": str(entity.get("layout_anchor_id") or ""),
             "anchor_relation": _coerce_dict(entity.get("anchor_relation")),
             "junction_direction": str(entity.get("junction_direction") or ""),
@@ -277,6 +280,9 @@ def build_render_actor_graph_from_carla_records(
             "blueprint_name": entity.get("blueprint_name"),
             "placement_mode": str(entity.get("placement_mode") or "project_to_lane"),
             "projected_lane": _coerce_dict(entity.get("projected_lane")),
+            "visual_position_override": _coerce_dict(
+                entity.get("visual_position_override")
+            ),
             "layout_anchor_id": str(entity.get("layout_anchor_id") or ""),
             "anchor_relation": _coerce_dict(entity.get("anchor_relation")),
             "junction_direction": str(entity.get("junction_direction") or ""),
@@ -311,6 +317,10 @@ def build_render_actor_graph_from_carla_records(
                 )
                 actor["parking_projection_lane"] = _coerce_dict(
                     record.get("parking_projection_lane")
+                )
+            if isinstance(record.get("visual_position_result"), dict):
+                actor["visual_position_result"] = _coerce_dict(
+                    record.get("visual_position_result")
                 )
             longitudinal, lateral = _relative_metrics({"location": loc}, ego)
             actor["ego_frame"] = {
@@ -681,9 +691,9 @@ def compare_actor_graphs(
             render_actor.get("parking_projection_lane")
         )
         actual_waypoint = _coerce_dict(render_actor.get("actual_waypoint"))
-        parking_fallback_valid = (
+        parking_projection_valid = (
             str(render_actor.get("parking_projection_result") or "")
-            == "rightmost_driving_fallback"
+            in {"parking_lane", "rightmost_driving_fallback"}
             and parking_fallback_lane.get("road_id") is not None
             and parking_fallback_lane.get("lane_id") is not None
             and str(parking_fallback_lane.get("road_id"))
@@ -691,15 +701,86 @@ def compare_actor_graphs(
             and str(parking_fallback_lane.get("lane_id"))
             == str(actual_waypoint.get("lane_id"))
         )
+        visual_override = _coerce_dict(source_actor.get("visual_position_override"))
+        if visual_override:
+            target_longitudinal = visual_override.get("target_longitudinal_m")
+            actual_longitudinal = render_ego.get("longitudinal_m")
+            longitudinal_tolerance = float(
+                visual_override.get("longitudinal_tolerance_m") or 1.5
+            )
+            if isinstance(target_longitudinal, (int, float)) and isinstance(
+                actual_longitudinal, (int, float)
+            ):
+                error_m = abs(float(target_longitudinal) - float(actual_longitudinal))
+                if error_m > longitudinal_tolerance:
+                    issues.append(_issue(
+                        "visual_target_deviation",
+                        "spawn_payload",
+                        "reproject_visual_pose",
+                        source_actor,
+                        render_actor,
+                        "medium",
+                        f"{actor_id} visual target longitudinal={float(target_longitudinal):.2f}m "
+                        f"actual={float(actual_longitudinal):.2f}m error={error_m:.2f}m",
+                    ))
+            requested_location = _coerce_dict(
+                visual_override.get("requested_world_location")
+            )
+            actual_location = _coerce_dict(render_actor.get("location"))
+            visual_result = _coerce_dict(render_actor.get("visual_position_result"))
+            collision_adjustment = visual_result.get("collision_adjustment_m")
+            lateral_tolerance = float(
+                visual_override.get("lateral_tolerance_m") or 0.75
+            ) + (
+                float(collision_adjustment)
+                if isinstance(collision_adjustment, (int, float))
+                else 0.0
+            )
+            if requested_location and actual_location:
+                dx = float(actual_location.get("x", 0.0)) - float(
+                    requested_location.get("x", 0.0)
+                )
+                dy = float(actual_location.get("y", 0.0)) - float(
+                    requested_location.get("y", 0.0)
+                )
+                positional_error = math.sqrt(dx * dx + dy * dy)
+                if positional_error > lateral_tolerance:
+                    issues.append(_issue(
+                        "visual_target_deviation",
+                        "spawn_payload",
+                        "reproject_visual_pose",
+                        source_actor,
+                        render_actor,
+                        "medium",
+                        f"{actor_id} visual target XY error={positional_error:.2f}m "
+                        f"(collision adjustment={collision_adjustment})",
+                    ))
+            target_heading = str(
+                visual_override.get("target_heading_relation") or ""
+            )
+            render_heading = str(
+                render_actor.get("heading_relation_to_ego") or "unknown"
+            )
+            if target_heading and render_heading != target_heading:
+                issues.append(_issue(
+                    "heading_mismatch",
+                    "spawn_payload",
+                    "reproject_visual_pose",
+                    source_actor,
+                    render_actor,
+                    "medium",
+                    f"{actor_id} visual heading target={target_heading} render={render_heading}",
+                ))
+            # A visual position override deliberately may be off lane. Validate
+            # its explicit target, not the old relation DSL lane/band fields.
+            continue
         if junction_local_frame:
             # Side-arm lane slots live in the arm's local frame. Structural
             # validation compares them; ego lateral metres are not comparable.
             pass
-        elif parking_fallback_valid:
-            # The source semantic remains right_parking_lane, but the selected
-            # CARLA map has no usable Parking lane at this longitudinal point.
-            # An explicit, verified fallback to the rightmost same-direction
-            # Driving lane is an allowed reconstruction, not a lane mismatch.
+        elif parking_projection_valid:
+            # A real Parking lane and the explicit rightmost-Driving fallback
+            # are both legal physical realizations of parking semantics.
             pass
         elif source_heading == "opposite_direction":
             # Oncoming actors live on the opposing carriageway across the median.
@@ -768,7 +849,7 @@ def compare_actor_graphs(
                 f"{actor_id} distance band source={source_band} render={render_band}"
             )
         if longitudinal_mismatch:
-            issues.append(_issue(
+            issue = _issue(
                 "longitudinal_mismatch",
                 "spawn_payload",
                 "shift_longitudinal",
@@ -777,7 +858,17 @@ def compare_actor_graphs(
                 "medium",
                 longitudinal_evidence,
                 direction=f"{source_band}->{render_band}",
-            ))
+            )
+            if (
+                isinstance(expected_longitudinal, (int, float))
+                and isinstance(actual_longitudinal, (int, float))
+            ):
+                issue["expected_longitudinal_m"] = float(expected_longitudinal)
+                issue["actual_longitudinal_m"] = float(actual_longitudinal)
+                issue["projection_correction_m"] = (
+                    float(expected_longitudinal) - float(actual_longitudinal)
+                )
+            issues.append(issue)
         render_heading = str(render_actor.get("heading_relation_to_ego") or "unknown")
         if (
             source_heading != "unknown"

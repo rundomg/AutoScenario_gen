@@ -13,6 +13,7 @@ _AUTOSCENARIO_SPAWNED_ACTORS = []
 _AUTOSCENARIO_FOCUS_POINTS = []
 _AUTOSCENARIO_EXISTING_VEHICLES = []
 _AUTOSCENARIO_PARKING_PROJECTION_RESULTS = {}
+_AUTOSCENARIO_VISUAL_POSITION_RESULTS = {}
 _AUTOSCENARIO_LAST_PARKING_PROJECTION_RESULT = {
     "result": "unavailable",
     "lane": None,
@@ -71,6 +72,7 @@ def _autoscenario_init(w, bl):
     world = w
     blueprint_library = bl
     _AUTOSCENARIO_PARKING_PROJECTION_RESULTS.clear()
+    _AUTOSCENARIO_VISUAL_POSITION_RESULTS.clear()
 
 
 def _autoscenario_normalize_key(value):
@@ -735,6 +737,177 @@ def _autoscenario_project_vehicle_to_parking_lane(
             _autoscenario_normalize_yaw(snapped_yaw),
             float(base_rotation.roll),
         ),
+    )
+
+
+def _autoscenario_project_vehicle_to_visual_pose(
+    location,
+    rotation,
+    visual_position_override=None,
+    projected_lane=None,
+    lane_side_relation=None,
+):
+    """Resolve a visual repair target without snapping away its offset or yaw."""
+    base_location = _autoscenario_to_location(location)
+    base_rotation = _autoscenario_to_rotation(rotation)
+    override = (
+        visual_position_override
+        if isinstance(visual_position_override, dict)
+        else {}
+    )
+    target_lane = str(
+        override.get("target_lane") or lane_side_relation or "same_lane"
+    )
+    projected_lane = projected_lane if isinstance(projected_lane, dict) else {}
+    driving_type = getattr(carla.LaneType, "Driving", None)
+    parking_type = getattr(carla.LaneType, "Parking", None)
+    driving_seed = _autoscenario_get_waypoint_for_lane_type(
+        base_location, driving_type
+    )
+    basis = driving_seed
+    projection_result = "driving_lane"
+    if target_lane in {"left_parking_lane", "right_parking_lane"}:
+        basis = _autoscenario_get_waypoint_for_lane_type(base_location, parking_type)
+        if not _autoscenario_lane_is_parking(basis):
+            basis = _autoscenario_find_adjacent_parking_waypoint(
+                driving_seed, projected_lane.get("road_id")
+            )
+        projection_result = "parking_lane"
+        if basis is None and target_lane == "right_parking_lane":
+            basis = _autoscenario_rightmost_same_direction_driving_waypoint(
+                driving_seed
+            )
+            projection_result = "rightmost_driving_fallback"
+    elif target_lane == "opposing_lane":
+        projected_location, _ = _autoscenario_project_to_opposing_lane(
+            base_location, base_rotation
+        )
+        basis = _autoscenario_get_waypoint_for_lane_type(
+            projected_location, driving_type
+        )
+        projection_result = "opposing_driving_lane"
+
+    if basis is None:
+        return base_location, base_rotation, {
+            "result": "unavailable",
+            "target_lane": target_lane,
+            "basis_lane": None,
+            "collision_adjustment_m": None,
+        }
+
+    basis_location = basis.transform.location
+    basis_yaw = float(basis.transform.rotation.yaw)
+    yaw_radians = math.radians(basis_yaw)
+    right_x, right_y = -math.sin(yaw_radians), math.cos(yaw_radians)
+    lateral_offset = float(override.get("target_lateral_offset_m") or 0.0)
+    visual_location = carla.Location(
+        float(basis_location.x) + right_x * lateral_offset,
+        float(basis_location.y) + right_y * lateral_offset,
+        float(basis_location.z) + 0.35,
+    )
+    try:
+        basis_lane = {"road_id": int(basis.road_id), "lane_id": int(basis.lane_id)}
+    except Exception:
+        basis_lane = None
+    return visual_location, base_rotation, {
+        "result": projection_result,
+        "target_lane": target_lane,
+        "basis_lane": basis_lane,
+        "collision_adjustment_m": 0.0,
+    }
+
+
+def _autoscenario_try_spawn_vehicle_actor_visual(
+    blueprint, location, rotation, entity_id=None, visual_result=None
+):
+    """Spawn at the visual target, then use the smallest same-frame offset to avoid overlap."""
+    if blueprint is None:
+        return None
+    base_location = _autoscenario_to_location(location)
+    base_rotation = _autoscenario_to_rotation(rotation)
+    yaw_radians = math.radians(float(base_rotation.yaw))
+    forward_x, forward_y = math.cos(yaw_radians), math.sin(yaw_radians)
+    right_x, right_y = -forward_y, forward_x
+    candidate_offsets = [(0.0, 0.0)]
+    for radius in (0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 5.0, 6.0):
+        candidate_offsets.extend(
+            [
+                (radius, 0.0), (-radius, 0.0), (0.0, radius), (0.0, -radius),
+                (radius, radius), (radius, -radius), (-radius, radius), (-radius, -radius),
+            ]
+        )
+    for forward_offset, lateral_offset in candidate_offsets:
+        candidate_location = carla.Location(
+            float(base_location.x) + forward_x * forward_offset + right_x * lateral_offset,
+            float(base_location.y) + forward_y * forward_offset + right_y * lateral_offset,
+            float(base_location.z),
+        )
+        if not _autoscenario_spawn_location_is_clear(
+            candidate_location,
+            _autoscenario_min_spawn_spacing_for_blueprint(blueprint),
+        ):
+            continue
+        actor = world.try_spawn_actor(
+            blueprint, carla.Transform(candidate_location, base_rotation)
+        )
+        if actor is None:
+            continue
+        _AUTOSCENARIO_SPAWNED_ACTORS.append(actor)
+        try:
+            actor.set_autopilot(False)
+            actor.apply_control(carla.VehicleControl(brake=1.0))
+        except Exception:
+            pass
+        if entity_id:
+            result = dict(visual_result or {})
+            result["collision_adjustment_m"] = round(
+                math.sqrt(forward_offset ** 2 + lateral_offset ** 2), 3
+            )
+            result["realized_seed_location"] = {
+                "x": float(candidate_location.x),
+                "y": float(candidate_location.y),
+                "z": float(candidate_location.z),
+            }
+            _AUTOSCENARIO_VISUAL_POSITION_RESULTS[str(entity_id)] = result
+        return actor
+    if entity_id:
+        result = dict(visual_result or {})
+        result["collision_adjustment_m"] = None
+        result["result"] = "spawn_blocked"
+        _AUTOSCENARIO_VISUAL_POSITION_RESULTS[str(entity_id)] = result
+    return None
+
+
+def _autoscenario_spawn_vehicle_visual_pose(
+    blueprint_name,
+    location,
+    rotation,
+    visual_position_override=None,
+    projected_lane=None,
+    color=None,
+    role_name=None,
+    entity_id=None,
+    lane_side_relation=None,
+):
+    snapped_location, snapped_rotation, visual_result = (
+        _autoscenario_project_vehicle_to_visual_pose(
+            location,
+            rotation,
+            visual_position_override=visual_position_override,
+            projected_lane=projected_lane,
+            lane_side_relation=lane_side_relation,
+        )
+    )
+    _autoscenario_record_focus_point(snapped_location)
+    bp = _autoscenario_pick_blueprint("vehicle", blueprint_name)
+    _autoscenario_apply_vehicle_color(bp, color)
+    _autoscenario_apply_role_name(bp, role_name)
+    return _autoscenario_try_spawn_vehicle_actor_visual(
+        bp,
+        snapped_location,
+        snapped_rotation,
+        entity_id=entity_id,
+        visual_result=visual_result,
     )
 
 
@@ -1413,7 +1586,7 @@ def _autoscenario_actor_transform_record(actor):
     }
 
 
-def _autoscenario_waypoint_record(location):
+def _autoscenario_waypoint_record(location, preferred_lane_type=None):
     try:
         world_map = world.get_map()
         carla_location = carla.Location(
@@ -1421,7 +1594,8 @@ def _autoscenario_waypoint_record(location):
             float(location.get("y", 0.0)),
             float(location.get("z", 0.0)),
         )
-        lane_type = getattr(carla.LaneType, "Driving", None)
+        lane_type_name = str(preferred_lane_type or "Driving")
+        lane_type = getattr(carla.LaneType, lane_type_name, None)
         if lane_type is not None:
             waypoint = world_map.get_waypoint(
                 carla_location,
@@ -1449,6 +1623,7 @@ def _autoscenario_waypoint_record(location):
             "y": float(loc.y),
             "z": float(loc.z),
             "yaw": float(rot.yaw),
+            "lane_type": str(getattr(waypoint, "lane_type", lane_type_name)),
         }
     except Exception:
         return None
@@ -1496,12 +1671,16 @@ def _autoscenario_capture_render_actor_graph_if_requested(spawn_payload, actor_b
             "lane_side_relation": str(entity.get("lane_side_relation") or "same_lane"),
             "placement_mode": str(entity.get("placement_mode") or "project_to_lane"),
             "projected_lane": entity.get("projected_lane") or {},
+            "visual_position_override": entity.get("visual_position_override") or {},
             "truth_source": "carla_actor_transform",
         }
         parking_projection = _AUTOSCENARIO_PARKING_PROJECTION_RESULTS.get(entity_id)
         if isinstance(parking_projection, dict):
             record["parking_projection_result"] = parking_projection.get("result")
             record["parking_projection_lane"] = parking_projection.get("lane")
+        visual_result = _AUTOSCENARIO_VISUAL_POSITION_RESULTS.get(entity_id)
+        if isinstance(visual_result, dict):
+            record["visual_position_result"] = visual_result
         if actor is None:
             record["spawned"] = False
             record["spawn_failure_reason"] = "try_spawn_actor_returned_none_or_collision"
@@ -1512,8 +1691,13 @@ def _autoscenario_capture_render_actor_graph_if_requested(spawn_payload, actor_b
             record["location"] = actor_record["location"]
             record["yaw"] = actor_record["yaw"]
             record["blueprint_id"] = actor_record.get("blueprint_id")
+            preferred_lane_type = (
+                "Parking"
+                if str(record.get("parking_projection_result") or "") == "parking_lane"
+                else "Driving"
+            )
             record["actual_waypoint"] = _autoscenario_waypoint_record(
-                actor_record["location"]
+                actor_record["location"], preferred_lane_type=preferred_lane_type
             )
             if ego_record:
                 record["ego_frame"] = _autoscenario_ego_frame(
@@ -1541,7 +1725,9 @@ def _autoscenario_capture_render_actor_graph_if_requested(spawn_payload, actor_b
         "metadata": {
             "actor_count": len(actors),
             "truth_unavailable": False,
+            "ego": ego_record,
         },
+        "ego": ego_record,
     }
     try:
         os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)

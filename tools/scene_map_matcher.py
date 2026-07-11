@@ -201,7 +201,7 @@ class SceneMapMatcher:
         self,
         host: str = "localhost",
         port: int = 2000,
-        timeout: float = 10.0,
+        timeout: float = 30.0,
         sample_step: float = 5.0,
         search_radius: float = 30.0,
         coarse_top_k: int = 20,

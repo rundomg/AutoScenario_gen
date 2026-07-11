@@ -80,7 +80,7 @@ class AutoGenerator:
 
         self.carla_host = info_dict.get("carla_host", "localhost")
         self.carla_port = info_dict.get("carla_port", 2000)
-        self.carla_timeout = info_dict.get("carla_timeout", 10.0)
+        self.carla_timeout = float(info_dict.get("carla_timeout", 30.0))
         self.carla_map = info_dict.get("carla_map")
         self.spawn_point_limit = info_dict.get("spawn_point_limit", 12)
         self.require_carla_connection = info_dict.get("require_carla_connection", True)
@@ -1357,11 +1357,15 @@ class AutoGenerator:
             spawn_kind = str(entity.get("spawn_kind") or actor.get("spawn_kind") or "vehicle")
             if spawn_kind != "vehicle":
                 continue
+            if isinstance(entity.get("visual_position_override"), dict) and entity.get(
+                "visual_position_override"
+            ):
+                continue
             fallback_lane = actor.get("parking_projection_lane") or {}
             actual_waypoint = actor.get("actual_waypoint") or {}
             if (
                 str(actor.get("parking_projection_result") or "")
-                == "rightmost_driving_fallback"
+                in {"parking_lane", "rightmost_driving_fallback"}
                 and fallback_lane.get("road_id") is not None
                 and fallback_lane.get("lane_id") is not None
                 and str(fallback_lane.get("road_id"))
@@ -1489,6 +1493,7 @@ class AutoGenerator:
             spawn_payload_filename=os.path.basename(self._spawn_payload_path(scene_id)),
             carla_host=self.carla_host,
             carla_port=self.carla_port,
+            carla_timeout=self.carla_timeout,
             carla_map=carla_map,
             scene_match_status=match_report.get("status"),
             scene_match_reason=match_report.get("reason"),
@@ -1714,6 +1719,8 @@ class AutoGenerator:
         user_scene_description: str,
         scene_understanding: dict,
         match_report_path: str,
+        bev_image_path: str = None,
+        actor_graph_evidence: dict = None,
     ) -> dict:
         verification_path = self._verification_path(scene_id, round_index)
         match_report = self._load_json_if_exists(match_report_path)
@@ -1734,16 +1741,19 @@ class AutoGenerator:
                     "output_fn": verification_path,
                     "source_image_path": image_path,
                     "layout_image_path": layout_image_path,
-                    "bev_image_path": layout_image_path,
+                    "bev_image_path": bev_image_path,
                     "capture_mode": capture_mode,
                     "scene_understanding": scene_understanding,
                     "scene_match": match_report,
                     "spawn_entities": spawn_payload,
+                    "actor_graph_evidence": actor_graph_evidence or {},
                     "user_scene_description": user_scene_description,
                 }
             )
         report["capture_mode"] = capture_mode
         report["layout_image_path"] = layout_image_path
+        report["bev_image_path"] = bev_image_path
+        report["actor_graph_evidence"] = actor_graph_evidence or {}
         report["passed"] = bool(report.get("passed")) and float(report.get("score", 0.0)) >= self.verify_min_score
         score = float(report.get("score", 0.0))
         passed = report.get("passed")
@@ -1770,6 +1780,40 @@ class AutoGenerator:
             relation_dsl,
             spawn_payload=spawn_payload,
         )
+        overrides = (
+            (spawn_payload.get("repair_metadata") or {}).get("target_overrides")
+            or {}
+        )
+        if isinstance(overrides, dict):
+            for actor in graph.get("actors") or []:
+                override = overrides.get(str(actor.get("id") or ""))
+                if not isinstance(override, dict):
+                    continue
+                if override.get("lane_side_relation"):
+                    actor["lane_side_relation"] = override["lane_side_relation"]
+                    actor["lane_index_relation"] = int(
+                        override.get("lane_index_relation", actor.get("lane_index_relation", 0))
+                    )
+                if override.get("distance_band"):
+                    actor["distance_band"] = override["distance_band"]
+                if isinstance(override.get("expected_longitudinal_m"), (int, float)):
+                    actor["expected_longitudinal_m"] = float(
+                        override["expected_longitudinal_m"]
+                    )
+                if override.get("heading_relation"):
+                    actor["heading_relation"] = override["heading_relation"]
+                visual_override = override.get("visual_position_override") or {}
+                if isinstance(visual_override, dict) and visual_override:
+                    actor["visual_position_override"] = deepcopy(visual_override)
+                    actor["expected_longitudinal_m"] = float(
+                        visual_override.get(
+                            "target_longitudinal_m",
+                            actor.get("expected_longitudinal_m", 0.0),
+                        )
+                    )
+                    actor["expected_lateral_offset_m"] = float(
+                        visual_override.get("target_lateral_offset_m", 0.0)
+                    )
         write_to_file(
             self._source_actor_graph_path(scene_id),
             json.dumps(graph, indent=2, sort_keys=True, ensure_ascii=False),
@@ -2106,6 +2150,753 @@ class AutoGenerator:
         fwd_x, fwd_y = ex / length, ey / length
         right_x, right_y = -fwd_y, fwd_x
         return anchor_lane, fwd_x, fwd_y, right_x, right_y
+
+    @staticmethod
+    def _repair_band(value: object) -> str:
+        band = str(value or "").strip().lower()
+        return "alongside" if band in {"immediate", "alongside"} else band
+
+    @staticmethod
+    def _lane_index_for_target(target: str) -> int:
+        return {
+            "left_lane": -1,
+            "left_parking_lane": -1,
+            "same_lane": 0,
+            "right_lane": 1,
+            "right_parking_lane": 1,
+            "opposing_lane": -1,
+        }.get(str(target or ""), 0)
+
+    @staticmethod
+    def _target_longitudinal_for_band(current: float, band: str) -> float:
+        ranges = {
+            "alongside": (-2.0, 5.0),
+            "near": (5.0, 12.0),
+            "mid": (12.0, 30.0),
+            "far": (30.0, 60.0),
+        }
+        low, high = ranges[band]
+        if low <= current < high:
+            return current
+        if current < low:
+            return low + 0.5
+        return high - 0.5
+
+    @staticmethod
+    def _actor_graph_evidence(
+        source_graph: dict,
+        render_graph: dict,
+        actor_graph_plan: dict,
+    ) -> dict:
+        source_actors = source_graph.get("actors") or []
+        render_actors = render_graph.get("actors") or []
+        anchors = sorted(
+            {
+                str(item.get("layout_anchor_id") or "")
+                for item in source_actors
+                if str(item.get("layout_anchor_id") or "")
+            }
+        )
+        return {
+            "schema_version": "actor-evidence-v2",
+            "available_anchor_ids": anchors,
+            "ego": render_graph.get("ego")
+            or ((render_graph.get("metadata") or {}).get("ego"))
+            or {},
+            "source_actor_ids": [str(item.get("id")) for item in source_actors],
+            "render_actor_ids": [str(item.get("id")) for item in render_actors],
+            "spawned_actor_ids": [
+                str(item.get("id"))
+                for item in render_actors
+                if item.get("spawned", True)
+            ],
+            "spawn_failed_actor_ids": [
+                str(item.get("id"))
+                for item in render_actors
+                if not item.get("spawned", True)
+            ],
+            "render_actors": [
+                {
+                    "id": item.get("id"),
+                    "category": item.get("category"),
+                    "spawned": item.get("spawned", True),
+                    "lane_side_relation": item.get("lane_side_relation"),
+                    "actual_waypoint": item.get("actual_waypoint") or {},
+                    "ego_frame": item.get("ego_frame") or {},
+                    "heading_relation_to_ego": item.get("heading_relation_to_ego"),
+                    "parking_projection_result": item.get("parking_projection_result"),
+                    "parking_projection_lane": item.get("parking_projection_lane") or {},
+                    "visual_position_override": item.get("visual_position_override") or {},
+                }
+                for item in render_actors
+            ],
+            "geometry_issues": actor_graph_plan.get("issues") or [],
+            "inventory_equal": (
+                {str(item.get("id")) for item in source_actors}
+                == {str(item.get("id")) for item in render_actors}
+            ),
+        }
+
+    @staticmethod
+    def _compile_actor_repair_patches(
+        vlm_report: dict,
+        actor_graph_plan: dict,
+        source_graph: dict,
+        spawn_payload: dict,
+        render_graph: Optional[dict] = None,
+    ) -> dict:
+        source_by_id = {
+            str(actor.get("id")): actor for actor in source_graph.get("actors") or []
+        }
+        entities_by_id = {
+            str(entity.get("id")): entity
+            for entity in spawn_payload.get("entities") or []
+        }
+        available_anchor_ids = {
+            str(actor.get("layout_anchor_id") or "")
+            for actor in source_by_id.values()
+            if str(actor.get("layout_anchor_id") or "")
+        }
+        patches = []
+        rejected = list(vlm_report.get("patch_rejections") or [])
+        requested_semantic = list(vlm_report.get("semantic_unrepairable") or [])
+        actor_semantic_issues = [
+            issue
+            for issue in actor_graph_plan.get("issues") or []
+            if str(issue.get("issue_type") or "")
+            in {"count_mismatch", "category_mismatch", "missing_actor"}
+        ]
+        semantic_unrepairable = requested_semantic if actor_semantic_issues else []
+        if requested_semantic and not actor_semantic_issues:
+            rejected.extend(
+                {
+                    "requested_patch": item,
+                    "reason": "semantic_issue_not_confirmed_by_actor_graph",
+                }
+                for item in requested_semantic
+            )
+        occupied = set()
+
+        def patch_key(patch: dict) -> tuple:
+            op = str(patch.get("op") or "")
+            field = {
+                "set_pose_target": "pose",
+                "set_lane_target": "lane",
+                "set_distance_band": "distance",
+                "set_heading_relation": "heading",
+                "set_pairwise_relation": "pairwise",
+                "resolve_overlap": "overlap",
+            }.get(op, op)
+            return str(patch.get("entity_id") or ""), field
+
+        def add_patch(patch: dict, prefer=False) -> None:
+            entity_id = str(patch.get("entity_id") or "")
+            if entity_id not in entities_by_id:
+                rejected.append(
+                    {"requested_patch": patch, "reason": "unknown_entity_id"}
+                )
+                return
+            target_anchor_id = str(patch.get("target_anchor_id") or "")
+            if target_anchor_id and target_anchor_id not in available_anchor_ids:
+                rejected.append(
+                    {
+                        "requested_patch": patch,
+                        "reason": "unknown_target_anchor_id",
+                    }
+                )
+                return
+            key = patch_key(patch)
+            if key in occupied and not prefer:
+                return
+            if prefer and key in occupied:
+                patches[:] = [item for item in patches if patch_key(item) != key]
+            patches.append(deepcopy(patch))
+            occupied.add(key)
+
+        for patch in vlm_report.get("repair_patches") or []:
+            add_patch(patch, prefer=True)
+
+        pose_patch_by_entity = {
+            str(patch.get("entity_id") or ""): patch
+            for patch in patches
+            if str(patch.get("op") or "") == "set_pose_target"
+        }
+
+        render_by_id = {
+            str(actor.get("id") or ""): actor
+            for actor in (render_graph or {}).get("actors") or []
+        }
+        graph_pose_entities = set()
+        if render_by_id:
+            geometry_issue_types = {
+                "heading_mismatch",
+                "lane_side_mismatch",
+                "longitudinal_mismatch",
+                "overlap",
+                "off_lane_spawn",
+            }
+            issue_by_entity = {}
+            for issue in actor_graph_plan.get("issues") or []:
+                issue_type = str(issue.get("issue_type") or "")
+                entity_id = str(
+                    issue.get("source_entity_id") or issue.get("render_entity_id") or ""
+                )
+                if issue_type in geometry_issue_types and entity_id:
+                    issue_by_entity.setdefault(entity_id, []).append(issue)
+            for entity_id, entity_issues in issue_by_entity.items():
+                if entity_id in pose_patch_by_entity:
+                    continue
+                source_actor = source_by_id.get(entity_id) or {}
+                render_actor = render_by_id.get(entity_id) or {}
+                actual_frame = render_actor.get("ego_frame") or {}
+                target_longitudinal = source_actor.get("expected_longitudinal_m")
+                if not isinstance(target_longitudinal, (int, float)):
+                    target_longitudinal = actual_frame.get("longitudinal_m")
+                if not isinstance(target_longitudinal, (int, float)):
+                    continue
+                target_lane = str(
+                    source_actor.get("lane_side_relation") or "same_lane"
+                )
+                pose = {
+                    "op": "set_pose_target",
+                    "entity_id": entity_id,
+                    "target_lane": target_lane,
+                    "target_longitudinal_m": float(target_longitudinal),
+                    "target_lateral_offset_m": 0.0,
+                    "severity": max(
+                        (str(item.get("severity") or "medium") for item in entity_issues),
+                        key=lambda value: {"low": 0, "medium": 1, "high": 2}.get(value, 1),
+                    ),
+                    "evidence": "; ".join(
+                        str(item.get("evidence") or item.get("issue_type"))
+                        for item in entity_issues
+                    ),
+                    "source": "actor_graph",
+                }
+                if source_actor.get("heading_relation"):
+                    pose["target_heading_relation"] = source_actor["heading_relation"]
+                add_patch(pose)
+                pose_patch_by_entity[entity_id] = pose
+                graph_pose_entities.add(entity_id)
+
+        semantic_issue_types = {"count_mismatch", "category_mismatch", "missing_actor"}
+        for issue in actor_graph_plan.get("issues") or []:
+            issue_type = str(issue.get("issue_type") or "")
+            entity_id = str(
+                issue.get("source_entity_id") or issue.get("render_entity_id") or ""
+            )
+            if issue_type in semantic_issue_types:
+                semantic_unrepairable.append(
+                    {
+                        "type": issue_type,
+                        "entity_id": entity_id or None,
+                        "severity": issue.get("severity", "high"),
+                        "evidence": issue.get("evidence", ""),
+                        "reason": "actor_inventory_mutation_forbidden",
+                    }
+                )
+                continue
+            source_actor = source_by_id.get(entity_id) or {}
+            visual_pose = pose_patch_by_entity.get(entity_id)
+            if visual_pose is not None:
+                if (
+                    issue_type == "heading_mismatch"
+                    and not visual_pose.get("target_heading_relation")
+                    and source_actor.get("heading_relation")
+                ):
+                    visual_pose["target_heading_relation"] = source_actor[
+                        "heading_relation"
+                    ]
+                # A pose target owns lane, longitudinal position and overlap
+                # resolution. It must not be overwritten by v1 graph patches.
+                continue
+            base = {
+                "entity_id": entity_id,
+                "severity": issue.get("severity", "medium"),
+                "evidence": issue.get("evidence", ""),
+                "source": "actor_graph",
+            }
+            if issue_type == "heading_mismatch" and source_actor.get("heading_relation"):
+                add_patch(
+                    {
+                        **base,
+                        "op": "set_heading_relation",
+                        "target_heading": source_actor["heading_relation"],
+                    }
+                )
+            elif issue_type == "lane_side_mismatch" and source_actor.get("lane_side_relation"):
+                add_patch(
+                    {
+                        **base,
+                        "op": "set_lane_target",
+                        "target_lane": source_actor["lane_side_relation"],
+                    }
+                )
+            elif issue_type == "longitudinal_mismatch":
+                band = AutoGenerator._repair_band(source_actor.get("distance_band"))
+                if band in {"alongside", "near", "mid", "far"}:
+                    patch = {**base, "op": "set_distance_band", "target_band": band}
+                    if isinstance(issue.get("projection_correction_m"), (int, float)):
+                        patch["projection_correction_m"] = float(
+                            issue["projection_correction_m"]
+                        )
+                    if isinstance(issue.get("expected_longitudinal_m"), (int, float)):
+                        patch["expected_longitudinal_m"] = float(
+                            issue["expected_longitudinal_m"]
+                        )
+                    add_patch(patch)
+            elif issue_type == "overlap":
+                add_patch(
+                    {
+                        **base,
+                        "op": "resolve_overlap",
+                        "reference_entity_id": issue.get("reference_entity_id"),
+                    }
+                )
+            elif issue_type == "off_lane_spawn":
+                entity = entities_by_id.get(entity_id) or {}
+                if not AutoGenerator._is_parking_spawn_entity(entity):
+                    target_lane = str(source_actor.get("lane_side_relation") or "same_lane")
+                    add_patch(
+                        {**base, "op": "set_lane_target", "target_lane": target_lane}
+                    )
+
+        deduped_semantic = []
+        seen_semantic = set()
+        for item in semantic_unrepairable:
+            key = (str(item.get("type")), str(item.get("entity_id")), str(item.get("evidence")))
+            if key not in seen_semantic:
+                seen_semantic.add(key)
+                deduped_semantic.append(item)
+        operation_priority = {
+            "set_pose_target": 0,
+            "set_lane_target": 0,
+            "set_heading_relation": 1,
+            "set_distance_band": 2,
+            "set_pairwise_relation": 3,
+            "resolve_overlap": 4,
+        }
+        patches.sort(
+            key=lambda item: operation_priority.get(str(item.get("op") or ""), 99)
+        )
+        return {
+            "schema_version": "actor-repair-v2",
+            "patches": patches,
+            "rejected": rejected,
+            "semantic_unrepairable": deduped_semantic,
+        }
+
+    def _apply_actor_repair_patches(
+        self,
+        scene_id: str,
+        validation: dict,
+        compiled: dict,
+        render_graph: Optional[dict] = None,
+    ) -> dict:
+        payload_path = self._spawn_payload_path(scene_id)
+        payload = self._load_json_if_exists(payload_path)
+        entities = payload.get("entities") or []
+        entities_by_id = {str(entity.get("id")): entity for entity in entities}
+        fallback_anchor = ((self.carla_spawn_context or {}).get("topology_sample") or [{}])[0]
+        _, fwd_x, fwd_y, right_x, right_y = self._layout_frame_from_validation(
+            validation, fallback_anchor
+        )
+        ego = entities_by_id.get("ego") or entities_by_id.get("ego_vehicle") or {}
+        render_graph = render_graph or {}
+        render_actors_by_id = {
+            str(actor.get("id") or ""): actor
+            for actor in render_graph.get("actors") or []
+        }
+        render_ego = (
+            render_graph.get("ego")
+            or ((render_graph.get("metadata") or {}).get("ego"))
+            or {}
+        )
+        render_ego_location = render_ego.get("location") or ego.get("location") or {}
+        render_ego_yaw = float(
+            render_ego.get("yaw")
+            or ((ego.get("rotation") or {}).get("yaw")
+            or 0.0)
+        )
+        ego_yaw = render_ego_yaw
+        render_yaw_radians = math.radians(render_ego_yaw)
+        render_fwd_x, render_fwd_y = (
+            math.cos(render_yaw_radians),
+            math.sin(render_yaw_radians),
+        )
+        render_right_x, render_right_y = -render_fwd_y, render_fwd_x
+        lane_width = float((validation or {}).get("lane_width_m") or 3.5)
+        overrides = deepcopy(
+            ((payload.get("repair_metadata") or {}).get("target_overrides") or {})
+        )
+        outcomes = [
+            {
+                "requested_patch": item.get("requested_patch"),
+                "normalized_patch": None,
+                "status": "rejected",
+                "before": None,
+                "after": None,
+                "reason": item.get("reason"),
+            }
+            for item in compiled.get("rejected") or []
+        ]
+
+        def snapshot(entity: dict) -> dict:
+            return {
+                "lane_side_relation": entity.get("lane_side_relation"),
+                "lane_index_relation": entity.get("lane_index_relation"),
+                "longitudinal_m": entity.get("longitudinal_m"),
+                "heading_relation": entity.get("heading_relation"),
+                "placement_mode": entity.get("placement_mode"),
+                "location": deepcopy(entity.get("location") or {}),
+                "rotation": deepcopy(entity.get("rotation") or {}),
+                "visual_position_override": deepcopy(
+                    entity.get("visual_position_override") or {}
+                ),
+            }
+
+        def longitudinal(entity: dict) -> float:
+            value = entity.get("longitudinal_m")
+            if isinstance(value, (int, float)):
+                return float(value)
+            loc = entity.get("location") or {}
+            ego_loc = ego.get("location") or {}
+            return (
+                (float(loc.get("x", 0.0)) - float(ego_loc.get("x", 0.0))) * fwd_x
+                + (float(loc.get("y", 0.0)) - float(ego_loc.get("y", 0.0))) * fwd_y
+            )
+
+        def move_longitudinal(entity: dict, target: float) -> None:
+            current = longitudinal(entity)
+            delta = target - current
+            loc = entity.setdefault("location", {})
+            loc["x"] = float(loc.get("x", 0.0)) + fwd_x * delta
+            loc["y"] = float(loc.get("y", 0.0)) + fwd_y * delta
+            entity["longitudinal_m"] = float(target)
+
+        def pose_target_is_satisfied(entity: dict, patch: dict) -> bool:
+            previous = entity.get("visual_position_override") or {}
+            if not previous:
+                return False
+            keys = (
+                "target_lane",
+                "target_longitudinal_m",
+                "target_lateral_offset_m",
+                "target_anchor_id",
+                "target_heading_relation",
+            )
+            if any(
+                previous.get(key) != patch.get(key)
+                for key in keys
+                if key in patch or key in previous
+            ):
+                return False
+            actual = render_actors_by_id.get(str(entity.get("id") or "")) or {}
+            actual_frame = actual.get("ego_frame") or {}
+            actual_longitudinal = actual_frame.get("longitudinal_m")
+            if not isinstance(actual_longitudinal, (int, float)):
+                return False
+            if abs(float(actual_longitudinal) - float(patch["target_longitudinal_m"])) > 1.5:
+                return False
+            heading = patch.get("target_heading_relation")
+            return not heading or actual.get("heading_relation_to_ego") == heading
+
+        def apply_pose_target(entity: dict, patch: dict, override: dict) -> None:
+            target_lane = str(patch["target_lane"])
+            target_longitudinal = float(patch["target_longitudinal_m"])
+            lateral_offset = float(patch["target_lateral_offset_m"])
+            lane_index = self._lane_index_for_target(target_lane)
+            lane_center_lateral = lane_index * lane_width
+            requested_location = {
+                "x": float(render_ego_location.get("x", 0.0))
+                + render_fwd_x * target_longitudinal
+                + render_right_x * (lane_center_lateral + lateral_offset),
+                "y": float(render_ego_location.get("y", 0.0))
+                + render_fwd_y * target_longitudinal
+                + render_right_y * (lane_center_lateral + lateral_offset),
+                "z": float((entity.get("location") or {}).get("z", 0.3)),
+            }
+            heading = patch.get("target_heading_relation")
+            if heading:
+                target_yaw = self._normalize_yaw(
+                    {
+                        "same_direction": render_ego_yaw,
+                        "opposite_direction": render_ego_yaw + 180.0,
+                        "crossing": render_ego_yaw + 90.0,
+                    }[heading]
+                )
+                entity["heading_relation"] = heading
+                entity["original_heading_relation"] = heading
+                entity.setdefault("rotation", {})["yaw"] = target_yaw
+            entity["lane_side_relation"] = target_lane
+            entity["lane_index_relation"] = lane_index
+            if patch.get("target_anchor_id"):
+                entity["layout_anchor_id"] = patch["target_anchor_id"]
+            entity["location"] = requested_location
+            entity["longitudinal_m"] = target_longitudinal
+            entity["placement_mode"] = "project_to_visual_pose"
+            entity["placement_mode_hint"] = "visual_position_override"
+            projected_lane = deepcopy(entity.get("projected_lane") or {})
+            projected_lane["preserve_input_yaw"] = True
+            entity["projected_lane"] = projected_lane
+            visual_override = {
+                "schema_version": "actor-repair-v2",
+                "target_lane": target_lane,
+                "target_longitudinal_m": target_longitudinal,
+                "target_lateral_offset_m": lateral_offset,
+                "target_anchor_id": patch.get("target_anchor_id"),
+                "target_heading_relation": heading,
+                "ego_reference": {
+                    "location": {
+                        "x": float(render_ego_location.get("x", 0.0)),
+                        "y": float(render_ego_location.get("y", 0.0)),
+                        "z": float(render_ego_location.get("z", 0.0)),
+                    },
+                    "yaw": render_ego_yaw,
+                },
+                "requested_world_location": deepcopy(requested_location),
+                "longitudinal_tolerance_m": 1.5,
+                "lateral_tolerance_m": 0.75,
+            }
+            entity["visual_position_override"] = visual_override
+            override.update(
+                {
+                    "lane_side_relation": target_lane,
+                    "lane_index_relation": lane_index,
+                    "expected_longitudinal_m": target_longitudinal,
+                    "heading_relation": heading or entity.get("heading_relation"),
+                    "visual_position_override": deepcopy(visual_override),
+                }
+            )
+
+        def nearest_legal_band_position(
+            entity: dict,
+            band: str,
+            preferred: float,
+        ) -> Optional[float]:
+            bounds = {
+                "alongside": (-2.0, 5.0),
+                "near": (5.0, 12.0),
+                "mid": (12.0, 30.0),
+                "far": (30.0, 60.0),
+            }
+            low, high = bounds[band]
+            minimum = low + 0.5
+            maximum = high - 0.5
+            candidate_values = [
+                min(max(float(preferred), minimum), maximum),
+                minimum,
+                maximum,
+            ]
+            entity_lane = int(entity.get("lane_index_relation") or 0)
+            entity_anchor = str(entity.get("layout_anchor_id") or "")
+            blockers = []
+            for other in entities:
+                if other is entity or str(other.get("id") or "") in {"ego", "ego_vehicle"}:
+                    continue
+                if int(other.get("lane_index_relation") or 0) != entity_lane:
+                    continue
+                other_anchor = str(other.get("layout_anchor_id") or "")
+                if entity_anchor and other_anchor and entity_anchor != other_anchor:
+                    continue
+                other_longitudinal = longitudinal(other)
+                spacing = max(
+                    self._spawn_min_spacing(entity), self._spawn_min_spacing(other)
+                ) + 0.5
+                blockers.append((other_longitudinal, spacing))
+                candidate_values.extend(
+                    [other_longitudinal - spacing, other_longitudinal + spacing]
+                )
+            candidates = sorted(
+                {
+                    round(min(max(value, minimum), maximum), 6)
+                    for value in candidate_values
+                },
+                key=lambda value: (abs(value - preferred), value),
+            )
+            for candidate in candidates:
+                if all(
+                    abs(candidate - other_longitudinal) + 1e-6 >= spacing
+                    for other_longitudinal, spacing in blockers
+                ):
+                    return float(candidate)
+            return None
+
+        for patch in compiled.get("patches") or []:
+            entity_id = str(patch.get("entity_id") or "")
+            entity = entities_by_id.get(entity_id)
+            before = snapshot(entity) if entity is not None else None
+            outcome = {
+                "requested_patch": deepcopy(patch),
+                "normalized_patch": deepcopy(patch),
+                "status": "blocked" if entity is None else "no_op",
+                "before": before,
+                "after": before,
+                "reason": "unknown_entity_id" if entity is None else None,
+            }
+            if entity is None:
+                outcomes.append(outcome)
+                continue
+            op = str(patch.get("op") or "")
+            override = overrides.setdefault(entity_id, {})
+            if op == "set_pose_target":
+                if pose_target_is_satisfied(entity, patch):
+                    outcome["reason"] = "visual_pose_already_realized"
+                else:
+                    apply_pose_target(entity, patch, override)
+                    outcome["status"] = "applied"
+            elif op == "set_lane_target":
+                target = str(patch.get("target_lane") or "")
+                old_index = int(entity.get("lane_index_relation") or 0)
+                new_index = self._lane_index_for_target(target)
+                if target != str(entity.get("lane_side_relation") or ""):
+                    correction = (new_index - old_index) * lane_width
+                    loc = entity.setdefault("location", {})
+                    loc["x"] = float(loc.get("x", 0.0)) + right_x * correction
+                    loc["y"] = float(loc.get("y", 0.0)) + right_y * correction
+                    entity["lane_side_relation"] = target
+                    entity["lane_index_relation"] = new_index
+                    if target in {"left_parking_lane", "right_parking_lane"}:
+                        entity["placement_mode"] = "project_to_parking_lane"
+                        entity["placement_mode_hint"] = "parking_lane_actor"
+                    elif target == "opposing_lane":
+                        entity["placement_mode"] = "project_to_opposing_lane"
+                    else:
+                        entity["placement_mode"] = "project_to_lane"
+                    outcome["status"] = "applied"
+                override.update(
+                    {"lane_side_relation": target, "lane_index_relation": new_index}
+                )
+            elif op == "set_heading_relation":
+                target = str(patch.get("target_heading") or "")
+                target_yaw = self._normalize_yaw(
+                    {
+                        "same_direction": ego_yaw,
+                        "opposite_direction": ego_yaw + 180.0,
+                        "crossing": ego_yaw + 90.0,
+                    }[target]
+                )
+                current_yaw = float(
+                    (entity.get("rotation") or {}).get("yaw") or 0.0
+                )
+                yaw_error = abs(self._normalize_yaw(current_yaw - target_yaw))
+                if (
+                    target != str(entity.get("heading_relation") or "")
+                    or yaw_error > 1.0
+                ):
+                    entity["heading_relation"] = target
+                    entity["original_heading_relation"] = target
+                    entity.setdefault("rotation", {})["yaw"] = target_yaw
+                    outcome["status"] = "applied"
+                override["heading_relation"] = target
+            elif op == "set_distance_band":
+                target = str(patch.get("target_band") or "")
+                current = longitudinal(entity)
+                projection_correction = patch.get("projection_correction_m")
+                if isinstance(projection_correction, (int, float)):
+                    payload_target_m = current + float(projection_correction)
+                    expected_target_m = float(
+                        patch.get("expected_longitudinal_m", current)
+                    )
+                else:
+                    payload_target_m = self._target_longitudinal_for_band(current, target)
+                    expected_target_m = payload_target_m
+                legal_target_m = nearest_legal_band_position(
+                    entity, target, payload_target_m
+                )
+                if legal_target_m is None:
+                    outcome["status"] = "blocked"
+                    outcome["reason"] = "no_legal_position_in_distance_band"
+                else:
+                    if abs(legal_target_m - current) > 0.1:
+                        move_longitudinal(entity, legal_target_m)
+                        outcome["status"] = "applied"
+                    override.update(
+                        {
+                            "distance_band": target,
+                            "expected_longitudinal_m": (
+                                legal_target_m
+                                if not isinstance(projection_correction, (int, float))
+                                else expected_target_m
+                            ),
+                            "projection_input_longitudinal_m": legal_target_m,
+                        }
+                    )
+            elif op == "set_pairwise_relation":
+                reference = entities_by_id.get(str(patch.get("reference_entity_id") or ""))
+                if reference is None:
+                    outcome["status"] = "blocked"
+                    outcome["reason"] = "unknown_reference_entity_id"
+                else:
+                    relation = str(patch.get("target_relation") or "")
+                    spacing = max(
+                        self._spawn_min_spacing(entity), self._spawn_min_spacing(reference)
+                    ) + 0.5
+                    if relation in {"ahead_of", "behind_other"}:
+                        sign = 1.0 if relation == "ahead_of" else -1.0
+                        target_m = longitudinal(reference) + sign * spacing
+                        if abs(target_m - longitudinal(entity)) > 0.1:
+                            move_longitudinal(entity, target_m)
+                            outcome["status"] = "applied"
+                        override["expected_longitudinal_m"] = target_m
+                    else:
+                        ref_index = int(reference.get("lane_index_relation") or 0)
+                        new_index = ref_index + (1 if relation == "right_of_other" else -1)
+                        old_index = int(entity.get("lane_index_relation") or 0)
+                        correction = (new_index - old_index) * lane_width
+                        if abs(correction) > 0.1:
+                            loc = entity.setdefault("location", {})
+                            loc["x"] = float(loc.get("x", 0.0)) + right_x * correction
+                            loc["y"] = float(loc.get("y", 0.0)) + right_y * correction
+                            entity["lane_index_relation"] = new_index
+                            entity["lane_side_relation"] = (
+                                "right_lane" if new_index > 0 else "left_lane" if new_index < 0 else "same_lane"
+                            )
+                            outcome["status"] = "applied"
+                        override.update(
+                            {
+                                "lane_index_relation": new_index,
+                                "lane_side_relation": entity.get("lane_side_relation"),
+                            }
+                        )
+            elif op == "resolve_overlap":
+                reference = entities_by_id.get(str(patch.get("reference_entity_id") or ""))
+                spacing = self._spawn_min_spacing(entity) + 0.5
+                target_m = (
+                    longitudinal(reference) + max(spacing, self._spawn_min_spacing(reference) + 0.5)
+                    if reference is not None
+                    else longitudinal(entity) + spacing
+                )
+                move_longitudinal(entity, target_m)
+                override["expected_longitudinal_m"] = target_m
+                outcome["status"] = "applied"
+            else:
+                outcome["status"] = "rejected"
+                outcome["reason"] = "unsupported_patch_type"
+            outcome["after"] = snapshot(entity)
+            if outcome["status"] == "no_op" and outcome["reason"] is None:
+                outcome["reason"] = "already_satisfied"
+            outcomes.append(outcome)
+
+        payload["entities"] = entities
+        repair_metadata = payload.setdefault("repair_metadata", {})
+        repair_metadata["schema_version"] = "actor-repair-v2"
+        repair_metadata["target_overrides"] = overrides
+        repair_metadata["patch_outcomes"] = outcomes
+        repair_metadata["semantic_unrepairable"] = compiled.get("semantic_unrepairable") or []
+        write_to_file(
+            payload_path,
+            json.dumps(payload, indent=2, sort_keys=True, ensure_ascii=False),
+        )
+        return {
+            "schema_version": "actor-repair-v2",
+            "patch_outcomes": outcomes,
+            "semantic_unrepairable": compiled.get("semantic_unrepairable") or [],
+            "applied_count": sum(item.get("status") == "applied" for item in outcomes),
+            "no_op_count": sum(item.get("status") == "no_op" for item in outcomes),
+            "rejected_count": sum(item.get("status") == "rejected" for item in outcomes),
+            "blocked_count": sum(item.get("status") == "blocked" for item in outcomes),
+        }
 
     @staticmethod
     def _repair_action_types(report: dict) -> tuple:
@@ -2581,6 +3372,69 @@ class AutoGenerator:
         )
         return summary
 
+    @staticmethod
+    def _layered_evaluation(actor_graph_plan: dict, vlm_report: dict) -> dict:
+        issues = actor_graph_plan.get("issues") or []
+        spawn_failure_count = sum(
+            str(issue.get("issue_type") or "") == "spawn_failure" for issue in issues
+        )
+        high_count = sum(
+            str(issue.get("severity") or "").lower() == "high"
+            and str(issue.get("issue_type") or "") != "spawn_failure"
+            for issue in issues
+        )
+        medium_count = sum(
+            str(issue.get("severity") or "").lower() == "medium" for issue in issues
+        )
+        semantic_unrepairable = list(vlm_report.get("semantic_unrepairable") or [])
+        visual_available = isinstance(vlm_report.get("score"), (int, float)) and not bool(
+            vlm_report.get("skipped")
+        )
+        visual_score = float(vlm_report.get("score") or 0.0) if visual_available else None
+        truth_unavailable = bool(actor_graph_plan.get("truth_unavailable"))
+        if semantic_unrepairable or high_count or spawn_failure_count:
+            status = "failed"
+        elif medium_count or truth_unavailable or not visual_available:
+            status = "degraded"
+        elif visual_score is not None and visual_score >= 0.70:
+            status = "passed"
+        else:
+            status = "degraded"
+        return {
+            "status": status,
+            "high_fact_issue_count": high_count,
+            "spawn_failure_count": spawn_failure_count,
+            "medium_geometry_issue_count": medium_count,
+            "visual_score": visual_score,
+            "visual_available": visual_available,
+            "truth_unavailable": truth_unavailable,
+            "semantic_unrepairable": semantic_unrepairable,
+        }
+
+    @staticmethod
+    def _evaluation_is_worse(candidate: dict, baseline: dict) -> bool:
+        candidate_facts = (
+            int(candidate.get("high_fact_issue_count") or 0),
+            int(candidate.get("spawn_failure_count") or 0),
+            int(candidate.get("medium_geometry_issue_count") or 0),
+        )
+        baseline_facts = (
+            int(baseline.get("high_fact_issue_count") or 0),
+            int(baseline.get("spawn_failure_count") or 0),
+            int(baseline.get("medium_geometry_issue_count") or 0),
+        )
+        if candidate_facts != baseline_facts:
+            return candidate_facts > baseline_facts
+        if bool(candidate.get("visual_available")) != bool(
+            baseline.get("visual_available")
+        ):
+            return bool(baseline.get("visual_available"))
+        if candidate.get("visual_available") and baseline.get("visual_available"):
+            return float(candidate.get("visual_score") or 0.0) < float(
+                baseline.get("visual_score") or 0.0
+            ) - 1e-9
+        return False
+
     def verify_and_repair_spawn_layout(
         self,
         scene_id: str,
@@ -2592,52 +3446,35 @@ class AutoGenerator:
         match_report_path: str,
         final_scene_path: str,
     ) -> dict:
-        """Verify spawned actor layout and repair with v3 deterministic priority."""
+        """Two-round layered verification with one transactional actor-patch repair."""
         if not self.enable_scene_verify:
             return {"enabled": False, "rounds": []}
 
         matched_structure = (self.carla_spawn_context or {}).get("matched_structure")
         matched_structure_source = (
-            (self.carla_spawn_context or {}).get("matched_structure_source")
-            or "missing"
+            (self.carla_spawn_context or {}).get("matched_structure_source") or "missing"
         )
-        repair_summary: dict = {
+        summary = {
             "enabled": True,
+            "repair_schema_version": "actor-repair-v2",
             "rounds": [],
             "matched_structure_summary": self._matched_structure_summary(
-                matched_structure,
-                matched_structure_source,
+                matched_structure, matched_structure_source
             ),
             "matched_structure_path": self._matched_structure_path(scene_id),
+            "regression_reverted": False,
         }
-        ego_lane_warning = self._ego_lane_anchor_warning(scene_id, scene_understanding)
-        if ego_lane_warning:
-            repair_summary["ego_lane_anchor_warning"] = ego_lane_warning
-            print(
-                "  [ego_lane_warning] expected offset "
-                f"{ego_lane_warning['expected_offset_from_right']} != actual "
-                f"{ego_lane_warning['actual_offset_from_right']} "
-                f"(lane_id={ego_lane_warning['actual_lane_id']}, "
-                f"vlm_forward={ego_lane_warning['vlm_forward_lane_count']}, "
-                f"actual_lanes={ego_lane_warning['actual_driving_lane_count']})"
-            )
-        current_scene_understanding = scene_understanding
-        current_relation_dsl = relation_dsl
-        current_validation = validation
         current_final_path = final_scene_path
+        baseline_payload_text = None
+        baseline_evaluation = None
         previous_actor_graph_plan = None
-        previous_score = None
-        last_good_spawn_payload_text = None
+        max_rounds = min(2, max(1, int(self.verify_max_rounds)))
 
-        for round_index in range(1, max(1, self.verify_max_rounds) + 1):
-            print(f"Spawn layout verify-repair round {round_index}.......")
-            capture = self._capture_layout_images(
-                scene_id, current_final_path, round_index
-            )
+        for round_index in range(1, max_rounds + 1):
+            print(f"Spawn layout layered verify round {round_index}.......")
+            capture = self._capture_layout_images(scene_id, current_final_path, round_index)
             source_graph = self._write_source_actor_graph(
-                scene_id,
-                current_scene_understanding,
-                current_relation_dsl,
+                scene_id, scene_understanding, relation_dsl
             )
             render_graph = self._load_or_build_render_actor_graph(scene_id, round_index)
             actor_graph_plan = self._write_actor_graph_repair_plan(
@@ -2645,101 +3482,45 @@ class AutoGenerator:
                 round_index,
                 source_graph,
                 render_graph,
-                current_validation,
+                validation,
                 previous_plan=previous_actor_graph_plan,
             )
             actor_graph_plan = self._augment_actor_graph_plan(
                 scene_id,
                 actor_graph_plan,
                 render_graph,
-                current_validation,
-                current_scene_understanding,
+                validation,
+                scene_understanding,
             )
             write_to_file(
                 self._actor_graph_repair_plan_path(scene_id, round_index),
                 json.dumps(actor_graph_plan, indent=2, sort_keys=True, ensure_ascii=False),
             )
+            evidence = self._actor_graph_evidence(
+                source_graph, render_graph, actor_graph_plan
+            )
+
             if capture.get("error"):
                 report = self._verification_report_from_actor_graph_plan(actor_graph_plan)
-                report["capture_mode"] = capture.get("capture_mode")
-                report["layout_image_path"] = capture.get("layout_image_path")
-                report["hard_failures"] = list(report.get("hard_failures") or [])
-                report["hard_failures"].append(str(capture.get("error")))
-                geometry_actions, semantic_actions = self._repair_action_types(report)
-                actionable_without_capture = bool(geometry_actions) and not semantic_actions
-                if actionable_without_capture:
-                    print(
-                        "Layout capture failed, but static actor-graph repair_actions "
-                        "are available; applying deterministic layout repair."
-                    )
-                    last_good_spawn_payload_text = read_file(self._spawn_payload_path(scene_id))
-                    previous_score = float(report.get("score", 0.0) or 0.0)
-                    self._apply_layout_repair_actions(scene_id, current_validation, report)
-                    current_final_path = self.generate_final_scene_script(
-                        scene_id, match_report_path
-                    )
-                    repair_summary["rounds"].append({
-                        "round": round_index,
-                        "verification": report,
-                        "repair": "deterministic_layout_repair",
-                        "repair_actions": report.get("repair_actions") or [],
+                report.update(
+                    {
+                        "score": None,
+                        "passed": False,
+                        "skipped": True,
                         "capture_mode": capture.get("capture_mode"),
                         "layout_image_path": capture.get("layout_image_path"),
-                        "ego_view_path": capture.get("ego_view_path"),
-                        "bev_path": capture.get("bev_path"),
-                        "render_actor_graph_path": self._render_actor_graph_path(scene_id, round_index),
-                        "actor_graph_repair_plan_path": self._actor_graph_repair_plan_path(scene_id, round_index),
-                        "actor_graph_repair_plan": actor_graph_plan,
-                    })
-                    if round_index < max(1, self.verify_max_rounds):
-                        previous_actor_graph_plan = actor_graph_plan
-                        continue
-                    break
-                report = self._write_verification_skipped(
-                    scene_id, round_index, str(capture.get("error"))
+                        "bev_image_path": capture.get("bev_path"),
+                        "actor_graph_evidence": evidence,
+                    }
                 )
-                repair_summary["rounds"].append({
-                    "round": round_index,
-                    "verification": report,
-                    "repair": "skipped",
-                    "capture_mode": capture.get("capture_mode"),
-                    "layout_image_path": capture.get("layout_image_path"),
-                    "ego_view_path": capture.get("ego_view_path"),
-                    "bev_path": capture.get("bev_path"),
-                    "render_actor_graph_path": self._render_actor_graph_path(scene_id, round_index),
-                    "actor_graph_repair_plan_path": self._actor_graph_repair_plan_path(scene_id, round_index),
-                    "actor_graph_repair_plan": actor_graph_plan,
-                })
-                break
-
-            actor_graph_blocked = (
-                bool(actor_graph_plan.get("stop_repair_loop"))
-                or bool(actor_graph_plan.get("requires_code_fix"))
-            )
-            if actor_graph_blocked:
-                report = self._verification_report_from_actor_graph_plan(actor_graph_plan)
-                report["capture_mode"] = capture.get("capture_mode")
-                report["layout_image_path"] = capture.get("layout_image_path")
+                report["hard_failures"] = list(report.get("hard_failures") or []) + [
+                    str(capture.get("error"))
+                ]
                 write_to_file(
                     self._verification_path(scene_id, round_index),
                     json.dumps(report, indent=2, sort_keys=True, ensure_ascii=False),
                 )
-                print("Actor graph verification detected a systematic issue; stopping repair loop.")
-            elif self.verify_mode == "actor_graph":
-                report = self._verification_report_from_actor_graph_plan(actor_graph_plan)
-                report["capture_mode"] = capture.get("capture_mode")
-                report["layout_image_path"] = capture.get("layout_image_path")
-                write_to_file(
-                    self._verification_path(scene_id, round_index),
-                    json.dumps(report, indent=2, sort_keys=True, ensure_ascii=False),
-                )
-                score = float(report.get("score", 0.0))
-                print(
-                    f"  Actor graph verification score: {score:.2f} "
-                    f"({'PASS' if report.get('passed') else 'FAIL'}, "
-                    f"status={actor_graph_plan.get('status')})"
-                )
-            else:
+            elif self.verify_mode == "vlm":
                 report = self._verify_scene_round(
                     scene_id,
                     round_index,
@@ -2747,200 +3528,187 @@ class AutoGenerator:
                     capture.get("layout_image_path"),
                     capture.get("capture_mode"),
                     user_scene_description,
-                    current_scene_understanding,
+                    scene_understanding,
                     match_report_path,
+                    bev_image_path=capture.get("bev_path"),
+                    actor_graph_evidence=evidence,
                 )
-            round_summary: dict = {
+                if isinstance(report, dict):
+                    report = self.scene_verification_agent.normalize_report(report)
+                    report["capture_mode"] = capture.get("capture_mode")
+                    report["layout_image_path"] = capture.get("layout_image_path")
+                    report["bev_image_path"] = capture.get("bev_path")
+                    report["actor_graph_evidence"] = evidence
+                else:
+                    report = {
+                        **deepcopy(self.scene_verification_agent.DEFAULT_REPORT),
+                        "score": None,
+                        "skipped": True,
+                        "hard_failures": ["VLM verification returned a non-object report."],
+                        "actor_graph_evidence": evidence,
+                    }
+            else:
+                report = self._verification_report_from_actor_graph_plan(actor_graph_plan)
+                report["score"] = 1.0 if actor_graph_plan.get("passed") else 0.0
+                report["capture_mode"] = capture.get("capture_mode")
+                report["layout_image_path"] = capture.get("layout_image_path")
+                report["bev_image_path"] = capture.get("bev_path")
+                report["actor_graph_evidence"] = evidence
+                report["repair_patches"] = []
+                report["patch_rejections"] = []
+                report["semantic_unrepairable"] = []
+                write_to_file(
+                    self._verification_path(scene_id, round_index),
+                    json.dumps(report, indent=2, sort_keys=True, ensure_ascii=False),
+                )
+
+            spawn_payload = self._load_json_if_exists(self._spawn_payload_path(scene_id))
+            compiled = self._compile_actor_repair_patches(
+                report,
+                actor_graph_plan,
+                source_graph,
+                spawn_payload,
+                render_graph=render_graph,
+            )
+            report["semantic_unrepairable"] = compiled["semantic_unrepairable"]
+            evaluation = self._layered_evaluation(actor_graph_plan, report)
+            rematch_issues = [
+                issue
+                for issue in actor_graph_plan.get("issues") or []
+                if str(issue.get("issue_type") or "")
+                in {"junction_lane_mismatch", "id_chain_mismatch"}
+                and str(issue.get("severity") or "").lower() == "high"
+            ]
+            round_summary = {
                 "round": round_index,
                 "layout_image_path": capture.get("layout_image_path"),
                 "ego_view_path": capture.get("ego_view_path"),
                 "bev_path": capture.get("bev_path"),
-                "render_actor_graph_path": self._render_actor_graph_path(scene_id, round_index),
+                "render_actor_graph_path": self._render_actor_graph_path(
+                    scene_id, round_index
+                ),
                 "source_actor_graph_path": self._source_actor_graph_path(scene_id),
-                "actor_graph_repair_plan_path": self._actor_graph_repair_plan_path(scene_id, round_index),
+                "actor_graph_repair_plan_path": self._actor_graph_repair_plan_path(
+                    scene_id, round_index
+                ),
                 "actor_graph_repair_plan": actor_graph_plan,
                 "capture_mode": capture.get("capture_mode"),
                 "verification": report,
+                "compiled_patch_plan": compiled,
+                "layered_evaluation": evaluation,
+                "repair": "verification_only",
             }
 
-            score = float(report.get("score", 0.0) or 0.0)
-            if (
-                round_index > 1
-                and previous_score is not None
-                and score < float(previous_score) - 1e-9
-                and last_good_spawn_payload_text
-            ):
-                print(
-                    "Repair regression detected "
-                    f"({score:.2f} < {float(previous_score):.2f}); reverting spawn payload."
+            if round_index == 1:
+                baseline_payload_text = read_file(self._spawn_payload_path(scene_id))
+                baseline_evaluation = evaluation
+                if rematch_issues:
+                    round_summary["repair"] = "requires_rematch"
+                    summary["rounds"].append(round_summary)
+                    summary["selected_round"] = 1
+                    summary["selected_evaluation"] = evaluation
+                    summary["requires_rematch"] = True
+                    write_to_file(
+                        self._spawn_layout_repair_summary_path(scene_id),
+                        json.dumps(summary, indent=2, sort_keys=True, ensure_ascii=False),
+                    )
+                    raise CandidateValidationError(
+                        "Actor verification requires map rematch: "
+                        + "; ".join(str(item.get("evidence") or item.get("issue_type")) for item in rematch_issues)
+                    )
+                if compiled["semantic_unrepairable"]:
+                    round_summary["repair"] = "semantic_unrepairable"
+                    summary["rounds"].append(round_summary)
+                    summary["selected_round"] = 1
+                    summary["selected_evaluation"] = evaluation
+                    break
+                if evaluation["status"] == "passed":
+                    round_summary["repair"] = "none"
+                    summary["rounds"].append(round_summary)
+                    summary["selected_round"] = 1
+                    summary["selected_evaluation"] = evaluation
+                    break
+                if max_rounds < 2 or not compiled["patches"]:
+                    round_summary["repair"] = (
+                        "blocked_high_fact_issue"
+                        if evaluation.get("high_fact_issue_count")
+                        or evaluation.get("spawn_failure_count")
+                        else "no_repair_patch"
+                    )
+                    summary["rounds"].append(round_summary)
+                    summary["selected_round"] = 1
+                    summary["selected_evaluation"] = evaluation
+                    break
+                execution = self._apply_actor_repair_patches(
+                    scene_id, validation, compiled, render_graph=render_graph
                 )
-                write_to_file(self._spawn_payload_path(scene_id), last_good_spawn_payload_text)
+                round_summary["repair"] = "actor_patch_repair"
+                round_summary["patch_execution"] = execution
+                summary["rounds"].append(round_summary)
+                current_final_path = self.generate_final_scene_script(
+                    scene_id, match_report_path
+                )
+                previous_actor_graph_plan = actor_graph_plan
+                continue
+
+            if baseline_evaluation and self._evaluation_is_worse(
+                evaluation, baseline_evaluation
+            ):
+                write_to_file(self._spawn_payload_path(scene_id), baseline_payload_text)
                 current_final_path = self.generate_final_scene_script(
                     scene_id, match_report_path
                 )
                 round_summary["repair"] = "reverted_regression"
-                round_summary["reverted_to_previous_score"] = float(previous_score)
-                repair_summary["rounds"].append(round_summary)
-                repair_summary["regression_reverted"] = True
-                break
-
-            if actor_graph_blocked:
-                round_summary["repair"] = "blocked_for_code_fix"
-                repair_summary["rounds"].append(round_summary)
-                break
-
-            if report.get("passed"):
-                round_summary["repair"] = "none"
-                repair_summary["rounds"].append(round_summary)
-                break
-
-            geometry_actions, semantic_actions = self._repair_action_types(report)
-            recommended_stage = str(report.get("recommended_stage") or "match_spawn")
-            validation_repairable = self._validation_has_repairable_failures(current_validation)
-
-            if self.verify_mode == "actor_graph" and actor_graph_plan.get("stop_repair_loop"):
-                round_summary["repair"] = "blocked_for_code_fix"
-                repair_summary["rounds"].append(round_summary)
-                print("Actor graph verification requested repair-loop stop.")
-                break
-
-            if (
-                self.verify_mode == "actor_graph"
-                and actor_graph_plan.get("truth_unavailable")
-                and not geometry_actions
-                and not validation_repairable
-            ):
-                round_summary["repair"] = "truth_unavailable_static_check_only"
-                repair_summary["rounds"].append(round_summary)
-                print("Actor graph verification has no CARLA truth; stopping after static checks.")
-                break
-
-            if round_index >= max(1, self.verify_max_rounds) and (
-                geometry_actions or validation_repairable
-            ):
-                print(
-                    "Applying final deterministic layout repair before leaving "
-                    f"verify-repair at max rounds ({self.verify_max_rounds})."
-                )
-                last_good_spawn_payload_text = read_file(self._spawn_payload_path(scene_id))
-                previous_score = score
-                self._apply_layout_repair_actions(
-                    scene_id,
-                    current_validation,
-                    report if geometry_actions else {"repair_actions": []},
-                )
-                current_final_path = self.generate_final_scene_script(
-                    scene_id, match_report_path
-                )
-                round_summary["repair"] = (
-                    "deterministic_layout_repair"
-                    if geometry_actions
-                    else "validation_deterministic_layout_repair"
-                )
-                round_summary["repair_actions"] = report.get("repair_actions") or []
-                round_summary["deterministic_fallback"] = not bool(geometry_actions)
-                repair_summary["rounds"].append(round_summary)
-                break
-
-            if round_index >= max(1, self.verify_max_rounds):
-                round_summary["repair"] = "max_rounds_reached"
-                repair_summary["rounds"].append(round_summary)
-                print(
-                    f"Spawn layout verify-repair reached max rounds ({self.verify_max_rounds}). "
-                    "Continuing with last result."
-                )
-                break
-
-            scene_understanding_first = (
-                recommended_stage == "scene_understanding"
-                or self._has_high_severity_semantic_action(semantic_actions)
-            )
-            round_summary["repair_actions"] = report.get("repair_actions") or []
-            round_summary["deterministic_fallback"] = False
-
-            if scene_understanding_first:
-                print("Repairing scene_understanding before layout repair.......")
-                last_good_spawn_payload_text = read_file(self._spawn_payload_path(scene_id))
-                previous_score = score
-                output_fn = self._scene_understanding_path(scene_id)
-                revised = self.scene_understanding_interpreter.revise_with_verification_feedback(
-                    current_scene_understanding,
-                    report,
-                    user_scene_description,
-                    output_fn,
-                )
-                current_scene_understanding = revised
-                (
-                    current_relation_dsl,
-                    _refined,
-                    current_validation,
-                    current_final_path,
-                ) = self._rerun_structured_tail_no_remap(
-                    scene_id, current_scene_understanding, match_report_path
-                )
-                round_summary["repair"] = "scene_understanding_revision"
-
-            elif geometry_actions:
-                print("Applying deterministic repair_actions to spawn payload.......")
-                last_good_spawn_payload_text = read_file(self._spawn_payload_path(scene_id))
-                previous_score = score
-                self._apply_layout_repair_actions(scene_id, current_validation, report)
-                current_final_path = self.generate_final_scene_script(
-                    scene_id, match_report_path
-                )
-                round_summary["repair"] = "deterministic_layout_repair"
-
-            elif semantic_actions:
-                print("Repairing scene_understanding based on VLM feedback.......")
-                last_good_spawn_payload_text = read_file(self._spawn_payload_path(scene_id))
-                previous_score = score
-                output_fn = self._scene_understanding_path(scene_id)
-                revised = self.scene_understanding_interpreter.revise_with_verification_feedback(
-                    current_scene_understanding,
-                    report,
-                    user_scene_description,
-                    output_fn,
-                )
-                current_scene_understanding = revised
-                (
-                    current_relation_dsl,
-                    _refined,
-                    current_validation,
-                    current_final_path,
-                ) = self._rerun_structured_tail_no_remap(
-                    scene_id, current_scene_understanding, match_report_path
-                )
-                round_summary["repair"] = "scene_understanding_revision"
-
-            elif validation_repairable:
-                print("Applying validation-driven deterministic layout repair.......")
-                last_good_spawn_payload_text = read_file(self._spawn_payload_path(scene_id))
-                previous_score = score
-                self._apply_layout_repair_actions(
-                    scene_id,
-                    current_validation,
-                    {"repair_actions": []},
-                )
-                current_final_path = self.generate_final_scene_script(
-                    scene_id, match_report_path
-                )
-                round_summary["repair"] = "validation_deterministic_layout_repair"
-                round_summary["deterministic_fallback"] = True
-
+                round_summary["rollback_reason"] = {
+                    "baseline": baseline_evaluation,
+                    "candidate": evaluation,
+                }
+                summary["regression_reverted"] = True
+                summary["selected_round"] = 1
+                summary["selected_evaluation"] = baseline_evaluation
             else:
-                round_summary["repair"] = "no_repair_action"
-                repair_summary["rounds"].append(round_summary)
-                print("Spawn layout verification failed but produced no actionable repair.")
-                break
+                round_summary["repair"] = "final_verification"
+                summary["selected_round"] = 2
+                summary["selected_evaluation"] = evaluation
+            summary["rounds"].append(round_summary)
+            break
 
-            repair_summary["rounds"].append(round_summary)
-            previous_actor_graph_plan = actor_graph_plan
-
+        if not summary.get("selected_round") and summary["rounds"]:
+            summary["selected_round"] = summary["rounds"][-1]["round"]
+            summary["selected_evaluation"] = summary["rounds"][-1].get(
+                "layered_evaluation"
+            )
+        selected_round = int(summary.get("selected_round") or 1)
+        selected = next(
+            (
+                item
+                for item in summary["rounds"]
+                if int(item.get("round") or 0) == selected_round
+            ),
+            summary["rounds"][-1] if summary["rounds"] else {},
+        )
+        summary["selected_actor_graph_plan"] = selected.get(
+            "actor_graph_repair_plan"
+        ) or {}
+        executions = [
+            item.get("patch_execution")
+            for item in summary["rounds"]
+            if isinstance(item.get("patch_execution"), dict)
+        ]
+        summary["patch_execution_totals"] = {
+            key: sum(int(item.get(key) or 0) for item in executions)
+            for key in (
+                "applied_count",
+                "no_op_count",
+                "rejected_count",
+                "blocked_count",
+            )
+        }
         write_to_file(
             self._spawn_layout_repair_summary_path(scene_id),
-            json.dumps(repair_summary, indent=2, sort_keys=True, ensure_ascii=False),
+            json.dumps(summary, indent=2, sort_keys=True, ensure_ascii=False),
         )
-        return repair_summary
+        return summary
 
     def _build_scenario_for_match(
         self,
@@ -3035,8 +3803,25 @@ class AutoGenerator:
                 json.dumps(repair_summary, indent=2, sort_keys=True, ensure_ascii=False),
             )
         rounds = (repair_summary or {}).get("rounds") or []
-        last_round = rounds[-1] if rounds else {}
-        actor_plan = last_round.get("actor_graph_repair_plan") or {}
+        selected_round_index = int((repair_summary or {}).get("selected_round") or 0)
+        selected_round = next(
+            (
+                item
+                for item in rounds
+                if int(item.get("round") or 0) == selected_round_index
+            ),
+            rounds[-1] if rounds else {},
+        )
+        actor_plan = (
+            (repair_summary or {}).get("selected_actor_graph_plan")
+            or selected_round.get("actor_graph_repair_plan")
+            or {}
+        )
+        layered_evaluation = (
+            (repair_summary or {}).get("selected_evaluation")
+            or selected_round.get("layered_evaluation")
+            or {}
+        )
         actor_issues = actor_plan.get("issues") or []
         high_issues = [
             issue
@@ -3044,12 +3829,9 @@ class AutoGenerator:
             if str((issue or {}).get("severity") or "").lower() == "high"
         ]
         truth_unavailable = bool(actor_plan.get("truth_unavailable"))
-        if high_issues:
-            final_status = "failed"
-        elif actor_issues or truth_unavailable or quick_bev.get("error"):
+        final_status = str(layered_evaluation.get("status") or "degraded")
+        if final_status == "passed" and quick_bev.get("error"):
             final_status = "degraded"
-        else:
-            final_status = "passed"
         self._write_run_summary(
             {
                 "status": final_status,
@@ -3073,6 +3855,17 @@ class AutoGenerator:
                     "truth_unavailable": truth_unavailable,
                     "issue_count": len(actor_issues),
                     "high_issue_count": len(high_issues),
+                },
+                "repair": {
+                    "schema_version": "actor-repair-v2",
+                    "selected_round": selected_round_index or None,
+                    "regression_reverted": bool(
+                        (repair_summary or {}).get("regression_reverted")
+                    ),
+                    "patch_execution_totals": (
+                        (repair_summary or {}).get("patch_execution_totals") or {}
+                    ),
+                    "layered_evaluation": layered_evaluation,
                 },
             }
         )
@@ -3142,12 +3935,13 @@ if __name__ == "__main__":
         "generation_mode": "generation",
         "input_type": input_type,
         "require_carla_connection": True,
+        "carla_timeout": 30.0,
         "spawn_point_limit": 12,
         "enable_scene_match": True,
         "enable_scene_verify": True,
         "verify_max_rounds": 2,
         "verify_min_score": 0.70,
-        "verify_mode": "actor_graph",
+        "verify_mode": "vlm",
         "strict_validation": args.strict_validation,
         "map_match_blacklist_radius_m": 35.0,
         "map_match_topology_weight": 0.70,
