@@ -77,10 +77,12 @@ class _FakeWaypoint:
 class SceneHelperTests(unittest.TestCase):
     def setUp(self):
         self._old_carla = helpers.carla
+        self._old_world = helpers.world
         helpers.carla = _FakeCarla
 
     def tearDown(self):
         helpers.carla = self._old_carla
+        helpers.world = self._old_world
 
     def test_strict_lane_spawn_candidates_do_not_shift_laterally(self):
         location = _FakeLocation(10.0, 20.0, 0.35)
@@ -100,6 +102,68 @@ class SceneHelperTests(unittest.TestCase):
                     0.0, 5.5, -5.5, 11.0, -11.0, 16.5, -16.5
                 })
             )
+
+    def test_night_weather_is_brightened_without_losing_rain(self):
+        class _Weather:
+            cloudiness = 80.0
+            precipitation = 60.0
+            wetness = 80.0
+            sun_altitude_angle = -90.0
+            fog_density = 60.0
+            fog_distance = 0.75
+
+        class _WeatherParameters:
+            MidRainyNight = _Weather()
+
+        class _WeatherCarla(_FakeCarla):
+            WeatherParameters = _WeatherParameters
+
+        fake_world = mock.Mock()
+        helpers.carla = _WeatherCarla
+        helpers.world = fake_world
+
+        with mock.patch.dict(os.environ, {}, clear=True):
+            helpers._autoscenario_apply_weather("MidRainyNight")
+
+        applied = fake_world.set_weather.call_args.args[0]
+        self.assertEqual(applied.precipitation, 60.0)
+        self.assertEqual(applied.wetness, 80.0)
+        self.assertEqual(applied.sun_altitude_angle, -8.0)
+        self.assertEqual(applied.fog_density, 15.0)
+        self.assertEqual(applied.fog_distance, 20.0)
+        self.assertTrue(helpers._AUTOSCENARIO_NIGHT_WEATHER_ACTIVE)
+
+    def test_low_light_detection_covers_night_and_dusk_but_not_day(self):
+        night_payload = {
+            "metadata": {"carla_weather_preset": "MidRainyNight"}
+        }
+        dusk_payload = {
+            "metadata": {
+                "general_environment": {
+                    "lighting_hint": "twilight",
+                    "time_of_day_hint": "dusk",
+                }
+            }
+        }
+        day_payload = {
+            "metadata": {
+                "carla_weather_preset": "ClearNoon",
+                "general_environment": {
+                    "lighting_hint": "daylight",
+                    "time_of_day_hint": "day",
+                },
+            }
+        }
+
+        self.assertTrue(
+            helpers._autoscenario_is_low_light_environment(night_payload)
+        )
+        self.assertTrue(
+            helpers._autoscenario_is_low_light_environment(dusk_payload)
+        )
+        self.assertFalse(
+            helpers._autoscenario_is_low_light_environment(day_payload)
+        )
 
     def test_same_lane_step_rejects_road_or_lane_jump(self):
         jumped = _FakeWaypoint(17, 1)

@@ -1,7 +1,7 @@
 """Orchestrator for the accident video -> CARLA dynamic-reconstruction pipeline.
 
-    video + (start_s, end_s)
-      --> extract_anchor_frames        --> frames/ + frames.json + anchor jpgs
+    adaptive frames_manifest.json (preferred), or video + (start_s, end_s)
+      --> load sampled frames, or extract_anchor_frames for legacy callers
       --> [reuse Layer-1 static recon]  --> {scene_id}_actors.json + _match.json
       --> VideoAccidentInterpreter      --> {scene_id}_video_understanding.json   (Stage A)
       --> LlmVideoTrajectoryGenerator   --> {scene_id}_video_trajectory_dsl.json  (Stage B)
@@ -44,9 +44,10 @@ class VideoReconstructionRunner:
         self,
         output_folder: str,
         scene_id: str,
-        video_path: str,
-        start_s: float,
-        end_s: float,
+        video_path: Optional[str] = None,
+        start_s: Optional[float] = None,
+        end_s: Optional[float] = None,
+        frames_manifest_path: Optional[str] = None,
         risk_output_folder: Optional[str] = None,
         ego_speed_mps: float = 10.0,
         context_sample_rate_s: Optional[float] = None,
@@ -64,8 +65,9 @@ class VideoReconstructionRunner:
         self.risk_output_folder = risk_output_folder or output_folder
         self.scene_id = scene_id
         self.video_path = video_path
-        self.start_s = float(start_s)
-        self.end_s = float(end_s)
+        self.start_s = float(start_s) if start_s is not None else None
+        self.end_s = float(end_s) if end_s is not None else None
+        self.frames_manifest_path = frames_manifest_path
         self.ego_speed_mps = float(ego_speed_mps)
         self.context_sample_rate_s = context_sample_rate_s
         self.max_retries = max(0, int(max_retries))
@@ -80,15 +82,8 @@ class VideoReconstructionRunner:
         self.frame_extractor = frame_extractor or extract_anchor_frames
 
     def run(self, user_request: str = "") -> Dict[str, Any]:
-        frames_dir = join(self.risk_output_folder, "frames")
-        frames_manifest = self.frame_extractor(
-            self.video_path,
-            self.start_s,
-            self.end_s,
-            frames_dir,
-            self.scene_id,
-            context_sample_rate_s=self.context_sample_rate_s,
-        )
+        frames_manifest, effective_manifest_path = self._prepare_frames()
+        ordered_frames = frames_manifest["frames"]
 
         spawn_payload = self._load_json(self._spawn_payload_path())
         match_report = self._load_json(self._scene_match_path())
@@ -103,8 +98,10 @@ class VideoReconstructionRunner:
             {
                 "output_fn": self._understanding_path(),
                 "scene_id": self.scene_id,
+                "actor_context": actor_context,
                 "start_frame_path": frames_manifest.get("start_frame_path"),
                 "end_anchor_frame_path": frames_manifest.get("end_anchor_frame_path"),
+                "frame_sequence": ordered_frames,
                 "context_frame_paths": [
                     frame["path"]
                     for frame in frames_manifest.get("frames", [])
@@ -117,6 +114,7 @@ class VideoReconstructionRunner:
             understanding=understanding,
             actor_context=actor_context,
             spawn_payload=spawn_payload,
+            user_request=user_request,
         )
 
         # The map is fixed by Layer-1: actors.json coordinates are projected onto
@@ -183,13 +181,18 @@ class VideoReconstructionRunner:
             "scene_id": self.scene_id,
             "static_output_folder": self.output_folder,
             "risk_output_folder": self.risk_output_folder,
-            "video_path": os.path.abspath(self.video_path),
+            "video_path": os.path.abspath(self.video_path) if self.video_path else None,
             "start_s": self.start_s,
             "end_s": self.end_s,
             "ego_speed_mps": self.ego_speed_mps,
             "map_name": map_name,
             "compile_enabled": self.enable_compile,
-            "frames_manifest_path": join(frames_dir, "frames.json"),
+            "frames_manifest_path": effective_manifest_path,
+            "frame_source": (
+                "adaptive_manifest" if self.frames_manifest_path else "video_extraction"
+            ),
+            "frame_count": len(ordered_frames),
+            "user_request": user_request,
             "understanding_path": self._understanding_path(),
             "actor_context_path": self._actor_context_path(),
             "artifact": artifact,
@@ -199,11 +202,81 @@ class VideoReconstructionRunner:
         )
         return summary
 
+    def _prepare_frames(self) -> Tuple[Dict[str, Any], str]:
+        """Load pre-sampled frames, falling back to legacy video extraction."""
+        if self.frames_manifest_path:
+            manifest_path = os.path.abspath(self.frames_manifest_path)
+            if os.path.isdir(manifest_path):
+                manifest_path = join(manifest_path, "frames_manifest.json")
+            manifest = self._load_json(manifest_path)
+            frames = manifest.get("frames")
+            if not isinstance(frames, list) or len(frames) < 2:
+                raise ValueError(
+                    "Adaptive frames manifest must contain at least two frames."
+                )
+            frames = sorted(
+                frames,
+                key=lambda row: (
+                    row.get("sample_index", float("inf")),
+                    row.get("timestamp_s", float("inf")),
+                    row.get("frame_index", float("inf")),
+                ),
+            )
+            normalized_frames: List[Dict[str, Any]] = []
+            manifest_dir = os.path.dirname(manifest_path)
+            first_timestamp = float(frames[0].get("timestamp_s", 0.0))
+            for index, source in enumerate(frames):
+                if not isinstance(source, dict) or not source.get("path"):
+                    raise ValueError(f"Manifest frame {index} has no image path.")
+                row = dict(source)
+                path = str(row["path"])
+                if not os.path.isabs(path):
+                    path = os.path.abspath(join(manifest_dir, path))
+                if not os.path.exists(path):
+                    raise FileNotFoundError(f"Sampled frame image not found: {path}")
+                row["path"] = path
+                row["is_start"] = index == 0
+                row["is_end_anchor"] = index == len(frames) - 1
+                if row.get("timestamp_s") is not None:
+                    row["relative_timestamp_s"] = round(
+                        float(row["timestamp_s"]) - first_timestamp, 3
+                    )
+                normalized_frames.append(row)
+
+            self.video_path = self.video_path or manifest.get("video_path")
+            self.start_s = float(
+                manifest.get("time_of_alert_s", frames[0].get("timestamp_s", 0.0))
+            )
+            self.end_s = float(
+                manifest.get("time_of_event_s", frames[-1].get("timestamp_s", 0.0))
+            )
+            manifest = dict(manifest)
+            manifest["frames"] = normalized_frames
+            manifest["start_frame_path"] = normalized_frames[0]["path"]
+            manifest["end_anchor_frame_path"] = normalized_frames[-1]["path"]
+            return manifest, manifest_path
+
+        if not self.video_path or self.start_s is None or self.end_s is None:
+            raise ValueError(
+                "Provide frames_manifest_path, or provide video_path + start_s + end_s."
+            )
+        frames_dir = join(self.risk_output_folder, "frames")
+        manifest = self.frame_extractor(
+            self.video_path,
+            self.start_s,
+            self.end_s,
+            frames_dir,
+            self.scene_id,
+            context_sample_rate_s=self.context_sample_rate_s,
+        )
+        return manifest, join(frames_dir, "frames.json")
+
     def _generate_with_repair(
         self,
         understanding: Dict[str, Any],
         actor_context: Dict[str, Any],
         spawn_payload: Dict[str, Any],
+        user_request: str = "",
     ) -> Tuple[Optional[Dict[str, Any]], int, Optional[str]]:
         prior_attempt: Optional[str] = None
         schema_error: Optional[str] = None
@@ -214,13 +287,16 @@ class VideoReconstructionRunner:
                 scene_id=self.scene_id,
                 understanding=understanding,
                 actor_context=actor_context,
+                user_request=user_request,
                 prior_attempt=prior_attempt,
                 schema_error=schema_error,
             )
             parsed, parse_error = self._parse_json_object(dsl_text)
             if parse_error is None:
                 normalized, validate_error = validate_video_trajectory_dsl(
-                    parsed, spawn_payload
+                    parsed,
+                    spawn_payload,
+                    require_all_vehicle_actors=True,
                 )
                 if validate_error is None:
                     return normalized, attempts, None

@@ -304,6 +304,47 @@ class TestRiskDslValidator(unittest.TestCase):
 
 
 class TestRealCodegenCompiles(unittest.TestCase):
+    def test_dsl_flying_start_is_committed_before_immediate_events(self):
+        from agents.existing_world_scenario_generator import ExistingWorldScenarioGenerator
+
+        loop = ExistingWorldScenarioGenerator._build_dsl_risk_loop()
+
+        self.assertIn("_autoscenario_flying_start_enabled", loop)
+        self.assertIn(
+            "# Commit set_target_velocity before t=0 immediate events.",
+            loop,
+        )
+        self.assertIn(
+            "# EgoController owns ego until an ego DSL event is active.",
+            loop,
+        )
+        flying_start_index = loop.index("_autoscenario_flying_start_enabled =")
+        commit_index = loop.index(
+            "# Commit set_target_velocity before t=0 immediate events."
+        )
+        main_loop_index = loop.index("for tick_index in range(max_ticks):")
+        self.assertLess(flying_start_index, commit_index)
+        self.assertLess(commit_index, main_loop_index)
+
+    def test_risk_loops_use_spawn_payload_weather(self):
+        from agents.existing_world_scenario_generator import ExistingWorldScenarioGenerator
+
+        for loop in (
+            ExistingWorldScenarioGenerator._build_dynamic_risk_loop(),
+            ExistingWorldScenarioGenerator._build_dsl_risk_loop(),
+        ):
+            self.assertIn("carla_weather_preset", loop)
+            self.assertIn("AUTOSCENARIO_WEATHER_OVERRIDE", loop)
+            self.assertNotIn(
+                "_autoscenario_apply_weather(carla.WeatherParameters.ClearNoon)",
+                loop,
+            )
+            self.assertIn(
+                "_autoscenario_configure_vehicle_lights_for_environment",
+                loop,
+            )
+            self.assertIn("_autoscenario_vehicle_light_base_state()", loop)
+
     def test_generated_script_passes_py_compile(self):
         from agents.existing_world_scenario_generator import ExistingWorldScenarioGenerator
 
@@ -320,6 +361,14 @@ class TestRealCodegenCompiles(unittest.TestCase):
                 carla_map="Town06",
             )
             self.assertIn("client.set_timeout(30.0)", script)
+            self.assertIn("placement_mode == 'project_to_visual_pose'", script)
+            self.assertIn("_autoscenario_spawn_vehicle_visual_pose(", script)
+            self.assertIn("_autoscenario_apply_heading_relation(", script)
+            self.assertIn("launch_throttle = min(0.32", script)
+            self.assertIn("hand_brake=False", script)
+            self.assertIn("_autoscenario_post_collision_released", script)
+            self.assertIn("post_collision_control_release_s", script)
+            self.assertIn("set(metrics.collision_actor_ids)", script)
             script_path = Path(tmp) / f"{scene_id}_r000.py"
             script_path.write_text(script, encoding="utf-8")
             result = check_python_compile(str(script_path))

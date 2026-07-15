@@ -146,6 +146,7 @@ def build_target_signature(signature: Dict[str, Any]) -> Dict[str, Any]:
         "has_center_median": _as_bool(signature.get("has_center_median")),
         "has_crosswalk": _as_bool(signature.get("has_crosswalk")),
         "has_traffic_light": _as_bool(signature.get("has_traffic_light")),
+        "has_street_lights": _as_bool(signature.get("has_street_lights")),
         "ego_to_junction_distance_m": _as_float(
             signature.get("ego_to_junction_distance_m")
         ),
@@ -245,7 +246,10 @@ def _traffic_light_distance(candidate: Dict[str, Any]) -> Optional[float]:
 
 def _context_fit(target: Dict[str, Any], candidate: Dict[str, Any]) -> float:
     env = candidate.get("environment_context") or {}
-    if not env:
+    candidate_has_street_lights = candidate.get("has_street_lights")
+    if candidate_has_street_lights is None:
+        candidate_has_street_lights = env.get("has_street_lights")
+    if not env and candidate_has_street_lights is None:
         return 0.55
     score = 0.55
     urban_score = float(env.get("urban_score") or 0.0)
@@ -260,6 +264,11 @@ def _context_fit(target: Dict[str, Any], candidate: Dict[str, Any]) -> float:
         score += 0.25 * natural_score
         if env.get("buildings_nearby"):
             score -= 0.08
+    target_has_street_lights = target.get("has_street_lights")
+    if isinstance(target_has_street_lights, bool) and isinstance(
+        candidate_has_street_lights, bool
+    ):
+        score += 0.25 if target_has_street_lights == candidate_has_street_lights else -0.25
     return _clamp(score)
 
 
@@ -447,6 +456,17 @@ def _curve_open_road_lane_hard_mismatches(
         and target_forward <= 1
         and target_opposing >= 1
     )
+    if (
+        isinstance(target_forward, int)
+        and target_forward >= 2
+        and candidate_forward is not None
+        and candidate_forward < target_forward
+    ):
+        reasons.append(
+            "curve open-road target rejects too few same-direction lanes "
+            f"(target_forward_lane_count={target_forward}, "
+            f"candidate_same_direction_lane_count={candidate_forward})"
+        )
     if (
         narrow_two_way_target
         and candidate_forward is not None

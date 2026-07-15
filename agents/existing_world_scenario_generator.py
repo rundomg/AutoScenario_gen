@@ -997,6 +997,7 @@ class ExistingWorldScenarioGenerator(ScenarioGenerator):
             "    )\n\n"
             "    if actor is not None and entity_id:\n"
             "        _autoscenario_actor_by_id[entity_id] = actor\n\n"
+            "_autoscenario_configure_vehicle_lights_for_environment(_autoscenario_actor_by_id, spawn_payload, _autoscenario_weather)\n"
             "_autoscenario_focus_spectator()\n"
             "_autoscenario_capture_render_actor_graph_if_requested(spawn_payload, _autoscenario_actor_by_id)\n"
             "_autoscenario_capture_ego_view_if_requested(_autoscenario_actor_by_id)\n"
@@ -1044,6 +1045,7 @@ class ExistingWorldScenarioGenerator(ScenarioGenerator):
 
             def _autoscenario_spawn_payload_actors(spawn_payload):
                 actor_by_id = {}
+                ego_yaw = _autoscenario_payload_ego_yaw(spawn_payload)
                 for entity in spawn_payload.get('entities', []):
                     location = carla.Location(
                         x=float(entity['location']['x']),
@@ -1054,6 +1056,9 @@ class ExistingWorldScenarioGenerator(ScenarioGenerator):
                         pitch=float(entity['rotation']['pitch']),
                         yaw=float(entity['rotation']['yaw']),
                         roll=float(entity['rotation']['roll']),
+                    )
+                    rotation = _autoscenario_apply_heading_relation(
+                        entity, rotation, ego_yaw
                     )
                     spawn_kind = str(entity.get('spawn_kind') or 'vehicle')
                     entity_id = str(entity.get('id') or '')
@@ -1069,11 +1074,32 @@ class ExistingWorldScenarioGenerator(ScenarioGenerator):
                     else:
                         placement_mode = str(entity.get('placement_mode') or 'project_to_lane')
                         role_name = 'hero' if entity_id == 'ego' else entity.get('role_name')
-                        if placement_mode in {'direct', 'preserve_xy'}:
+                        if placement_mode == 'project_to_visual_pose':
+                            actor = _autoscenario_spawn_vehicle_visual_pose(
+                                entity.get('blueprint_name'),
+                                location,
+                                rotation,
+                                entity.get('visual_position_override'),
+                                entity.get('projected_lane'),
+                                entity.get('color'),
+                                role_name=role_name,
+                                entity_id=entity_id,
+                                lane_side_relation=entity.get('lane_side_relation'),
+                            )
+                        elif placement_mode in {'direct', 'preserve_xy'}:
                             actor = _autoscenario_spawn_vehicle_direct(
                                 entity.get('blueprint_name'),
                                 location,
                                 rotation,
+                                entity.get('color'),
+                                role_name=role_name,
+                            )
+                        elif placement_mode == 'project_to_opposing_lane':
+                            actor = _autoscenario_spawn_vehicle_opposing(
+                                entity.get('blueprint_name'),
+                                location,
+                                rotation,
+                                int(entity.get('opposing_lane_from_median') or 1),
                                 entity.get('color'),
                                 role_name=role_name,
                             )
@@ -1234,6 +1260,151 @@ class ExistingWorldScenarioGenerator(ScenarioGenerator):
                 return route
 
 
+            def _autoscenario_follow_waypoint_chain(start_waypoint, max_distance_m=80.0, step_m=3.0):
+                route = []
+                waypoint = start_waypoint
+                travelled = 0.0
+                while waypoint is not None and travelled <= max_distance_m:
+                    route.append(waypoint.transform)
+                    try:
+                        candidates = list(waypoint.next(step_m) or [])
+                    except Exception:
+                        candidates = []
+                    waypoint = candidates[0] if candidates else None
+                    travelled += step_m
+                return route
+
+
+            def _autoscenario_sample_lane_change_route(
+                actor,
+                direction,
+                lane_count=1,
+                transition_distance_m=18.0,
+                max_distance_m=80.0,
+            ):
+                try:
+                    world_map = world.get_map()
+                    waypoint = world_map.get_waypoint(
+                        actor.get_transform().location,
+                        project_to_road=True,
+                        lane_type=carla.LaneType.Driving,
+                    )
+                except Exception:
+                    return _autoscenario_sample_forward_route(actor, max_distance_m)
+                getter_name = 'get_left_lane' if str(direction) == 'left' else 'get_right_lane'
+                target_lane = waypoint
+                for _ in range(max(1, int(lane_count))):
+                    getter = getattr(target_lane, getter_name, None)
+                    target_lane = getter() if callable(getter) else None
+                    if target_lane is None:
+                        return _autoscenario_sample_forward_route(actor, max_distance_m)
+                    try:
+                        if target_lane.lane_type != carla.LaneType.Driving:
+                            return _autoscenario_sample_forward_route(actor, max_distance_m)
+                    except Exception:
+                        pass
+                try:
+                    leads = list(target_lane.next(max(6.0, float(transition_distance_m))) or [])
+                except Exception:
+                    leads = []
+                start = leads[0] if leads else target_lane
+                route = _autoscenario_follow_waypoint_chain(start, max_distance_m=max_distance_m)
+                return route or _autoscenario_sample_forward_route(actor, max_distance_m)
+
+
+            def _autoscenario_choose_junction_branch(current_waypoint, candidates, direction):
+                if not candidates:
+                    return None
+                try:
+                    current_yaw = float(current_waypoint.transform.rotation.yaw)
+                except Exception:
+                    current_yaw = 0.0
+                scored = []
+                for candidate in candidates:
+                    try:
+                        delta = _autoscenario_normalize_angle(
+                            float(candidate.transform.rotation.yaw) - current_yaw
+                        )
+                    except Exception:
+                        delta = 0.0
+                    if direction == 'straight':
+                        score = abs(delta)
+                    elif direction == 'left':
+                        score = abs(delta + 90.0) if delta <= 20.0 else 180.0 + abs(delta)
+                    elif direction == 'right':
+                        score = abs(delta - 90.0) if delta >= -20.0 else 180.0 + abs(delta)
+                    else:  # u_turn
+                        score = abs(abs(delta) - 180.0)
+                    scored.append((score, candidate))
+                scored.sort(key=lambda item: item[0])
+                return scored[0][1]
+
+
+            def _autoscenario_sample_junction_route(
+                actor,
+                direction,
+                max_distance_m=45.0,
+                step_m=3.0,
+            ):
+                try:
+                    world_map = world.get_map()
+                    waypoint = world_map.get_waypoint(
+                        actor.get_transform().location,
+                        project_to_road=True,
+                        lane_type=carla.LaneType.Driving,
+                    )
+                except Exception:
+                    return _autoscenario_sample_forward_route(actor, max_distance_m)
+                route = []
+                travelled = 0.0
+                branch_selected = False
+                while waypoint is not None and travelled <= max_distance_m:
+                    route.append(waypoint.transform)
+                    try:
+                        candidates = list(waypoint.next(step_m) or [])
+                    except Exception:
+                        candidates = []
+                    if not candidates:
+                        break
+                    if len(candidates) > 1 and not branch_selected:
+                        waypoint = _autoscenario_choose_junction_branch(
+                            waypoint, candidates, str(direction)
+                        )
+                        branch_selected = True
+                    else:
+                        waypoint = candidates[0]
+                    travelled += step_m
+                return route or _autoscenario_sample_forward_route(actor, max_distance_m)
+
+
+            def _autoscenario_apply_vehicle_lights(actor, names):
+                if not names or actor is None or not hasattr(carla, 'VehicleLightState'):
+                    return
+                mapping = {
+                    'none': 'NONE',
+                    'position': 'Position',
+                    'low_beam': 'LowBeam',
+                    'high_beam': 'HighBeam',
+                    'brake': 'Brake',
+                    'right_blinker': 'RightBlinker',
+                    'left_blinker': 'LeftBlinker',
+                    'reverse': 'Reverse',
+                    'fog': 'Fog',
+                    'interior': 'Interior',
+                    'special1': 'Special1',
+                    'special2': 'Special2',
+                    'all': 'All',
+                }
+                try:
+                    state = _autoscenario_vehicle_light_base_state()
+                    for name in names:
+                        value = getattr(carla.VehicleLightState, mapping.get(str(name), ''), 0)
+                        state = state | value
+                    actor.set_light_state(carla.VehicleLightState(state))
+                except Exception:
+                    pass
+
+
             class EgoController:
                 def __init__(self, actor, risk_sample):
                     self.actor = actor
@@ -1368,6 +1539,8 @@ class ExistingWorldScenarioGenerator(ScenarioGenerator):
                     self.min_distance_m = float('inf')
                     self.min_ttc_s = float('inf')
                     self.collisions = []
+                    self.collision_actor_ids = set()
+                    self.post_collision_control_release_s = None
                     self.collision_sensor = None
                     self._attach_collision_sensor()
 
@@ -1381,11 +1554,22 @@ class ExistingWorldScenarioGenerator(ScenarioGenerator):
                             carla.Transform(),
                             attach_to=self.ego_actor,
                         )
-                        self.collision_sensor.listen(
-                            lambda event: self.collisions.append({'frame': int(event.frame)})
-                        )
+                        self.collision_sensor.listen(self._record_collision)
                     except Exception:
                         self.collision_sensor = None
+
+                def _record_collision(self, event):
+                    record = {'frame': int(event.frame)}
+                    try:
+                        other_numeric_id = int(event.other_actor.id)
+                        for actor_id, actor in self.actor_by_id.items():
+                            if actor is not None and int(actor.id) == other_numeric_id:
+                                record['actor_id'] = actor_id
+                                self.collision_actor_ids.add(actor_id)
+                                break
+                    except Exception:
+                        pass
+                    self.collisions.append(record)
 
                 def tick(self):
                     if self.ego_actor is None:
@@ -1422,14 +1606,21 @@ class ExistingWorldScenarioGenerator(ScenarioGenerator):
                     with open(self.output_path, 'w', encoding='utf-8') as file:
                         json.dump(data, file, indent=2, sort_keys=True)
 
-
-            _autoscenario_apply_weather(carla.WeatherParameters.ClearNoon)
+            spawn_payload = _autoscenario_load_spawn_payload()
+            _autoscenario_weather = (
+                os.environ.get('AUTOSCENARIO_WEATHER_OVERRIDE')
+                or (spawn_payload.get('metadata') or {}).get('carla_weather_preset')
+                or 'ClearNoon'
+            )
+            _autoscenario_apply_weather(_autoscenario_weather)
             if os.environ.get('AUTOSCENARIO_CLEAR_EXISTING') == '1':
                 _autoscenario_clear_existing_dynamic_actors()
             _AUTOSCENARIO_EXISTING_VEHICLES = _autoscenario_collect_existing_vehicles()
-            spawn_payload = _autoscenario_load_spawn_payload()
             risk_sample = _autoscenario_load_risk_sample()
             actor_by_id = _autoscenario_spawn_payload_actors(spawn_payload)
+            _autoscenario_configure_vehicle_lights_for_environment(
+                actor_by_id, spawn_payload, _autoscenario_weather
+            )
             _autoscenario_focus_spectator()
 
             ego_actor = actor_by_id.get('ego')
@@ -1611,6 +1802,7 @@ class ExistingWorldScenarioGenerator(ScenarioGenerator):
 
             def _autoscenario_spawn_payload_actors(spawn_payload):
                 actor_by_id = {}
+                ego_yaw = _autoscenario_payload_ego_yaw(spawn_payload)
                 for entity in spawn_payload.get('entities', []):
                     location = carla.Location(
                         x=float(entity['location']['x']),
@@ -1621,6 +1813,9 @@ class ExistingWorldScenarioGenerator(ScenarioGenerator):
                         pitch=float(entity['rotation']['pitch']),
                         yaw=float(entity['rotation']['yaw']),
                         roll=float(entity['rotation']['roll']),
+                    )
+                    rotation = _autoscenario_apply_heading_relation(
+                        entity, rotation, ego_yaw
                     )
                     spawn_kind = str(entity.get('spawn_kind') or 'vehicle')
                     entity_id = str(entity.get('id') or '')
@@ -1636,11 +1831,32 @@ class ExistingWorldScenarioGenerator(ScenarioGenerator):
                     else:
                         placement_mode = str(entity.get('placement_mode') or 'project_to_lane')
                         role_name = 'hero' if entity_id == 'ego' else entity.get('role_name')
-                        if placement_mode in {'direct', 'preserve_xy'}:
+                        if placement_mode == 'project_to_visual_pose':
+                            actor = _autoscenario_spawn_vehicle_visual_pose(
+                                entity.get('blueprint_name'),
+                                location,
+                                rotation,
+                                entity.get('visual_position_override'),
+                                entity.get('projected_lane'),
+                                entity.get('color'),
+                                role_name=role_name,
+                                entity_id=entity_id,
+                                lane_side_relation=entity.get('lane_side_relation'),
+                            )
+                        elif placement_mode in {'direct', 'preserve_xy'}:
                             actor = _autoscenario_spawn_vehicle_direct(
                                 entity.get('blueprint_name'),
                                 location,
                                 rotation,
+                                entity.get('color'),
+                                role_name=role_name,
+                            )
+                        elif placement_mode == 'project_to_opposing_lane':
+                            actor = _autoscenario_spawn_vehicle_opposing(
+                                entity.get('blueprint_name'),
+                                location,
+                                rotation,
+                                int(entity.get('opposing_lane_from_median') or 1),
                                 entity.get('color'),
                                 role_name=role_name,
                             )
@@ -1794,6 +2010,151 @@ class ExistingWorldScenarioGenerator(ScenarioGenerator):
                 return route
 
 
+            def _autoscenario_follow_waypoint_chain(start_waypoint, max_distance_m=80.0, step_m=3.0):
+                route = []
+                waypoint = start_waypoint
+                travelled = 0.0
+                while waypoint is not None and travelled <= max_distance_m:
+                    route.append(waypoint.transform)
+                    try:
+                        candidates = list(waypoint.next(step_m) or [])
+                    except Exception:
+                        candidates = []
+                    waypoint = candidates[0] if candidates else None
+                    travelled += step_m
+                return route
+
+
+            def _autoscenario_sample_lane_change_route(
+                actor,
+                direction,
+                lane_count=1,
+                transition_distance_m=18.0,
+                max_distance_m=80.0,
+            ):
+                try:
+                    world_map = world.get_map()
+                    waypoint = world_map.get_waypoint(
+                        actor.get_transform().location,
+                        project_to_road=True,
+                        lane_type=carla.LaneType.Driving,
+                    )
+                except Exception:
+                    return _autoscenario_sample_forward_route(actor, max_distance_m)
+                getter_name = 'get_left_lane' if str(direction) == 'left' else 'get_right_lane'
+                target_lane = waypoint
+                for _ in range(max(1, int(lane_count))):
+                    getter = getattr(target_lane, getter_name, None)
+                    target_lane = getter() if callable(getter) else None
+                    if target_lane is None:
+                        return _autoscenario_sample_forward_route(actor, max_distance_m)
+                    try:
+                        if target_lane.lane_type != carla.LaneType.Driving:
+                            return _autoscenario_sample_forward_route(actor, max_distance_m)
+                    except Exception:
+                        pass
+                try:
+                    leads = list(target_lane.next(max(6.0, float(transition_distance_m))) or [])
+                except Exception:
+                    leads = []
+                start = leads[0] if leads else target_lane
+                route = _autoscenario_follow_waypoint_chain(start, max_distance_m=max_distance_m)
+                return route or _autoscenario_sample_forward_route(actor, max_distance_m)
+
+
+            def _autoscenario_choose_junction_branch(current_waypoint, candidates, direction):
+                if not candidates:
+                    return None
+                try:
+                    current_yaw = float(current_waypoint.transform.rotation.yaw)
+                except Exception:
+                    current_yaw = 0.0
+                scored = []
+                for candidate in candidates:
+                    try:
+                        delta = _autoscenario_normalize_angle(
+                            float(candidate.transform.rotation.yaw) - current_yaw
+                        )
+                    except Exception:
+                        delta = 0.0
+                    if direction == 'straight':
+                        score = abs(delta)
+                    elif direction == 'left':
+                        score = abs(delta + 90.0) if delta <= 20.0 else 180.0 + abs(delta)
+                    elif direction == 'right':
+                        score = abs(delta - 90.0) if delta >= -20.0 else 180.0 + abs(delta)
+                    else:
+                        score = abs(abs(delta) - 180.0)
+                    scored.append((score, candidate))
+                scored.sort(key=lambda item: item[0])
+                return scored[0][1]
+
+
+            def _autoscenario_sample_junction_route(
+                actor,
+                direction,
+                max_distance_m=45.0,
+                step_m=3.0,
+            ):
+                try:
+                    world_map = world.get_map()
+                    waypoint = world_map.get_waypoint(
+                        actor.get_transform().location,
+                        project_to_road=True,
+                        lane_type=carla.LaneType.Driving,
+                    )
+                except Exception:
+                    return _autoscenario_sample_forward_route(actor, max_distance_m)
+                route = []
+                travelled = 0.0
+                branch_selected = False
+                while waypoint is not None and travelled <= max_distance_m:
+                    route.append(waypoint.transform)
+                    try:
+                        candidates = list(waypoint.next(step_m) or [])
+                    except Exception:
+                        candidates = []
+                    if not candidates:
+                        break
+                    if len(candidates) > 1 and not branch_selected:
+                        waypoint = _autoscenario_choose_junction_branch(
+                            waypoint, candidates, str(direction)
+                        )
+                        branch_selected = True
+                    else:
+                        waypoint = candidates[0]
+                    travelled += step_m
+                return route or _autoscenario_sample_forward_route(actor, max_distance_m)
+
+
+            def _autoscenario_apply_vehicle_lights(actor, names):
+                if not names or actor is None or not hasattr(carla, 'VehicleLightState'):
+                    return
+                mapping = {
+                    'none': 'NONE',
+                    'position': 'Position',
+                    'low_beam': 'LowBeam',
+                    'high_beam': 'HighBeam',
+                    'brake': 'Brake',
+                    'right_blinker': 'RightBlinker',
+                    'left_blinker': 'LeftBlinker',
+                    'reverse': 'Reverse',
+                    'fog': 'Fog',
+                    'interior': 'Interior',
+                    'special1': 'Special1',
+                    'special2': 'Special2',
+                    'all': 'All',
+                }
+                try:
+                    state = _autoscenario_vehicle_light_base_state()
+                    for name in names:
+                        value = getattr(carla.VehicleLightState, mapping.get(str(name), ''), 0)
+                        state = state | value
+                    actor.set_light_state(carla.VehicleLightState(state))
+                except Exception:
+                    pass
+
+
             def _autoscenario_normalize_angle(angle_degrees):
                 value = float(angle_degrees)
                 while value <= -180.0:
@@ -1810,6 +2171,7 @@ class ExistingWorldScenarioGenerator(ScenarioGenerator):
                 route_index=0,
                 lookahead_m=8.0,
                 max_throttle=0.55,
+                max_brake=0.7,
             ):
                 if actor is None:
                     return route_index
@@ -1851,7 +2213,7 @@ class ExistingWorldScenarioGenerator(ScenarioGenerator):
                     brake = 0.0
                 elif error < -0.4:
                     throttle = 0.0
-                    brake = min(0.7, abs(error) * 0.12)
+                    brake = min(float(max_brake), abs(error) * 0.12)
                 else:
                     throttle = 0.0
                     brake = 0.0
@@ -1864,8 +2226,11 @@ class ExistingWorldScenarioGenerator(ScenarioGenerator):
             def _autoscenario_dsl_initial_speed(actor_id, risk_dsl, cruise_speed_mps):
                 # Speed an actor should already have at t=0 (its flying-start speed).
                 ego_spec = risk_dsl.get('ego') or {}
-                if actor_id == 'ego':
-                    return float(ego_spec.get('target_speed_mps', 10.0))
+                default_speed = (
+                    float(ego_spec.get('target_speed_mps', 10.0))
+                    if actor_id == 'ego'
+                    else float(cruise_speed_mps)
+                )
                 for event in risk_dsl.get('events') or []:
                     if str(event.get('actor_id')) != actor_id:
                         continue
@@ -1874,14 +2239,25 @@ class ExistingWorldScenarioGenerator(ScenarioGenerator):
                         continue
                     action = event.get('action') or {}
                     action_type = action.get('type')
-                    if action_type in ('set_speed', 'accelerate'):
-                        return float(action.get('speed_mps', cruise_speed_mps))
-                    if action_type == 'stop':
+                    if action_type in ('set_speed', 'accelerate', 'lane_follow_speed'):
+                        return float(
+                            action.get(
+                                'speed_mps',
+                                    action.get('target_speed_mps', default_speed),
+                            )
+                        )
+                    if action_type in ('accelerate_to_speed', 'decelerate_to_speed'):
+                            return float(action.get('target_speed_mps', default_speed))
+                    if action_type == 'approach_actor':
+                        if str(action.get('travel_direction', 'forward')) == 'reverse':
+                            return 0.0
+                            return float(action.get('approach_speed_mps', default_speed))
+                    if action_type in ('stop', 'hold_position', 'reverse'):
                         return 0.0
                     # immediate brake/steer/cross: actor is still rolling at cruise.
-                    return float(cruise_speed_mps)
-                # No immediate event -> actor cruises until its (deferred) trigger.
-                return float(cruise_speed_mps)
+                        return default_speed
+                    # No immediate event -> actor cruises until its (deferred) trigger.
+                    return default_speed
 
 
             class EgoController:
@@ -1930,6 +2306,9 @@ class ExistingWorldScenarioGenerator(ScenarioGenerator):
                     self.cruise_speed_mps = float(ego_spec.get('target_speed_mps', 10.0)) * 0.9
                     self.routes = {}
                     self.route_indices = {}
+                    self.event_routes = {}
+                    self.event_route_indices = {}
+                    self.event_start_speeds = {}
                     for event in self.events:
                         actor_id = str(event.get('actor_id'))
                         actor = self.actor_by_id.get(actor_id)
@@ -1953,7 +2332,14 @@ class ExistingWorldScenarioGenerator(ScenarioGenerator):
                         return distance <= float(trigger.get('value_m', 12.0))
                     return False
 
-                def _follow_actor_lane(self, actor_id, actor, target_speed_mps, max_throttle=0.45):
+                def _follow_actor_lane(
+                    self,
+                    actor_id,
+                    actor,
+                    target_speed_mps,
+                    max_throttle=0.45,
+                    max_brake=0.7,
+                ):
                     route = self.routes.get(actor_id)
                     route_index = self.route_indices.get(actor_id, 0)
                     self.route_indices[actor_id] = _autoscenario_lane_follow_control(
@@ -1962,20 +2348,128 @@ class ExistingWorldScenarioGenerator(ScenarioGenerator):
                         route,
                         route_index,
                         max_throttle=max_throttle,
+                        max_brake=max_brake,
                     )
 
-                def _apply_action(self, actor_id, actor, action, elapsed_since_trigger):
+                def _follow_event_route(
+                    self,
+                    event_index,
+                    actor,
+                    route,
+                    target_speed_mps,
+                    max_throttle=0.45,
+                    max_brake=0.7,
+                ):
+                    if event_index not in self.event_routes:
+                        self.event_routes[event_index] = route or []
+                        self.event_route_indices[event_index] = 0
+                    self.event_route_indices[event_index] = _autoscenario_lane_follow_control(
+                        actor,
+                        target_speed_mps,
+                        self.event_routes[event_index],
+                        self.event_route_indices.get(event_index, 0),
+                        max_throttle=max_throttle,
+                        max_brake=max_brake,
+                    )
+
+                def _follow_current_event_lane(
+                    self,
+                    event_index,
+                    actor,
+                    target_speed_mps,
+                    max_throttle=0.45,
+                    max_brake=0.7,
+                ):
+                    route = (
+                        self.event_routes[event_index]
+                        if event_index in self.event_routes
+                        else _autoscenario_sample_forward_route(actor)
+                    )
+                    self._follow_event_route(
+                        event_index,
+                        actor,
+                        route,
+                        target_speed_mps,
+                        max_throttle=max_throttle,
+                        max_brake=max_brake,
+                    )
+
+                def _apply_action(
+                    self,
+                    event_index,
+                    actor_id,
+                    actor,
+                    action,
+                    elapsed_since_trigger,
+                ):
                     action_type = action.get('type')
+                    _autoscenario_apply_vehicle_lights(actor, action.get('lights'))
                     if action_type == 'brake':
                         intensity = min(1.0, max(0.0, float(action.get('intensity', 0.9))))
                         actor.apply_control(carla.VehicleControl(throttle=0.0, brake=intensity))
-                    elif action_type in ('set_speed', 'accelerate'):
-                        self._follow_actor_lane(
-                            actor_id,
+                    elif action_type in ('set_speed', 'accelerate', 'lane_follow_speed'):
+                        self._follow_current_event_lane(
+                            event_index,
                             actor,
-                            float(action.get('speed_mps', 6.0)),
+                            float(
+                                action.get(
+                                    'speed_mps',
+                                    action.get('target_speed_mps', 6.0),
+                                )
+                            ),
                         )
-                    elif action_type in ('steer', 'cross'):
+                    elif action_type == 'accelerate_to_speed':
+                        max_accel = max(0.1, float(action.get('max_accel_mps2', 3.0)))
+                        target_speed = float(action.get('target_speed_mps', 8.0))
+                        if event_index not in self.event_start_speeds:
+                            self.event_start_speeds[event_index] = _autoscenario_vehicle_speed(actor)
+                        if os.environ.get('AUTOSCENARIO_DETERMINISTIC_ACCELERATION', '1') != '0':
+                            # A bounded target-velocity ramp makes short launch
+                            # segments deterministic. Pure throttle can spend the
+                            # whole segment releasing the parking brake / engaging
+                            # first gear without producing visible displacement.
+                            commanded_speed = min(
+                                target_speed,
+                                self.event_start_speeds[event_index]
+                                + max_accel * max(0.0, elapsed_since_trigger),
+                            )
+                            _autoscenario_apply_target_velocity(actor, commanded_speed)
+                        elif _autoscenario_vehicle_speed(actor) < 0.35 and target_speed > 0.5:
+                            # Ensure low-speed scenarios have enough breakaway
+                            # torque after a preceding hold_position segment.
+                            launch_throttle = min(0.32, max(0.22, target_speed * 0.06))
+                            actor.apply_control(
+                                carla.VehicleControl(
+                                    throttle=launch_throttle,
+                                    steer=0.0,
+                                    brake=0.0,
+                                    hand_brake=False,
+                                )
+                            )
+                        else:
+                            self._follow_current_event_lane(
+                                event_index,
+                                actor,
+                                target_speed,
+                                max_throttle=min(1.0, 0.18 + max_accel / 12.0),
+                                max_brake=0.2,
+                            )
+                    elif action_type == 'decelerate_to_speed':
+                        max_decel = max(0.1, float(action.get('max_decel_mps2', 5.0)))
+                        self._follow_current_event_lane(
+                            event_index,
+                            actor,
+                            float(action.get('target_speed_mps', 3.0)),
+                            max_throttle=0.2,
+                            max_brake=min(1.0, 0.15 + max_decel / 15.0),
+                        )
+                    elif action_type == 'emergency_brake':
+                        actor.apply_control(carla.VehicleControl(throttle=0.0, brake=1.0))
+                    elif action_type == 'coast':
+                        actor.apply_control(
+                            carla.VehicleControl(throttle=0.0, steer=0.0, brake=0.0)
+                        )
+                    elif action_type in ('steer', 'cross', 'steer_offset'):
                         duration_s = float(action.get('duration_s', 1.2))
                         if elapsed_since_trigger > duration_s:
                             self._follow_actor_lane(
@@ -1988,10 +2482,185 @@ class ExistingWorldScenarioGenerator(ScenarioGenerator):
                         steer = max(-1.0, min(1.0, float(action.get('steer', 0.25))))
                         throttle = min(1.0, max(0.0, float(action.get('throttle', 0.35))))
                         actor.apply_control(
-                            carla.VehicleControl(throttle=throttle, steer=steer, brake=0.0)
+                            carla.VehicleControl(
+                                throttle=throttle,
+                                steer=steer,
+                                brake=max(0.0, min(1.0, float(action.get('brake', 0.0)))),
+                            )
+                        )
+                    elif action_type == 'lane_change':
+                        if event_index not in self.event_routes:
+                            route = _autoscenario_sample_lane_change_route(
+                                actor,
+                                action.get('direction', 'left'),
+                                action.get('lane_count', 1),
+                                action.get('transition_distance_m', 18.0),
+                            )
+                        else:
+                            route = self.event_routes[event_index]
+                        self._follow_event_route(
+                            event_index,
+                            actor,
+                            route,
+                            float(action.get('target_speed_mps', 6.0)),
+                        )
+                    elif action_type == 'junction_maneuver':
+                        if event_index not in self.event_routes:
+                            route = _autoscenario_sample_junction_route(
+                                actor,
+                                action.get('direction', 'straight'),
+                                action.get('route_distance_m', 45.0),
+                            )
+                        else:
+                            route = self.event_routes[event_index]
+                        self._follow_event_route(
+                            event_index,
+                            actor,
+                            route,
+                            float(action.get('target_speed_mps', 5.0)),
+                            max_throttle=0.35,
+                        )
+                    elif action_type == 'drive_to_location':
+                        target = action.get('target') or {}
+                        try:
+                            target_location = carla.Location(
+                                x=float(target.get('x')),
+                                y=float(target.get('y')),
+                                z=float(target.get('z', 0.0)),
+                            )
+                            actor_location = actor.get_transform().location
+                            distance = math.sqrt(
+                                (actor_location.x - target_location.x) ** 2
+                                + (actor_location.y - target_location.y) ** 2
+                            )
+                        except Exception:
+                            distance = 0.0
+                            target_location = None
+                        if target_location is None or distance <= float(
+                            action.get('acceptance_radius_m', 1.5)
+                        ):
+                            actor.apply_control(carla.VehicleControl(throttle=0.0, brake=1.0))
+                        else:
+                            route = [carla.Transform(target_location)]
+                            self._follow_event_route(
+                                event_index,
+                                actor,
+                                route,
+                                float(action.get('target_speed_mps', 5.0)),
+                                max_throttle=0.4,
+                            )
+                    elif action_type == 'reverse':
+                        target_speed = max(0.0, min(10.0, float(action.get('target_speed_mps', 2.0))))
+                        current_speed = _autoscenario_vehicle_speed(actor)
+                        throttle = 0.0 if current_speed >= target_speed else min(0.5, 0.15 + target_speed * 0.04)
+                        brake = 0.35 if current_speed > target_speed + 0.5 else 0.0
+                        actor.apply_control(
+                            carla.VehicleControl(
+                                throttle=throttle,
+                                steer=max(-1.0, min(1.0, float(action.get('steer', 0.0)))),
+                                brake=brake,
+                                reverse=True,
+                            )
+                        )
+                    elif action_type == 'follow_actor':
+                        target = self.actor_by_id.get(str(action.get('target_actor_id')))
+                        if target is None:
+                            actor.apply_control(carla.VehicleControl(throttle=0.0, brake=1.0))
+                        else:
+                            gap = _autoscenario_actor_distance(actor, target)
+                            desired = float(action.get('desired_gap_m', 8.0))
+                            target_speed = _autoscenario_vehicle_speed(target)
+                            commanded = max(
+                                0.0,
+                                min(
+                                    float(action.get('max_speed_mps', 15.0)),
+                                    target_speed + 0.45 * (gap - desired),
+                                ),
+                            )
+                            self._follow_current_event_lane(
+                                event_index, actor, commanded
+                            )
+                    elif action_type == 'approach_actor':
+                        target = self.actor_by_id.get(str(action.get('target_actor_id')))
+                        if target is None:
+                            actor.apply_control(carla.VehicleControl(throttle=0.0, brake=1.0))
+                        else:
+                            gap = _autoscenario_actor_distance(actor, target)
+                            target_gap = float(action.get('target_gap_m', 0.0))
+                            if target_gap > 0.0 and gap <= target_gap:
+                                actor.apply_control(carla.VehicleControl(throttle=0.0, brake=1.0))
+                            elif str(action.get('travel_direction', 'forward')) == 'reverse':
+                                target_speed = max(
+                                    0.0,
+                                    min(10.0, float(action.get('approach_speed_mps', 2.0))),
+                                )
+                                current_speed = _autoscenario_vehicle_speed(actor)
+                                actor.apply_control(
+                                    carla.VehicleControl(
+                                        throttle=(
+                                            0.0
+                                            if current_speed >= target_speed
+                                            else min(0.5, 0.15 + target_speed * 0.04)
+                                        ),
+                                        steer=max(
+                                            -1.0,
+                                            min(1.0, float(action.get('steer', 0.0))),
+                                        ),
+                                        brake=(
+                                            0.35
+                                            if current_speed > target_speed + 0.5
+                                            else 0.0
+                                        ),
+                                        reverse=True,
+                                    )
+                                )
+                            else:
+                                self._follow_current_event_lane(
+                                    event_index,
+                                    actor,
+                                    float(action.get('approach_speed_mps', 10.0)),
+                                    max_throttle=0.65,
+                                    max_brake=0.2,
+                                )
+                    elif action_type == 'yield_to_actor':
+                        target = self.actor_by_id.get(str(action.get('target_actor_id')))
+                        distance = (
+                            _autoscenario_actor_distance(actor, target)
+                            if target is not None
+                            else float('inf')
+                        )
+                        if distance <= float(action.get('yield_distance_m', 12.0)):
+                            actor.apply_control(carla.VehicleControl(throttle=0.0, brake=1.0))
+                        else:
+                            self._follow_current_event_lane(
+                                event_index,
+                                actor,
+                                float(action.get('resume_speed_mps', 5.0)),
+                                max_throttle=0.35,
+                            )
+                    elif action_type == 'raw_vehicle_control':
+                        actor.apply_control(
+                            carla.VehicleControl(
+                                throttle=max(0.0, min(1.0, float(action.get('throttle', 0.0)))),
+                                steer=max(-1.0, min(1.0, float(action.get('steer', 0.0)))),
+                                brake=max(0.0, min(1.0, float(action.get('brake', 0.0)))),
+                                hand_brake=bool(action.get('hand_brake', False)),
+                                reverse=bool(action.get('reverse', False)),
+                                manual_gear_shift=bool(action.get('manual_gear_shift', False)),
+                                gear=int(action.get('gear', 0)),
+                            )
                         )
                     elif action_type == 'stop':
-                        actor.apply_control(carla.VehicleControl(throttle=0.0, brake=1.0))
+                        hand_brake = bool(action.get('hand_brake', False)) and _autoscenario_vehicle_speed(actor) < 0.3
+                        actor.apply_control(
+                            carla.VehicleControl(
+                                throttle=0.0,
+                                brake=1.0,
+                                hand_brake=hand_brake,
+                            )
+                        )
+                    elif action_type == 'hold_position':
+                        _autoscenario_hold_vehicle_stationary(actor)
 
                 def tick(self, elapsed_s):
                     actors_with_active_event = set()
@@ -2010,7 +2679,14 @@ class ExistingWorldScenarioGenerator(ScenarioGenerator):
                         elapsed_since_trigger = (
                             0.0 if trigger_time is None else max(0.0, elapsed_s - trigger_time)
                         )
+                        active_duration_s = event.get('active_duration_s')
+                        if (
+                            active_duration_s is not None
+                            and elapsed_since_trigger > float(active_duration_s)
+                        ):
+                            continue
                         self._apply_action(
+                            index,
                             actor_id,
                             actor,
                             event.get('action') or {},
@@ -2020,6 +2696,11 @@ class ExistingWorldScenarioGenerator(ScenarioGenerator):
                     # Pre-trigger cruise for event actors that have not fired yet.
                     for event in self.events:
                         actor_id = str(event.get('actor_id'))
+                        # EgoController owns ego until an ego DSL event is active.
+                        # Without this guard, the generic 0.9x NPC cruise target
+                        # overwrites ego's configured target speed every tick.
+                        if actor_id == 'ego':
+                            continue
                         if actor_id in actors_with_active_event:
                             continue
                         actor = self.actor_by_id.get(actor_id)
@@ -2044,7 +2725,35 @@ class ExistingWorldScenarioGenerator(ScenarioGenerator):
                     self.min_ttc_s = float('inf')
                     self.collisions = []
                     self.collision_sensor = None
+                    self.motion_origins = {}
+                    self.motion_stats = {}
+                    for actor_id, actor in list(self.actor_by_id.items()):
+                        if actor is None:
+                            continue
+                        try:
+                            location = actor.get_transform().location
+                            self.motion_origins[actor_id] = (location.x, location.y)
+                            self.motion_stats[actor_id] = {
+                                'first_motion_s': None,
+                                'max_speed_mps': 0.0,
+                            }
+                        except Exception:
+                            pass
                     self._attach_collision_sensor()
+
+                def reset_motion_baseline(self):
+                    for actor_id, actor in list(self.actor_by_id.items()):
+                        if actor is None:
+                            continue
+                        try:
+                            location = actor.get_transform().location
+                            self.motion_origins[actor_id] = (location.x, location.y)
+                            self.motion_stats[actor_id] = {
+                                'first_motion_s': None,
+                                'max_speed_mps': 0.0,
+                            }
+                        except Exception:
+                            pass
 
                 def _attach_collision_sensor(self):
                     if self.ego_actor is None:
@@ -2062,7 +2771,19 @@ class ExistingWorldScenarioGenerator(ScenarioGenerator):
                     except Exception:
                         self.collision_sensor = None
 
-                def tick(self):
+                def tick(self, elapsed_s=None):
+                    for actor_id, actor in list(self.actor_by_id.items()):
+                        if actor_id not in self.motion_stats or actor is None:
+                            continue
+                        speed = _autoscenario_vehicle_speed(actor)
+                        stats = self.motion_stats[actor_id]
+                        stats['max_speed_mps'] = max(stats['max_speed_mps'], speed)
+                        if (
+                            stats['first_motion_s'] is None
+                            and elapsed_s is not None
+                            and speed > 0.5
+                        ):
+                            stats['first_motion_s'] = float(elapsed_s)
                     if self.ego_actor is None:
                         return
                     ego_speed = _autoscenario_vehicle_speed(self.ego_actor)
@@ -2086,25 +2807,55 @@ class ExistingWorldScenarioGenerator(ScenarioGenerator):
                             self.collision_sensor.destroy()
                         except Exception:
                             pass
+                    actor_motion = {}
+                    for actor_id, stats in self.motion_stats.items():
+                        actor = self.actor_by_id.get(actor_id)
+                        displacement = None
+                        final_speed = None
+                        try:
+                            location = actor.get_transform().location
+                            origin_x, origin_y = self.motion_origins[actor_id]
+                            displacement = math.sqrt(
+                                (location.x - origin_x) ** 2
+                                + (location.y - origin_y) ** 2
+                            )
+                            final_speed = _autoscenario_vehicle_speed(actor)
+                        except Exception:
+                            pass
+                        actor_motion[actor_id] = {
+                            'first_motion_s': stats['first_motion_s'],
+                            'max_speed_mps': stats['max_speed_mps'],
+                            'final_speed_mps': final_speed,
+                            'displacement_m': displacement,
+                        }
                     data = {
                         'collision': bool(self.collisions),
                         'collision_events': self.collisions,
                         'min_distance_m': None if self.min_distance_m == float('inf') else self.min_distance_m,
                         'min_ttc_s': None if self.min_ttc_s == float('inf') else self.min_ttc_s,
                         'actor_ids': sorted(self.actor_by_id.keys()),
+                        'actor_motion': actor_motion,
+                        'post_collision_control_release_s': self.post_collision_control_release_s,
                     }
                     os.makedirs(os.path.dirname(self.output_path) or '.', exist_ok=True)
                     with open(self.output_path, 'w', encoding='utf-8') as file:
                         json.dump(data, file, indent=2, sort_keys=True)
 
-
-            _autoscenario_apply_weather(carla.WeatherParameters.ClearNoon)
+            spawn_payload = _autoscenario_load_spawn_payload()
+            _autoscenario_weather = (
+                os.environ.get('AUTOSCENARIO_WEATHER_OVERRIDE')
+                or (spawn_payload.get('metadata') or {}).get('carla_weather_preset')
+                or 'ClearNoon'
+            )
+            _autoscenario_apply_weather(_autoscenario_weather)
             if os.environ.get('AUTOSCENARIO_CLEAR_EXISTING') == '1':
                 _autoscenario_clear_existing_dynamic_actors()
             _AUTOSCENARIO_EXISTING_VEHICLES = _autoscenario_collect_existing_vehicles()
-            spawn_payload = _autoscenario_load_spawn_payload()
             risk_dsl = _autoscenario_load_risk_dsl()
             actor_by_id = _autoscenario_spawn_payload_actors(spawn_payload)
+            _autoscenario_configure_vehicle_lights_for_environment(
+                actor_by_id, spawn_payload, _autoscenario_weather
+            )
             _autoscenario_focus_spectator()
 
             def _autoscenario_sampled_flying_speed(actor_id, cruise_speed_mps, low=0.85, high=1.0):
@@ -2140,8 +2891,10 @@ class ExistingWorldScenarioGenerator(ScenarioGenerator):
             _autoscenario_sync_settings.fixed_delta_seconds = tick_dt
             world.apply_settings(_autoscenario_sync_settings)
 
-            # Hand any actor that is neither the ego nor a scripted DSL-event actor to
-            # the Traffic Manager so the scene is not frozen around the ego.
+            # Actors covered by the trajectory DSL are controlled by its events.
+            # For a legacy/incomplete DSL, only an actor explicitly marked moving
+            # may become Traffic Manager background traffic. Parked, stopped, and
+            # unknown actors remain fixed instead of unexpectedly driving away.
             _autoscenario_scripted_ids = {'ego'}
             for _event in (risk_dsl.get('events') or []):
                 _autoscenario_scripted_ids.add(str(_event.get('actor_id')))
@@ -2152,6 +2905,12 @@ class ExistingWorldScenarioGenerator(ScenarioGenerator):
             except Exception:
                 _autoscenario_traffic_manager = None
             _autoscenario_background_actors = []
+            _autoscenario_stationary_background_actors = []
+            _autoscenario_spawn_entity_by_id = {
+                str(_entity.get('id')): _entity
+                for _entity in (spawn_payload.get('entities') or [])
+                if isinstance(_entity, dict) and _entity.get('id') is not None
+            }
 
             # Allow freshly spawned actors to settle onto the road surface before
             # starting the scenario.
@@ -2190,7 +2949,10 @@ class ExistingWorldScenarioGenerator(ScenarioGenerator):
             _autoscenario_cruise_speed_mps = float(
                 (risk_dsl.get('ego') or {}).get('target_speed_mps', 10.0)
             ) * 0.9
-            if os.environ.get('AUTOSCENARIO_DISABLE_FLYING_START', '0') == '0':
+            _autoscenario_flying_start_enabled = (
+                os.environ.get('AUTOSCENARIO_DISABLE_FLYING_START', '0') == '0'
+            )
+            if _autoscenario_flying_start_enabled:
                 for _init_id in _autoscenario_scripted_ids:
                     _init_actor = actor_by_id.get(_init_id)
                     if _init_actor is None:
@@ -2215,11 +2977,17 @@ class ExistingWorldScenarioGenerator(ScenarioGenerator):
                 try:
                     if 'vehicle' not in _bg_actor.type_id:
                         continue
-                    # Background vehicles get a sampled flying start so e.g. a
-                    # same-lane lead car is already rolling instead of being a
-                    # 0-speed obstacle for the flying-start ego, then autopilot
-                    # keeps them driving.
-                    if os.environ.get('AUTOSCENARIO_DISABLE_FLYING_START', '0') == '0':
+                    _bg_entity = _autoscenario_spawn_entity_by_id.get(_bg_id) or {}
+                    _bg_motion_state = str(
+                        _bg_entity.get('motion_state') or 'unknown'
+                    ).lower()
+                    if _bg_motion_state != 'moving':
+                        _autoscenario_hold_vehicle_stationary(_bg_actor)
+                        _autoscenario_stationary_background_actors.append(_bg_actor)
+                        continue
+                    # Explicitly moving background vehicles get a sampled flying
+                    # start and Traffic Manager lane following.
+                    if _autoscenario_flying_start_enabled:
                         _autoscenario_apply_target_velocity(
                             _bg_actor,
                             _autoscenario_sampled_flying_speed(
@@ -2234,6 +3002,12 @@ class ExistingWorldScenarioGenerator(ScenarioGenerator):
                     _autoscenario_background_actors.append(_bg_actor)
                 except Exception:
                     pass
+
+            # Commit set_target_velocity before t=0 immediate events. CARLA
+            # applies target velocity on a physics tick; without this tick an
+            # immediate brake can take effect before the flying start does.
+            if _autoscenario_flying_start_enabled:
+                world.tick()
 
             _autoscenario_spectator = None
             try:
@@ -2260,14 +3034,41 @@ class ExistingWorldScenarioGenerator(ScenarioGenerator):
                 except Exception:
                     pass
 
+            metrics.reset_motion_baseline()
+            _autoscenario_post_collision_released = False
             try:
                 for tick_index in range(max_ticks):
                     elapsed_s = tick_index * tick_dt
-                    ego_controller.tick(elapsed_s)
-                    dsl_controller.tick(elapsed_s)
+                    if metrics.collisions:
+                        if not _autoscenario_post_collision_released:
+                            # Clear the last commanded throttle/brake once, then
+                            # leave both collision actors entirely to CARLA physics.
+                            _release_ids = {'ego'} | set(metrics.collision_actor_ids)
+                            for _release_id in _release_ids:
+                                _release_actor = actor_by_id.get(_release_id)
+                                if _release_actor is None:
+                                    continue
+                                try:
+                                    _release_actor.apply_control(
+                                        carla.VehicleControl(
+                                            throttle=0.0,
+                                            steer=0.0,
+                                            brake=0.0,
+                                            hand_brake=False,
+                                        )
+                                    )
+                                except Exception:
+                                    pass
+                            metrics.post_collision_control_release_s = elapsed_s
+                            _autoscenario_post_collision_released = True
+                    else:
+                        ego_controller.tick(elapsed_s)
+                        dsl_controller.tick(elapsed_s)
+                    for _stationary_actor in _autoscenario_stationary_background_actors:
+                        _autoscenario_hold_vehicle_stationary(_stationary_actor)
                     world.tick()
                     time.sleep(0.05)
-                    metrics.tick()
+                    metrics.tick(elapsed_s)
                     _autoscenario_update_spectator(ego_actor, _autoscenario_spectator)
             finally:
                 metrics.close()

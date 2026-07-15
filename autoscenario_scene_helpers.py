@@ -14,6 +14,8 @@ _AUTOSCENARIO_FOCUS_POINTS = []
 _AUTOSCENARIO_EXISTING_VEHICLES = []
 _AUTOSCENARIO_PARKING_PROJECTION_RESULTS = {}
 _AUTOSCENARIO_VISUAL_POSITION_RESULTS = {}
+_AUTOSCENARIO_NIGHT_WEATHER_ACTIVE = False
+_AUTOSCENARIO_LOW_LIGHT_VEHICLE_LIGHTS_ACTIVE = False
 _AUTOSCENARIO_LAST_PARKING_PROJECTION_RESULT = {
     "result": "unavailable",
     "lane": None,
@@ -75,6 +77,68 @@ def _autoscenario_init(w, bl):
     _AUTOSCENARIO_VISUAL_POSITION_RESULTS.clear()
 
 
+def _autoscenario_is_low_light_environment(spawn_payload=None, weather_value=None):
+    """Return True for night and dusk/twilight scene descriptions."""
+    metadata = (spawn_payload or {}).get("metadata") or {}
+    environment = metadata.get("general_environment") or {}
+    values = [
+        weather_value,
+        metadata.get("carla_weather_preset"),
+        environment.get("lighting_hint"),
+        environment.get("time_of_day_hint"),
+    ]
+    description = " ".join(str(value or "").lower() for value in values)
+    return any(
+        marker in description
+        for marker in (
+            "night",
+            "sunset",
+            "twilight",
+            "dusk",
+            "evening",
+            "夜",
+            "黄昏",
+        )
+    )
+
+
+def _autoscenario_vehicle_light_base_state():
+    if carla is None or not hasattr(carla, "VehicleLightState"):
+        return 0
+    state = getattr(carla.VehicleLightState, "NONE", 0)
+    if _AUTOSCENARIO_LOW_LIGHT_VEHICLE_LIGHTS_ACTIVE:
+        state = state | getattr(carla.VehicleLightState, "Position", 0)
+        state = state | getattr(carla.VehicleLightState, "LowBeam", 0)
+    return state
+
+
+def _autoscenario_configure_vehicle_lights_for_environment(
+    actor_by_id,
+    spawn_payload=None,
+    weather_value=None,
+):
+    """Enable position lamps and low beams for every vehicle in low light."""
+    global _AUTOSCENARIO_LOW_LIGHT_VEHICLE_LIGHTS_ACTIVE
+    _AUTOSCENARIO_LOW_LIGHT_VEHICLE_LIGHTS_ACTIVE = (
+        _autoscenario_is_low_light_environment(spawn_payload, weather_value)
+    )
+    if not _AUTOSCENARIO_LOW_LIGHT_VEHICLE_LIGHTS_ACTIVE:
+        return False
+    if carla is None or not hasattr(carla, "VehicleLightState"):
+        return False
+    state = _autoscenario_vehicle_light_base_state()
+    for actor in (actor_by_id or {}).values():
+        if actor is None:
+            continue
+        try:
+            if "vehicle" not in actor.type_id:
+                continue
+            actor.set_light_state(carla.VehicleLightState(state))
+        except Exception:
+            pass
+    return True
+
+
 def _autoscenario_normalize_key(value):
     return "".join(ch for ch in str(value).lower() if ch.isalnum())
 
@@ -116,6 +180,35 @@ def _autoscenario_normalize_yaw(yaw_value):
 
 def _autoscenario_angle_distance(yaw_a, yaw_b):
     return abs(_autoscenario_normalize_yaw(yaw_a - yaw_b))
+
+
+def _autoscenario_payload_ego_yaw(spawn_payload):
+    for entity in (spawn_payload or {}).get("entities", []):
+        if str(entity.get("id")) not in {"ego", "ego_vehicle"}:
+            continue
+        try:
+            return float((entity.get("rotation") or {}).get("yaw"))
+        except (TypeError, ValueError):
+            return None
+    return None
+
+
+def _autoscenario_apply_heading_relation(entity, rotation, ego_yaw):
+    if ego_yaw is None:
+        return rotation
+    if str(entity.get("flow_compliance") or "").lower() == "wrong_way":
+        return rotation
+    relation = str(entity.get("heading_relation") or "unknown")
+    yaw = float(rotation.yaw)
+    if relation == "opposite_direction" and _autoscenario_angle_distance(
+        yaw, ego_yaw
+    ) < 90.0:
+        rotation.yaw = _autoscenario_normalize_yaw(yaw + 180.0)
+    elif relation == "same_direction" and _autoscenario_angle_distance(
+        yaw, ego_yaw
+    ) > 90.0:
+        rotation.yaw = _autoscenario_normalize_yaw(yaw + 180.0)
+    return rotation
 
 
 def _autoscenario_blueprint_matches_category(blueprint, category, semantic_name):
@@ -1370,7 +1463,34 @@ def _autoscenario_default_weather():
         return carla.WeatherParameters()
 
 
+def _autoscenario_brighten_night_weather(weather):
+    """Keep night semantics while adding usable moon/twilight illumination."""
+    try:
+        weather.sun_altitude_angle = float(
+            os.environ.get("AUTOSCENARIO_NIGHT_SUN_ALTITUDE", "-8.0")
+        )
+    except Exception:
+        pass
+    try:
+        max_fog_density = float(
+            os.environ.get("AUTOSCENARIO_NIGHT_MAX_FOG_DENSITY", "15.0")
+        )
+        weather.fog_density = min(float(weather.fog_density), max_fog_density)
+    except Exception:
+        pass
+    try:
+        min_fog_distance = float(
+            os.environ.get("AUTOSCENARIO_NIGHT_MIN_FOG_DISTANCE", "20.0")
+        )
+        weather.fog_distance = max(float(weather.fog_distance), min_fog_distance)
+    except Exception:
+        pass
+    return weather
+
+
 def _autoscenario_apply_weather(weather_value=None):
+    global _AUTOSCENARIO_NIGHT_WEATHER_ACTIVE
+    _AUTOSCENARIO_NIGHT_WEATHER_ACTIVE = False
     if weather_value is None:
         world.set_weather(_autoscenario_default_weather())
         return
@@ -1378,6 +1498,9 @@ def _autoscenario_apply_weather(weather_value=None):
     if isinstance(weather_value, str):
         preset = getattr(carla.WeatherParameters, weather_value, None)
         if preset is not None:
+            if weather_value.lower().endswith("night"):
+                preset = _autoscenario_brighten_night_weather(preset)
+                _AUTOSCENARIO_NIGHT_WEATHER_ACTIVE = True
             world.set_weather(preset)
             return
         world.set_weather(_autoscenario_default_weather())
@@ -1388,6 +1511,12 @@ def _autoscenario_apply_weather(weather_value=None):
         for key, value in weather_value.items():
             if hasattr(weather, key):
                 setattr(weather, key, value)
+        try:
+            _AUTOSCENARIO_NIGHT_WEATHER_ACTIVE = (
+                float(weather.sun_altitude_angle) < 0.0
+            )
+        except Exception:
+            pass
         world.set_weather(weather)
         return
 
@@ -1455,6 +1584,15 @@ def _autoscenario_capture_bev_if_requested():
         bp.set_attribute("image_size_y", image_size)
         bp.set_attribute("fov", fov)
         bp.set_attribute("sensor_tick", "0.05")
+        if (
+            _AUTOSCENARIO_NIGHT_WEATHER_ACTIVE
+            and hasattr(bp, "has_attribute")
+            and bp.has_attribute("exposure_compensation")
+        ):
+            bp.set_attribute(
+                "exposure_compensation",
+                os.environ.get("AUTOSCENARIO_NIGHT_EXPOSURE_COMPENSATION", "1.0"),
+            )
     except Exception:
         return
 
@@ -1505,6 +1643,15 @@ def _autoscenario_capture_ego_view_if_requested(actor_by_id=None):
         bp.set_attribute("image_size_y", image_size)
         bp.set_attribute("fov", fov)
         bp.set_attribute("sensor_tick", "0.05")
+        if (
+            _AUTOSCENARIO_NIGHT_WEATHER_ACTIVE
+            and hasattr(bp, "has_attribute")
+            and bp.has_attribute("exposure_compensation")
+        ):
+            bp.set_attribute(
+                "exposure_compensation",
+                os.environ.get("AUTOSCENARIO_NIGHT_EXPOSURE_COMPENSATION", "1.0"),
+            )
     except Exception:
         return
 

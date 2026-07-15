@@ -96,7 +96,10 @@ class TestLayoutCapture(unittest.TestCase):
                 Path(kwargs["env"]["AUTOSCENARIO_BEV_OUTPUT"]).write_bytes(b"bev")
                 return types.SimpleNamespace(returncode=0, stdout="", stderr="")
 
-            with mock.patch("experiments.auto_generate_all_vlm.subprocess.run", fake_run):
+            with mock.patch.dict(
+                "experiments.auto_generate_all_vlm.os.environ",
+                {"AUTOSCENARIO_WEATHER_OVERRIDE": "MidRainyNight"},
+            ), mock.patch("experiments.auto_generate_all_vlm.subprocess.run", fake_run):
                 capture = generator._capture_layout_images("s0000", "/tmp/final.py", 1)
 
             self.assertEqual(capture["capture_mode"], "ego_view")
@@ -105,6 +108,10 @@ class TestLayoutCapture(unittest.TestCase):
             self.assertIn("AUTOSCENARIO_EGO_VIEW_OUTPUT", seen_env)
             self.assertIn("AUTOSCENARIO_BEV_OUTPUT", seen_env)
             self.assertIn("AUTOSCENARIO_RENDER_ACTOR_GRAPH_OUTPUT", seen_env)
+            self.assertEqual(
+                seen_env.get("AUTOSCENARIO_WEATHER_OVERRIDE"),
+                "MidRainyNight",
+            )
 
     def test_capture_layout_images_falls_back_to_bev_when_ego_missing(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -365,6 +372,131 @@ class TestActorGraphVerifyRepairIntegration(unittest.TestCase):
         self.assertEqual(compiled["patches"][0]["op"], "set_heading_relation")
         self.assertEqual(
             compiled["patches"][0]["target_heading"], "opposite_direction"
+        )
+
+    def test_open_road_pose_repair_cannot_restore_crossing_heading(self):
+        compiled = AutoGenerator._compile_actor_repair_patches(
+            {
+                "repair_patches": [
+                    {
+                        "op": "set_pose_target",
+                        "entity_id": "car_1",
+                        "target_lane": "left_lane",
+                        "target_longitudinal_m": 6.0,
+                        "target_lateral_offset_m": -1.8,
+                        "target_heading_relation": "crossing",
+                    }
+                ]
+            },
+            {"issues": []},
+            {"actors": [{"id": "car_1"}]},
+            {
+                "entities": [
+                    {
+                        "id": "car_1",
+                        "spawn_kind": "vehicle",
+                        "layout_scene_kind": "open_road",
+                        "heading_relation": "unknown",
+                        "degraded_reason": "open-road crossing heading degraded to unknown",
+                    }
+                ]
+            },
+        )
+
+        self.assertEqual(
+            compiled["patches"][0]["target_heading_relation"], "same_direction"
+        )
+        self.assertEqual(
+            compiled["normalizations"][0]["reason"],
+            "open_road_crossing_heading_aligned_to_lane_flow",
+        )
+
+    def test_junction_pose_repair_keeps_crossing_heading(self):
+        compiled = AutoGenerator._compile_actor_repair_patches(
+            {
+                "repair_patches": [
+                    {
+                        "op": "set_pose_target",
+                        "entity_id": "car_1",
+                        "target_lane": "left_lane",
+                        "target_longitudinal_m": 6.0,
+                        "target_lateral_offset_m": -1.8,
+                        "target_heading_relation": "crossing",
+                    }
+                ]
+            },
+            {"issues": []},
+            {"actors": [{"id": "car_1"}]},
+            {
+                "entities": [
+                    {
+                        "id": "car_1",
+                        "spawn_kind": "vehicle",
+                        "layout_scene_kind": "junction",
+                    }
+                ]
+            },
+        )
+
+        self.assertEqual(
+            compiled["patches"][0]["target_heading_relation"], "crossing"
+        )
+        self.assertEqual(compiled["normalizations"], [])
+
+    def test_apply_repair_defensively_aligns_open_road_crossing_to_lane_flow(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            generator = _make_generator(tmp)
+            scene_id = "open_road_crossing_guard"
+            payload = {
+                "entities": [
+                    {
+                        "id": "ego",
+                        "location": {"x": 0.0, "y": 0.0, "z": 0.3},
+                        "rotation": {"yaw": 0.0},
+                    },
+                    {
+                        "id": "car_1",
+                        "spawn_kind": "vehicle",
+                        "layout_scene_kind": "open_road",
+                        "heading_relation": "unknown",
+                        "location": {"x": 5.0, "y": 0.0, "z": 0.3},
+                        "rotation": {"yaw": 0.0},
+                    },
+                ]
+            }
+            Path(generator._spawn_payload_path(scene_id)).write_text(
+                json.dumps(payload), encoding="utf-8"
+            )
+
+            result = generator._apply_actor_repair_patches(
+                scene_id,
+                {"lane_width_m": 3.5},
+                {
+                    "patches": [
+                        {
+                            "op": "set_pose_target",
+                            "entity_id": "car_1",
+                            "target_lane": "left_lane",
+                            "target_longitudinal_m": 6.0,
+                            "target_lateral_offset_m": -1.8,
+                            "target_heading_relation": "crossing",
+                        }
+                    ],
+                    "rejected": [],
+                    "semantic_unrepairable": [],
+                },
+            )
+            repaired = json.loads(
+                Path(generator._spawn_payload_path(scene_id)).read_text(encoding="utf-8")
+            )
+            car = next(item for item in repaired["entities"] if item["id"] == "car_1")
+
+        self.assertEqual(result["applied_count"], 1)
+        self.assertEqual(car["heading_relation"], "same_direction")
+        self.assertAlmostEqual(car["rotation"]["yaw"], 0.0)
+        self.assertEqual(
+            result["patch_outcomes"][0]["reason"],
+            "open_road_crossing_heading_aligned_to_lane_flow",
         )
 
     def test_live_actor_graph_geometry_compiles_to_pose_target(self):

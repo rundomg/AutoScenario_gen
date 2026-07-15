@@ -17,6 +17,11 @@ the deterministic generator knows how to execute.
 from copy import deepcopy
 from typing import Any, Dict, List, Optional, Tuple
 
+from tools.vehicle_atomic_behaviors import (
+    SUPPORTED_ATOMIC_BEHAVIORS,
+    normalize_atomic_behavior,
+)
+
 
 RISK_DSL_SCHEMA_VERSION = "risk-dsl-v1"
 DEFAULT_EGO_TARGET_SPEED_MPS = 10.0
@@ -26,7 +31,8 @@ DEFAULT_METRICS = ["collision", "min_ttc_s", "min_distance_m"]
 EGO_BEHAVIORS = {"drive_forward"}
 
 TRIGGER_TYPES = {"immediate", "time_elapsed_above", "distance_to_ego_below"}
-ACTION_TYPES = {"brake", "set_speed", "accelerate", "steer", "cross", "stop"}
+LEGACY_ACTION_TYPES = {"brake", "set_speed", "accelerate", "steer", "cross", "stop"}
+ACTION_TYPES = LEGACY_ACTION_TYPES | set(SUPPORTED_ATOMIC_BEHAVIORS)
 
 
 def validate_risk_dsl(
@@ -129,7 +135,7 @@ def _normalize_event(
         return None, error
     event["trigger"] = trigger
 
-    action, error = _normalize_action(event.get("action"), index)
+    action, error = _normalize_action(event.get("action"), index, actor_ids)
     if error:
         return None, error
     event["action"] = action
@@ -162,6 +168,7 @@ def _normalize_trigger(
 def _normalize_action(
     action: Any,
     index: int,
+    actor_ids: set,
 ) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
     if not isinstance(action, dict):
         return None, f"events[{index}].action must be an object."
@@ -170,6 +177,22 @@ def _normalize_action(
         return None, (
             f"events[{index}].action.type must be one of {sorted(ACTION_TYPES)}."
         )
+    if action_type in SUPPORTED_ATOMIC_BEHAVIORS and action_type not in {
+        "brake",
+        "stop",
+    }:
+        source = dict(action)
+        source["action"] = action_type
+        atomic, error = normalize_atomic_behavior(
+            source,
+            where=f"events[{index}].action",
+            actor_ids=actor_ids,
+        )
+        if error is not None or atomic is None:
+            return None, error
+        atomic["type"] = atomic.pop("action")
+        return atomic, None
+
     normalized: Dict[str, Any] = {"type": action_type}
     if action_type == "brake":
         normalized["intensity"] = _clamp(_to_float(action.get("intensity"), 0.9), 0.0, 1.0)
@@ -183,7 +206,19 @@ def _normalize_action(
         normalized["duration_s"] = _to_float(action.get("duration_s"), 1.2)
         if normalized["duration_s"] <= 0.0:
             return None, f"events[{index}].action.duration_s must be positive."
-    # "stop" needs no parameters.
+    elif action_type == "stop":
+        normalized["hand_brake"] = bool(action.get("hand_brake", False))
+    lights = action.get("lights")
+    if lights is not None:
+        source = {"action": "coast", "lights": lights}
+        atomic, error = normalize_atomic_behavior(
+            source,
+            where=f"events[{index}].action",
+            actor_ids=actor_ids,
+        )
+        if error:
+            return None, error
+        normalized["lights"] = atomic.get("lights")
     return normalized, None
 
 

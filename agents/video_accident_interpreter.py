@@ -38,9 +38,11 @@ class VideoAccidentInterpreter(TaskAgent):
         super().__init__()
         self.pre_prompt = """
         You are analysing an accident captured by a forward-facing vehicle camera.
-        You are given a few key frames in time order: the START frame (just before
-        the accident, normal approach), optional CONTEXT frames, and the END frame
-        (the accident outcome is clearest). The ego vehicle is the camera car.
+        You are given sampled frames in chronological order from alert to event.
+        Every image label includes available source time, time relative to START,
+        sampling progress/phase, and source frame index. Use changes across the
+        whole ordered sequence to infer each actor's motion; do not treat the
+        images as unrelated views. The ego vehicle is the camera car.
 
         Produce a STRUCTURED understanding of how the accident unfolds, in terms of
         the visible road participants and a coarse timeline. Do NOT output CARLA or
@@ -57,7 +59,16 @@ class VideoAccidentInterpreter(TaskAgent):
               "visual_description": "short visual cue (colour, position)",
               "start_position_relative_to_ego": "e.g. ahead same lane ~12 m / left lane",
               "role": "lead_vehicle|cut_in_vehicle|crossing|oncoming|...",
-              "mapping_hint": "which spawned actor it most likely is (by geometry)"
+              "mapping_hint": "short visual/geometric reason for the match",
+              "matched_actor_id": "real id from the supplied actor table, or null",
+              "match_confidence": 0.0
+            }
+          ],
+          "actor_motion_states": [
+            {
+              "actor_id": "every non-ego vehicle id from the actor table",
+              "motion_state": "moving|stationary|uncertain",
+              "evidence": "short cross-frame visual reason"
             }
           ],
           "event_sequence": [
@@ -85,6 +96,19 @@ class VideoAccidentInterpreter(TaskAgent):
           approximated by the downstream reconstruction.
         - participants[].ref ids must be referenced consistently in event_sequence
           and end_state.
+        - A compact table of the real CARLA actors is supplied below. Match every
+          visible participant to an actor id using type, lane relation, heading,
+          and ego-relative geometry. Never invent an actor id. Use null when no
+          table row is defensible, and explain the ambiguity in uncertainty.
+        - match_confidence must be between 0 and 1.
+        - Inspect EVERY non-ego vehicle from the actor table across the ordered
+          frames and include it exactly once in actor_motion_states, even when it
+          is not an accident participant. This is a simple moving/stationary
+          classification, not a detailed trajectory. A vehicle whose image
+          position remains consistent with the static scene is stationary.
+          Use the actor-table motion_state as supporting prior evidence. Choose
+          uncertain only when occlusion or inconsistent matching truly prevents
+          a decision; explain why in evidence.
         """
 
     def refine_request(self, user_request, add_info=None):
@@ -94,6 +118,13 @@ class VideoAccidentInterpreter(TaskAgent):
         if user_request:
             prompt += f"\nUser request:\n{user_request}"
         prompt += f"\n\nsource_scene_id:\n{scene_id}\n"
+        actor_context = add_info.get("actor_context") or {}
+        prompt += (
+            "\nCompact CARLA actor table at the START frame. Coordinates x/y/yaw "
+            "are CARLA world values; relative_to_ego is the preferred evidence "
+            "for matching visible participants:\n"
+            f"{json.dumps(actor_context, indent=2, sort_keys=True)}\n"
+        )
 
         messages: List[Dict[str, Any]] = [{"type": "text", "text": prompt}]
         for label, image_path in self._ordered_frames(add_info):
@@ -117,6 +148,32 @@ class VideoAccidentInterpreter(TaskAgent):
 
     @staticmethod
     def _ordered_frames(add_info: Dict[str, Any]) -> List[Tuple[str, Optional[str]]]:
+        sequence = add_info.get("frame_sequence") or []
+        if sequence:
+            ordered: List[Tuple[str, Optional[str]]] = []
+            count = len(sequence)
+            for index, frame in enumerate(sequence):
+                role = (
+                    "START"
+                    if index == 0
+                    else "END"
+                    if index == count - 1
+                    else "CONTEXT"
+                )
+                details = [f"FRAME {index + 1}/{count}", role]
+                if frame.get("timestamp_s") is not None:
+                    details.append(f"source_t={float(frame['timestamp_s']):.3f}s")
+                if frame.get("relative_timestamp_s") is not None:
+                    details.append(f"t_rel={float(frame['relative_timestamp_s']):.3f}s")
+                if frame.get("window_progress") is not None:
+                    details.append(f"progress={float(frame['window_progress']):.4f}")
+                if frame.get("phase"):
+                    details.append(f"phase={frame['phase']}")
+                if frame.get("frame_index") is not None:
+                    details.append(f"source_frame={frame['frame_index']}")
+                ordered.append((" | ".join(details), frame.get("path")))
+            return ordered
+
         frames: List[Tuple[str, Optional[str]]] = [
             ("START (before accident)", add_info.get("start_frame_path"))
         ]
@@ -139,6 +196,11 @@ class VideoAccidentInterpreter(TaskAgent):
                 },
             )
             payload, error = self.extract_decision_data(output_fn)
+            if error is None:
+                error = self._validate_actor_matches(
+                    payload,
+                    added_info.get("actor_context") or {},
+                )
             attempts += 1
             if error is None:
                 write_to_file(output_fn, json.dumps(payload, indent=2, sort_keys=True))
@@ -149,6 +211,84 @@ class VideoAccidentInterpreter(TaskAgent):
                     f"{self.MAX_REGENERATE_ATTEMPTS} attempts: {error}"
                 )
             print(f"Regenerating video understanding... Attempt {attempts + 1}")
+
+    @staticmethod
+    def _validate_actor_matches(
+        payload: Dict[str, Any], actor_context: Dict[str, Any]
+    ) -> Optional[str]:
+        actor_ids = {
+            str(row.get("id"))
+            for row in actor_context.get("actors", [])
+            if isinstance(row, dict) and row.get("id") is not None
+        }
+        for index, participant in enumerate(payload.get("participants") or []):
+            matched_id = participant.get("matched_actor_id")
+            if matched_id is not None and str(matched_id) not in actor_ids:
+                return (
+                    f"`participants[{index}].matched_actor_id` references unknown "
+                    f"actor id `{matched_id}`; allowed ids: {sorted(actor_ids)}."
+                )
+        motion_rows = payload.get("actor_motion_states")
+        if not isinstance(motion_rows, list):
+            return "`actor_motion_states` must be a list covering every non-ego vehicle."
+        required_vehicle_ids = {
+            str(row.get("id"))
+            for row in actor_context.get("actors", [])
+            if isinstance(row, dict)
+            and row.get("id") is not None
+            and str(row.get("id")) != "ego"
+            and VideoAccidentInterpreter._is_vehicle_actor_row(row)
+        }
+        seen_motion_ids = set()
+        for index, motion_row in enumerate(motion_rows):
+            if not isinstance(motion_row, dict):
+                return f"`actor_motion_states[{index}]` must be an object."
+            actor_id = str(motion_row.get("actor_id") or "")
+            if actor_id not in required_vehicle_ids:
+                return (
+                    f"`actor_motion_states[{index}].actor_id` references unknown "
+                    f"non-ego vehicle `{actor_id}`; allowed ids: "
+                    f"{sorted(required_vehicle_ids)}."
+                )
+            if actor_id in seen_motion_ids:
+                return f"Duplicate actor_motion_states entry for `{actor_id}`."
+            seen_motion_ids.add(actor_id)
+            if motion_row.get("motion_state") not in {
+                "moving",
+                "stationary",
+                "uncertain",
+            }:
+                return (
+                    f"`actor_motion_states[{index}].motion_state` must be "
+                    "moving, stationary, or uncertain."
+                )
+        missing_motion_ids = sorted(required_vehicle_ids - seen_motion_ids)
+        if missing_motion_ids:
+            return (
+                "Missing actor_motion_states entries for non-ego vehicles: "
+                + ", ".join(missing_motion_ids)
+            )
+        return None
+
+    @staticmethod
+    def _is_vehicle_actor_row(row: Dict[str, Any]) -> bool:
+        spawn_kind = str(row.get("spawn_kind") or "").lower()
+        category = str(row.get("category") or "").lower()
+        if spawn_kind:
+            return spawn_kind == "vehicle"
+        if category:
+            return category in {
+                "car",
+                "truck",
+                "bus",
+                "van",
+                "motorcycle",
+                "bicycle",
+                "vehicle",
+            }
+        # Compact legacy actor tables contained ids/geometry only and represented
+        # vehicles; preserve that interpretation.
+        return True
 
     def extract_decision_data(
         self, file_path: str
@@ -167,6 +307,18 @@ class VideoAccidentInterpreter(TaskAgent):
         participants = payload.get("participants")
         if not isinstance(participants, list) or not participants:
             return None, "`participants` must be a non-empty list."
+        for index, participant in enumerate(participants):
+            if not isinstance(participant, dict):
+                return None, f"`participants[{index}]` must be an object."
+            confidence = participant.get("match_confidence")
+            if confidence is not None and (
+                not isinstance(confidence, (int, float))
+                or isinstance(confidence, bool)
+                or not 0.0 <= float(confidence) <= 1.0
+            ):
+                return None, (
+                    f"`participants[{index}].match_confidence` must be between 0 and 1."
+                )
         events = payload.get("event_sequence")
         if not isinstance(events, list) or not events:
             return None, "`event_sequence` must be a non-empty list."

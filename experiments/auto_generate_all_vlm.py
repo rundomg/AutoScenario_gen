@@ -1542,7 +1542,6 @@ class AutoGenerator:
         env["AUTOSCENARIO_EGO_VIEW_OUTPUT"] = ego_view_path
         env["AUTOSCENARIO_BEV_OUTPUT"] = bev_path
         env["AUTOSCENARIO_RENDER_ACTOR_GRAPH_OUTPUT"] = render_actor_graph_path
-        env["AUTOSCENARIO_WEATHER_OVERRIDE"] = "ClearNoon"
         env.setdefault("AUTOSCENARIO_EGO_VIEW_SIZE", "1024")
         env.setdefault("AUTOSCENARIO_EGO_VIEW_FOV", "90")
         env.setdefault("AUTOSCENARIO_BEV_SIZE", "1024")
@@ -2259,6 +2258,7 @@ class AutoGenerator:
         }
         patches = []
         rejected = list(vlm_report.get("patch_rejections") or [])
+        normalizations = []
         requested_semantic = list(vlm_report.get("semantic_unrepairable") or [])
         actor_semantic_issues = [
             issue
@@ -2296,6 +2296,18 @@ class AutoGenerator:
                     {"requested_patch": patch, "reason": "unknown_entity_id"}
                 )
                 return
+            requested_patch = deepcopy(patch)
+            patch, normalization_reason = AutoGenerator._normalize_repair_heading_for_topology(
+                entities_by_id[entity_id], patch
+            )
+            if normalization_reason:
+                normalizations.append(
+                    {
+                        "requested_patch": requested_patch,
+                        "normalized_patch": deepcopy(patch),
+                        "reason": normalization_reason,
+                    }
+                )
             target_anchor_id = str(patch.get("target_anchor_id") or "")
             if target_anchor_id and target_anchor_id not in available_anchor_ids:
                 rejected.append(
@@ -2483,8 +2495,43 @@ class AutoGenerator:
             "schema_version": "actor-repair-v2",
             "patches": patches,
             "rejected": rejected,
+            "normalizations": normalizations,
             "semantic_unrepairable": deduped_semantic,
         }
+
+    @staticmethod
+    def _normalize_repair_heading_for_topology(
+        entity: dict,
+        patch: dict,
+    ) -> tuple:
+        """Keep visual repair patches compatible with the matched road topology.
+
+        Open-road actor construction deliberately degrades unanchored crossing
+        vehicles to lane flow.  A later visual repair must not resurrect the
+        crossing yaw, otherwise the vehicle is rotated 90 degrees while still
+        being positioned on an ordinary driving lane.
+        """
+        normalized = deepcopy(patch)
+        if str(entity.get("layout_scene_kind") or "").strip().lower() != "open_road":
+            return normalized, None
+        if str(entity.get("spawn_kind") or "vehicle").strip().lower() != "vehicle":
+            return normalized, None
+        if str(normalized.get("target_anchor_id") or entity.get("layout_anchor_id") or ""):
+            return normalized, None
+
+        op = str(normalized.get("op") or "")
+        heading_field = (
+            "target_heading_relation"
+            if op == "set_pose_target"
+            else "target_heading"
+            if op == "set_heading_relation"
+            else None
+        )
+        if not heading_field or str(normalized.get(heading_field) or "") != "crossing":
+            return normalized, None
+
+        normalized[heading_field] = "same_direction"
+        return normalized, "open_road_crossing_heading_aligned_to_lane_flow"
 
     def _apply_actor_repair_patches(
         self,
@@ -2723,16 +2770,26 @@ class AutoGenerator:
             return None
 
         for patch in compiled.get("patches") or []:
+            requested_patch = deepcopy(patch)
             entity_id = str(patch.get("entity_id") or "")
             entity = entities_by_id.get(entity_id)
+            normalization_reason = None
+            if entity is not None:
+                patch, normalization_reason = self._normalize_repair_heading_for_topology(
+                    entity, patch
+                )
             before = snapshot(entity) if entity is not None else None
             outcome = {
-                "requested_patch": deepcopy(patch),
+                "requested_patch": requested_patch,
                 "normalized_patch": deepcopy(patch),
                 "status": "blocked" if entity is None else "no_op",
                 "before": before,
                 "after": before,
-                "reason": "unknown_entity_id" if entity is None else None,
+                "reason": (
+                    "unknown_entity_id"
+                    if entity is None
+                    else normalization_reason
+                ),
             }
             if entity is None:
                 outcomes.append(outcome)

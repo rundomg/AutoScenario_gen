@@ -16,6 +16,7 @@ from tools.video_reconstruction_runner import (
     VideoReconstructionRunner,
     evaluate_end_anchor,
 )
+from agents.video_accident_interpreter import VideoAccidentInterpreter
 
 
 SPAWN_PAYLOAD = {
@@ -57,7 +58,11 @@ TRAJ_DSL_TEXT = json.dumps(
 
 
 class FakeInterpreter:
+    def __init__(self):
+        self.added_info = None
+
     def call_agent(self, user_request, added_info):
+        self.added_info = added_info
         Path(added_info["output_fn"]).write_text(json.dumps(UNDERSTANDING))
         return UNDERSTANDING
 
@@ -65,9 +70,11 @@ class FakeInterpreter:
 class FakeGenerator:
     def __init__(self):
         self.calls = 0
+        self.kwargs = None
 
     def generate(self, **kwargs):
         self.calls += 1
+        self.kwargs = kwargs
         return TRAJ_DSL_TEXT
 
 
@@ -141,6 +148,16 @@ class VideoReconstructionRunnerTest(unittest.TestCase):
         self.assertTrue(Path(artifact["script_path"]).exists())
         self.assertEqual(artifact["end_anchor_check"]["status"], "pending")
 
+    def test_user_request_reaches_trajectory_generator(self):
+        generator = FakeGenerator()
+        runner = self._runner(generator=generator)
+        request = "Both cars start stopped; lead brakes exactly 1 s after launch."
+
+        summary = runner.run(user_request=request)
+
+        self.assertEqual(generator.kwargs["user_request"], request)
+        self.assertEqual(summary["user_request"], request)
+
     def test_repair_loop_on_invalid_then_valid(self):
         class FlakyGenerator:
             def __init__(self):
@@ -158,6 +175,63 @@ class VideoReconstructionRunnerTest(unittest.TestCase):
         self.assertTrue(summary["artifact"]["dsl_valid"])
         self.assertEqual(summary["artifact"]["attempts"], 2)
         self.assertEqual(gen.calls, 2)
+
+    def test_adaptive_manifest_reuses_all_frames_without_extractor(self):
+        frame_dir = self.folder / "sampled" / "frames"
+        frame_dir.mkdir(parents=True)
+        rows = []
+        for index, timestamp in enumerate((16.9, 17.333, 19.233)):
+            path = frame_dir / f"frame_{index}.jpg"
+            path.write_text(str(index))
+            rows.append(
+                {
+                    "sample_index": index,
+                    "frame_index": 507 + index,
+                    "timestamp_s": timestamp,
+                    "window_progress": index / 2,
+                    "phase": "early" if index == 0 else "critical",
+                    "path": str(path),
+                }
+            )
+        manifest_path = self.folder / "sampled" / "frames_manifest.json"
+        manifest_path.write_text(
+            json.dumps(
+                {
+                    "video_path": str(self.video),
+                    "time_of_alert_s": 16.9,
+                    "time_of_event_s": 19.233,
+                    "frames": rows,
+                }
+            )
+        )
+        interpreter = FakeInterpreter()
+
+        def must_not_extract(*args, **kwargs):
+            raise AssertionError("video extraction must not run")
+
+        runner = self._runner(
+            video_path=None,
+            start_s=None,
+            end_s=None,
+            frames_manifest_path=str(manifest_path),
+            interpreter=interpreter,
+            frame_extractor=must_not_extract,
+        )
+        summary = runner.run()
+
+        self.assertEqual(summary["frame_source"], "adaptive_manifest")
+        self.assertEqual(summary["frame_count"], 3)
+        self.assertEqual(summary["start_s"], 16.9)
+        self.assertEqual(summary["end_s"], 19.233)
+        sequence = interpreter.added_info["frame_sequence"]
+        self.assertEqual(len(sequence), 3)
+        self.assertEqual(
+            [row["id"] for row in interpreter.added_info["actor_context"]["actors"]],
+            ["ego", "veh_1"],
+        )
+        self.assertTrue(sequence[0]["is_start"])
+        self.assertTrue(sequence[-1]["is_end_anchor"])
+        self.assertEqual(sequence[-1]["relative_timestamp_s"], 2.333)
 
 
 class EvaluateEndAnchorTest(unittest.TestCase):
@@ -178,6 +252,97 @@ class EvaluateEndAnchorTest(unittest.TestCase):
         result = evaluate_end_anchor({"collision": False}, {"collisions": [{"frame": 3}]})
         self.assertEqual(result["status"], "mismatch")
         self.assertIn("no contact", result["repair_hint"])
+
+
+class VideoAccidentInterpreterFrameSequenceTest(unittest.TestCase):
+    def test_labels_include_timing_and_sampling_metadata(self):
+        frames = [
+            {
+                "path": "/tmp/start.jpg",
+                "timestamp_s": 16.9,
+                "relative_timestamp_s": 0.0,
+                "window_progress": 0.0,
+                "phase": "early",
+                "frame_index": 507,
+            },
+            {
+                "path": "/tmp/end.jpg",
+                "timestamp_s": 19.233,
+                "relative_timestamp_s": 2.333,
+                "window_progress": 1.0,
+                "phase": "critical",
+                "frame_index": 577,
+            },
+        ]
+        ordered = VideoAccidentInterpreter._ordered_frames(
+            {"frame_sequence": frames}
+        )
+
+        self.assertEqual(len(ordered), 2)
+        self.assertIn("FRAME 1/2 | START", ordered[0][0])
+        self.assertIn("source_t=16.900s", ordered[0][0])
+        self.assertIn("t_rel=2.333s", ordered[1][0])
+        self.assertIn("phase=critical", ordered[1][0])
+        self.assertIn("source_frame=577", ordered[1][0])
+
+    def test_prompt_contains_compact_actor_table(self):
+        interpreter = VideoAccidentInterpreter()
+        content = interpreter.refine_request(
+            "",
+            {
+                "scene_id": "s0000_c0",
+                "actor_context": {
+                    "actors": [
+                        {
+                            "id": "veh_1",
+                            "relative_to_ego": {
+                                "longitudinal_m": 12.0,
+                                "lateral_m": 0.2,
+                            },
+                        }
+                    ]
+                },
+                "frame_sequence": [],
+            },
+        )
+
+        prompt = content[0]["text"]
+        self.assertIn("Compact CARLA actor table", prompt)
+        self.assertIn('"id": "veh_1"', prompt)
+        self.assertIn('"longitudinal_m": 12.0', prompt)
+
+    def test_unknown_matched_actor_id_is_rejected(self):
+        error = VideoAccidentInterpreter._validate_actor_matches(
+            {"participants": [{"matched_actor_id": "invented_car"}]},
+            {"actors": [{"id": "ego"}, {"id": "veh_1"}]},
+        )
+
+        self.assertIn("unknown actor id", error)
+        self.assertIn("veh_1", error)
+
+    def test_motion_classification_must_cover_every_non_ego_vehicle(self):
+        error = VideoAccidentInterpreter._validate_actor_matches(
+            {
+                "participants": [{"matched_actor_id": "veh_1"}],
+                "actor_motion_states": [
+                    {
+                        "actor_id": "veh_1",
+                        "motion_state": "stationary",
+                        "evidence": "unchanged across frames",
+                    }
+                ],
+            },
+            {
+                "actors": [
+                    {"id": "ego", "category": "car"},
+                    {"id": "veh_1", "category": "car"},
+                    {"id": "veh_2", "category": "car"},
+                ]
+            },
+        )
+
+        self.assertIn("Missing actor_motion_states", error)
+        self.assertIn("veh_2", error)
 
 
 if __name__ == "__main__":

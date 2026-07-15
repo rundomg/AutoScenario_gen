@@ -507,7 +507,6 @@ class TestGenerationPipelineHelpers(unittest.TestCase):
                         "longitudinal_proximity": "mid",
                         "layout_anchor_id": "right_arm",
                         "anchor_relation": {
-                            "travel_direction": "away_from_junction",
                             "position_along_anchor": "mid_arm",
                         },
                         "actor_group_type": "individual_vehicle",
@@ -528,7 +527,6 @@ class TestGenerationPipelineHelpers(unittest.TestCase):
                         "longitudinal_proximity": "near",
                         "layout_anchor_id": "right_arm",
                         "anchor_relation": {
-                            "travel_direction": "away_from_junction",
                             "position_along_anchor": "near_mouth",
                         },
                         "actor_group_type": "individual_vehicle",
@@ -675,6 +673,105 @@ class TestGenerationPipelineHelpers(unittest.TestCase):
             [{"det_id": "det_2", "reason": "roadside candidate"}],
         )
         self.assertEqual(len(result["key_pairwise_relations"]), 1)
+
+    def test_split_merge_adds_orientation_travel_direction_only_for_junction(self):
+        result = SceneUnderstandingInterpreter._merge_split_scene_payloads(
+            road_payload={
+                "traffic_subjects": [],
+                "key_pairwise_relations": [],
+                "road_network": {
+                    "map_matching": {
+                        "topology_type": "cross_intersection",
+                        "junction_visible": True,
+                    }
+                },
+                "actor_layout": {},
+                "general_environment": {},
+                "metadata": {},
+            },
+            detections=[],
+            row_hints=[],
+            orientation_payload={
+                "vehicle_orientation_hints": [
+                    {
+                        "det_id": "det_1",
+                        "junction_travel_direction": "away_from_junction",
+                    },
+                    {
+                        "det_id": "det_4",
+                        "junction_travel_direction": "toward_junction",
+                    },
+                ]
+            },
+            position_payload={
+                "traffic_subjects": [
+                    {
+                        "id": "det_1",
+                        "layout_anchor_id": "right_arm",
+                        "anchor_relation": {
+                            "lane_from_right": 0,
+                            "position_along_anchor": "near_mouth",
+                            "travel_direction": "toward_junction",
+                        },
+                    },
+                    {
+                        "id": "det_4",
+                        "layout_anchor_id": "ahead_arm",
+                        "anchor_relation": {
+                            "lane_from_right": 0,
+                            "position_along_anchor": "near_mouth",
+                        },
+                    },
+                ]
+            },
+        )
+
+        by_id = {item["id"]: item for item in result["traffic_subjects"]}
+        self.assertEqual(
+            by_id["det_1"]["anchor_relation"]["travel_direction"],
+            "away_from_junction",
+        )
+        self.assertEqual(
+            by_id["det_4"]["anchor_relation"]["travel_direction"],
+            "toward_junction",
+        )
+        self.assertEqual(by_id["det_1"]["anchor_relation"]["lane_from_right"], 0)
+        self.assertEqual(
+            by_id["det_1"]["anchor_relation"]["position_along_anchor"],
+            "near_mouth",
+        )
+
+        open_road_result = SceneUnderstandingInterpreter._merge_split_scene_payloads(
+            road_payload={
+                "traffic_subjects": [],
+                "key_pairwise_relations": [],
+                "road_network": {
+                    "map_matching": {
+                        "topology_type": "straight_road",
+                        "junction_visible": False,
+                    }
+                },
+                "actor_layout": {},
+                "general_environment": {},
+                "metadata": {},
+            },
+            detections=[],
+            row_hints=[],
+            orientation_payload={
+                "vehicle_orientation_hints": [
+                    {
+                        "det_id": "det_1",
+                        "junction_travel_direction": "away_from_junction",
+                    }
+                ]
+            },
+            position_payload={"traffic_subjects": [{"id": "det_1"}]},
+        )
+
+        self.assertNotIn(
+            "anchor_relation",
+            open_road_result["traffic_subjects"][0],
+        )
 
     def test_split_merge_allows_position_to_omit_ignored_candidate_and_drops_relations(self):
         result = SceneUnderstandingInterpreter._merge_split_scene_payloads(
@@ -4957,6 +5054,68 @@ class TestGenerationPipelineHelpers(unittest.TestCase):
         self.assertFalse(context["water_nearby"])
         self.assertEqual(context["environment_class"], "urban_like")
 
+    def test_cache_street_light_helper_labels_nearby_waypoint(self):
+        near = types.SimpleNamespace(x=10.0, y=0.0, z=8.0)
+        far = types.SimpleNamespace(x=100.0, y=0.0, z=8.0)
+
+        class FakeLightManager:
+            def get_all_lights(self, group):
+                self.requested_group = group
+                return [
+                    types.SimpleNamespace(location=near),
+                    types.SimpleNamespace(location=far),
+                ]
+
+        light_manager = FakeLightManager()
+        fake_world = types.SimpleNamespace(get_lightmanager=lambda: light_manager)
+        fake_carla = types.SimpleNamespace(
+            LightGroup=types.SimpleNamespace(Street="Street")
+        )
+
+        points = cache_map_topology._load_street_light_points(fake_world, fake_carla)
+        nearby = cache_map_topology._summarize_environment_context(
+            types.SimpleNamespace(x=0.0, y=0.0, z=0.0),
+            [],
+            60.0,
+            points,
+        )
+        absent = cache_map_topology._summarize_environment_context(
+            types.SimpleNamespace(x=200.0, y=0.0, z=0.0),
+            [],
+            60.0,
+            points,
+        )
+
+        self.assertEqual(light_manager.requested_group, "Street")
+        self.assertTrue(nearby["has_street_lights"])
+        self.assertFalse(absent["has_street_lights"])
+
+    def test_v2_context_prefers_matching_street_light_label(self):
+        signature = {
+            "topology_type": "straight_two_way",
+            "junction_visible": False,
+            "forward_lane_count": 1,
+            "driving_lane_count": 2,
+            "has_street_lights": True,
+        }
+        base_candidate = {
+            "candidate_topology_type": "straight_two_way",
+            "is_junction": False,
+            "junction_waypoint_ratio": 0.0,
+            "heading_cluster_count": 2,
+            "nearby_road_count": 1,
+            "same_direction_lane_count": 1,
+            "same_road_lane_count": 2,
+            "environment_context": {},
+        }
+
+        with_lights = dict(base_candidate, has_street_lights=True)
+        without_lights = dict(base_candidate, has_street_lights=False)
+        matching_score, _ = score_candidate_v2(signature, with_lights)
+        mismatching_score, _ = score_candidate_v2(signature, without_lights)
+
+        self.assertGreater(matching_score, mismatching_score)
+
     def test_cache_crosswalk_helper_accepts_flat_and_nested_locations(self):
         loc_a = types.SimpleNamespace(x=1.0, y=2.0)
         loc_b = types.SimpleNamespace(x=3.0, y=4.0)
@@ -5648,6 +5807,40 @@ class TestGenerationPipelineHelpers(unittest.TestCase):
         )
         self.assertTrue(
             any("overly wide driving-lane mismatch" in reason for reason in details["reject_reasons"])
+        )
+
+    def test_v2_curve_open_road_rejects_too_few_same_direction_lanes(self):
+        _score, details = score_candidate_v2(
+            {
+                "topology_type": "curve",
+                "curve_direction": "right",
+                "junction_visible": False,
+                "forward_lane_count": 2,
+                "opposing_lane_count": 0,
+                "driving_lane_count": 2,
+                "has_center_median": False,
+            },
+            {
+                "candidate_topology_type": "curve",
+                "is_curve": True,
+                "curve_score": 0.8,
+                "curve_direction": "right",
+                "is_junction": False,
+                "junction_waypoint_ratio": 0.0,
+                "heading_cluster_count": 2,
+                "nearby_road_count": 1,
+                "same_direction_lane_count": 1,
+                "same_road_lane_count": 2,
+                "has_center_median_candidate": False,
+            },
+        )
+
+        self.assertTrue(details["hard_reject"])
+        self.assertTrue(
+            any(
+                "too few same-direction lanes" in reason
+                for reason in details["reject_reasons"]
+            )
         )
 
     def test_v2_open_road_center_median_mismatch_is_hard_reject(self):

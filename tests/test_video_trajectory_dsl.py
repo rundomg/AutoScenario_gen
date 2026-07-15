@@ -63,12 +63,27 @@ class ValidateVideoTrajectoryDslTest(unittest.TestCase):
         _, error = validate_video_trajectory_dsl(dsl, SPAWN_PAYLOAD)
         self.assertIn("unknown actor id", error)
 
-    def test_unsupported_lane_change_rejected_with_hint(self):
+    def test_full_vehicle_coverage_reports_missing_background_actor(self):
+        _, error = validate_video_trajectory_dsl(
+            _valid_dsl(),
+            SPAWN_PAYLOAD,
+            require_all_vehicle_actors=True,
+        )
+        self.assertIn("Missing trajectories", error)
+        self.assertIn("veh_2", error)
+
+    def test_duplicate_actor_trajectory_rejected(self):
+        dsl = _valid_dsl()
+        dsl["trajectories"].append(dict(dsl["trajectories"][0]))
+        _, error = validate_video_trajectory_dsl(dsl, SPAWN_PAYLOAD)
+        self.assertIn("Duplicate trajectory", error)
+
+    def test_lane_change_requires_a_direction(self):
         dsl = _valid_dsl()
         dsl["trajectories"][0]["segments"][1]["action"] = "lane_change"
         _, error = validate_video_trajectory_dsl(dsl, SPAWN_PAYLOAD)
         self.assertIn("lane_change", error)
-        self.assertIn("not supported", error)
+        self.assertIn("direction", error)
 
     def test_unknown_action_rejected(self):
         dsl = _valid_dsl()

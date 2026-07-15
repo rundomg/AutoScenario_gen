@@ -179,9 +179,9 @@ secrets.json
 *.hdf5
 
 # Data files (if large)
-KITTI/
-experiments/mono3d_eval/checkpoints/monocon_pretrained/*.pth
-data/
+data/map_cache/
+data/map_cache_old/
+data/nexar_collision_prediction/
 *.csv
 *.json
 *.xml
@@ -189,12 +189,9 @@ data/
 *.avi
 *.mov
 *.jpg
+!data/0107.jpg
 *.jpeg
 *.png
 *.gif
 *.bmp
 *.tiff
-
-# Test and temporary files
-experiments/mono3d_eval/
-experiments/monocular_depth_eval/

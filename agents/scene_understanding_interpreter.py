@@ -150,6 +150,7 @@ Road-network contract:
 - Fill road_network.map_matching with topology_type, junction_visible, junction_type,
   junction_branches, target_branch_count, forward_lane_count, opposing_lane_count,
   driving_lane_count, has_center_median, has_crosswalk, has_traffic_light,
+  has_street_lights,
   curve_direction, ego_lane_from_right, ego_to_junction_distance_m,
   left_parking_presence, and right_parking_presence.
 - Fill road_network.lane_groups with the same travel-lane counts plus
@@ -172,6 +173,8 @@ Road-network contract:
 - When no curbside parking lane is visible, explicitly set
   left_parking_lane_count=0, right_parking_lane_count=0,
   left_parking_presence=false, and right_parking_presence=false.
+- Set has_street_lights=true only when one or more roadside street lamps are
+  visibly present. Do not count vehicle lamps or traffic signals as street lights.
 
 Actor-layout frame contract:
 - Do not output vehicle actors in traffic_subjects.
@@ -209,6 +212,7 @@ Output JSON only:
       "has_center_median": false,
       "has_crosswalk": false,
       "has_traffic_light": false,
+      "has_street_lights": false,
       "curve_direction": "straight | left | right | unknown",
       "ego_lane_from_right": 0,
       "ego_to_junction_distance_m": null,
@@ -1098,6 +1102,30 @@ Output JSON only:
                 row_membership,
                 is_junction=is_junction,
             )
+        if is_junction:
+            # The position pass owns arm membership and arm-local position, while
+            # the orientation pass owns whether an actor travels toward or away
+            # from the junction.  Preserve the position fields but always carry a
+            # concrete orientation result into the relation consumed by junction
+            # lane reprojection.  Without this merge, right/ahead arms fall back
+            # to opposite motion defaults and select the wrong inbound/outbound
+            # lane band.
+            for subject in subjects:
+                subject_id = str(subject.get("id") or "").strip()
+                hint = hints_by_id.get(subject_id) or {}
+                travel_direction = str(
+                    hint.get("junction_travel_direction") or ""
+                ).strip().lower()
+                if travel_direction not in {
+                    "toward_junction",
+                    "away_from_junction",
+                }:
+                    continue
+                anchor_relation = subject.get("anchor_relation")
+                if not isinstance(anchor_relation, dict):
+                    anchor_relation = {}
+                    subject["anchor_relation"] = anchor_relation
+                anchor_relation["travel_direction"] = travel_direction
         merged["traffic_subjects"] = subjects
         subject_ids = {
             str(item.get("id") or "").strip()

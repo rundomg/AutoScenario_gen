@@ -703,6 +703,8 @@ class SceneMapMatcher:
                 ("traffic_sign", "sign", "direction_sign", "road_sign", "标志"),
             )
 
+        has_street_lights = cls._optional_bool(map_matching, "has_street_lights")
+
         has_center_median = cls._optional_bool(map_matching, "has_center_median")
         if has_center_median is None:
             has_center_median = False if has_map_matching else cls._has_positive_area_or_control(
@@ -759,6 +761,7 @@ class SceneMapMatcher:
             "has_crosswalk": bool(has_crosswalk),
             "has_traffic_light": bool(has_traffic_light),
             "has_traffic_sign": bool(has_traffic_sign),
+            "has_street_lights": has_street_lights,
             "has_center_median": bool(has_center_median),
             "curve_direction": curve_direction,
             "side_context": side_context,
@@ -4562,6 +4565,9 @@ class SceneMapMatcher:
         buildings_nearby = bool(candidate_env.get("buildings_nearby"))
         sidewalks_nearby = bool(candidate_env.get("sidewalks_nearby"))
         traffic_control_nearby = bool(candidate_env.get("traffic_control_nearby"))
+        candidate_has_street_lights = candidate.get("has_street_lights")
+        if candidate_has_street_lights is None:
+            candidate_has_street_lights = candidate_env.get("has_street_lights")
         terrain_count = int(counts.get("Terrain") or 0)
         vegetation_count = int(counts.get("Vegetation") or 0)
         building_count = int(counts.get("Buildings") or 0)
@@ -4592,6 +4598,12 @@ class SceneMapMatcher:
                 delta -= 0.04
             if target_env.get("expects_water") and water_nearby:
                 delta += 0.05
+
+        target_has_street_lights = signature.get("has_street_lights")
+        if isinstance(target_has_street_lights, bool) and isinstance(
+            candidate_has_street_lights, bool
+        ):
+            delta += 0.08 if target_has_street_lights == candidate_has_street_lights else -0.08
 
         return max(-0.20, min(0.20, delta))
 
