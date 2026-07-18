@@ -1,0 +1,9 @@
+{
+  "scenes": [
+    {"scene_id": "nexar_00003_t016900", "traffic_ir": "/home/zx/code/TrafficComposer/results/scenicnl_image_txts_reproducible_fused/nexar_00003_t016900.yaml", "reference": "/home/zx/code/AutoScenario_gen/annotations/scenicnl_image_txts/nexar_00003_t016900_acrs_reference.json"},
+    {"scene_id": "nexar_00006_t017133", "traffic_ir": "/home/zx/code/TrafficComposer/results/scenicnl_image_txts_reproducible_fused/nexar_00006_t017133.yaml", "reference": "/home/zx/code/AutoScenario_gen/annotations/scenicnl_image_txts/nexar_00006_t017133_acrs_reference.json"},
+    {"scene_id": "nexar_00160_t017567", "traffic_ir": "/home/zx/code/TrafficComposer/results/scenicnl_image_txts_reproducible_fused/nexar_00160_t017567.yaml", "reference": "/home/zx/code/AutoScenario_gen/annotations/scenicnl_image_txts/nexar_00160_t017567_acrs_reference.json"},
+    {"scene_id": "nexar_00213_t016020", "traffic_ir": "/home/zx/code/TrafficComposer/results/scenicnl_image_txts_reproducible_fused/nexar_00213_t016020.yaml", "reference": "/home/zx/code/AutoScenario_gen/annotations/scenicnl_image_txts/nexar_00213_t016020_acrs_reference.json"},
+    {"scene_id": "nexar_00234_t006633", "traffic_ir": "/home/zx/code/TrafficComposer/results/scenicnl_image_txts_reproducible_fused/nexar_00234_t006633.yaml", "reference": "/home/zx/code/AutoScenario_gen/annotations/scenicnl_image_txts/nexar_00234_t006633_acrs_reference.json"}
+  ]
+}

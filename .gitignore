@@ -184,6 +184,9 @@ data/map_cache_old/
 data/nexar_collision_prediction/
 *.csv
 *.json
+!annotations/trafficcomposer_image_txts/trafficcomposer_acrs_manifest.json
+!annotations/trafficcomposer_image_txts/trafficcomposer_multimodal_acrs_manifest.json
+!annotations/trafficcomposer_image_txts/trafficcomposer_reproducible_fused_acrs_manifest.json
 *.xml
 *.mp4
 *.avi
