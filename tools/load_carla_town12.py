@@ -40,7 +40,7 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--map",
-        default="Town06",
+        default="Town03",
         help="Map name to load. Default: Town12",
     )
     parser.add_argument(

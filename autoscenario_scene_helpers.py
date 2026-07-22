@@ -1636,11 +1636,13 @@ def _autoscenario_capture_ego_view_if_requested(actor_by_id=None):
         return
 
     image_size = str(os.environ.get("AUTOSCENARIO_EGO_VIEW_SIZE", "1024"))
+    image_width = str(os.environ.get("AUTOSCENARIO_EGO_VIEW_WIDTH", image_size))
+    image_height = str(os.environ.get("AUTOSCENARIO_EGO_VIEW_HEIGHT", image_size))
     fov = str(os.environ.get("AUTOSCENARIO_EGO_VIEW_FOV", "90"))
     try:
         bp = blueprint_library.find("sensor.camera.rgb")
-        bp.set_attribute("image_size_x", image_size)
-        bp.set_attribute("image_size_y", image_size)
+        bp.set_attribute("image_size_x", image_width)
+        bp.set_attribute("image_size_y", image_height)
         bp.set_attribute("fov", fov)
         bp.set_attribute("sensor_tick", "0.05")
         if (

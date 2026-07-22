@@ -35,6 +35,17 @@ from tools.video_trajectory_dsl import (
     lower_to_risk_dsl,
     validate_video_trajectory_dsl,
 )
+from tools.collision_fitting import (
+    CollisionAnchoredFittingPipeline,
+    build_accident_specification,
+    build_scene_state,
+)
+from tools.collision_fitting.integration import (
+    apply_start_offsets_to_spawn_payload,
+    build_fitted_trajectory_dsl,
+    build_scenario_configuration,
+)
+from tools.collision_fitting.solver import BehaviorParameterSolver
 
 
 class VideoReconstructionRunner:
@@ -52,6 +63,9 @@ class VideoReconstructionRunner:
         ego_speed_mps: float = 10.0,
         context_sample_rate_s: Optional[float] = None,
         max_retries: int = 2,
+        enable_collision_fitting: bool = False,
+        fitting_max_rollouts: int = 48,
+        fitting_top_k: int = 3,
         carla_host: str = "localhost",
         carla_port: int = 2000,
         enable_compile: bool = True,
@@ -71,6 +85,9 @@ class VideoReconstructionRunner:
         self.ego_speed_mps = float(ego_speed_mps)
         self.context_sample_rate_s = context_sample_rate_s
         self.max_retries = max(0, int(max_retries))
+        self.enable_collision_fitting = bool(enable_collision_fitting)
+        self.fitting_max_rollouts = max(1, int(fitting_max_rollouts))
+        self.fitting_top_k = max(1, int(fitting_top_k))
         self.carla_host = carla_host
         self.carla_port = int(carla_port)
         self.enable_compile = enable_compile
@@ -127,6 +144,9 @@ class VideoReconstructionRunner:
             "dsl_valid": traj_dsl is not None,
             "schema_error": schema_error,
             "trajectory_dsl_path": None,
+            "fitting_config_path": None,
+            "fitted_spawn_payload_path": None,
+            "fitting_converged": None,
             "risk_dsl_path": None,
             "script_path": None,
             "metrics_path": None,
@@ -135,7 +155,67 @@ class VideoReconstructionRunner:
             "end_anchor_check": None,
         }
 
+        effective_spawn_payload_path = self._spawn_payload_path()
         if traj_dsl is not None:
+            if self.enable_collision_fitting:
+                duration_s = float(traj_dsl.get("duration_s", 6.0))
+                scene_state = build_scene_state(
+                    spawn_payload,
+                    duration_s=duration_s,
+                    fixed_delta_seconds=0.05,
+                    map_name=map_name,
+                )
+                accident_spec = build_accident_specification(
+                    understanding,
+                    scene_state.actors.keys(),
+                    duration_s=duration_s,
+                    top_k=self.fitting_top_k,
+                )
+                fitting_pipeline = CollisionAnchoredFittingPipeline(
+                    solver=BehaviorParameterSolver(
+                        max_rollouts=self.fitting_max_rollouts
+                    ),
+                    top_k=self.fitting_top_k,
+                )
+                fitting_result = fitting_pipeline.fit(scene_state, accident_spec)
+                fitted_dsl = build_fitted_trajectory_dsl(
+                    fitting_result,
+                    scene_id=self.scene_id,
+                    duration_s=duration_s,
+                    base_dsl=traj_dsl,
+                )
+                traj_dsl, fitting_error = validate_video_trajectory_dsl(
+                    fitted_dsl,
+                    spawn_payload,
+                    require_all_vehicle_actors=True,
+                )
+                if fitting_error is not None or traj_dsl is None:
+                    raise RuntimeError(
+                        "Collision-fitted trajectory failed validation: "
+                        f"{fitting_error}"
+                    )
+                fitting_config = build_scenario_configuration(
+                    fitting_result,
+                    scene_id=self.scene_id,
+                    map_name=map_name,
+                )
+                fitting_config_path = self._fitting_config_path()
+                write_to_file(
+                    fitting_config_path,
+                    json.dumps(fitting_config, indent=2, sort_keys=True),
+                )
+                fitted_spawn_payload = apply_start_offsets_to_spawn_payload(
+                    spawn_payload, fitting_result
+                )
+                effective_spawn_payload_path = self._fitted_spawn_payload_path()
+                write_to_file(
+                    effective_spawn_payload_path,
+                    json.dumps(fitted_spawn_payload, indent=2, sort_keys=True),
+                )
+                artifact["fitting_config_path"] = fitting_config_path
+                artifact["fitted_spawn_payload_path"] = effective_spawn_payload_path
+                artifact["fitting_converged"] = fitting_result.solver_result.converged
+
             traj_path = self._trajectory_dsl_path()
             write_to_file(traj_path, json.dumps(traj_dsl, indent=2, sort_keys=True))
             artifact["trajectory_dsl_path"] = traj_path
@@ -147,7 +227,7 @@ class VideoReconstructionRunner:
 
             metrics_path = self._metrics_path()
             script = self.codegen.build_dsl_risk_scene_script(
-                spawn_payload_filename=os.path.abspath(self._spawn_payload_path()),
+                spawn_payload_filename=os.path.abspath(effective_spawn_payload_path),
                 dsl_filename=os.path.abspath(risk_dsl_path),
                 risk_metrics_filename=os.path.abspath(metrics_path),
                 carla_host=self.carla_host,
@@ -187,6 +267,7 @@ class VideoReconstructionRunner:
             "ego_speed_mps": self.ego_speed_mps,
             "map_name": map_name,
             "compile_enabled": self.enable_compile,
+            "collision_anchored_fitting": self.enable_collision_fitting,
             "frames_manifest_path": effective_manifest_path,
             "frame_source": (
                 "adaptive_manifest" if self.frames_manifest_path else "video_extraction"
@@ -361,6 +442,18 @@ class VideoReconstructionRunner:
 
     def _risk_dsl_path(self) -> str:
         return join(self.risk_output_folder, f"{self.scene_id}_video_risk_dsl.json")
+
+    def _fitting_config_path(self) -> str:
+        return join(
+            self.risk_output_folder,
+            f"{self.scene_id}_collision_fitted_config.json",
+        )
+
+    def _fitted_spawn_payload_path(self) -> str:
+        return join(
+            self.risk_output_folder,
+            f"{self.scene_id}_collision_fitted_actors.json",
+        )
 
     def _script_path(self) -> str:
         return join(self.risk_output_folder, f"{self.scene_id}_dynamic_reconstruction.py")

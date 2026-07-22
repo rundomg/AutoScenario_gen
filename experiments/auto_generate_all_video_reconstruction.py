@@ -87,6 +87,26 @@ def parse_args():
     )
     parser.add_argument("--ego-speed-mps", type=float, default=10.0, help="Fixed ego speed (m/s).")
     parser.add_argument("--max-retries", type=int, default=2, help="Max trajectory-DSL schema-repair retries.")
+    parser.add_argument(
+        "--collision-anchored-fitting",
+        action="store_true",
+        help=(
+            "Replace VLM continuous timing/speed guesses with collision-anchored "
+            "analytical initialization and coarse-to-fine behavior fitting."
+        ),
+    )
+    parser.add_argument(
+        "--fitting-max-rollouts",
+        type=int,
+        default=48,
+        help="Maximum surrogate/CARLA candidate rollouts for behavior fitting.",
+    )
+    parser.add_argument(
+        "--fitting-top-k",
+        type=int,
+        default=3,
+        help="Maximum uncertain accident-pair hypotheses to evaluate.",
+    )
     parser.add_argument("--no-compile", action="store_true", help="Skip py_compile of the generated script.")
     parser.add_argument("--carla-host", default="localhost", help="CARLA RPC host for the generated script.")
     parser.add_argument("--carla-port", type=int, default=2000, help="CARLA RPC port for the generated script.")
@@ -119,6 +139,9 @@ def main() -> int:
         ego_speed_mps=args.ego_speed_mps,
         context_sample_rate_s=args.context_sample_rate,
         max_retries=args.max_retries,
+        enable_collision_fitting=args.collision_anchored_fitting,
+        fitting_max_rollouts=args.fitting_max_rollouts,
+        fitting_top_k=args.fitting_top_k,
         carla_host=args.carla_host,
         carla_port=args.carla_port,
         enable_compile=not args.no_compile,

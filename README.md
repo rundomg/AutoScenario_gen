@@ -88,6 +88,17 @@ python experiments/auto_generate_all_vlm.py
 python experiments/auto_generate_all_video.py
 ```
 
+#### **Collision-Anchored Accident Reconstruction**
+```sh
+python experiments/auto_generate_all_video_reconstruction.py \
+  --frames-manifest <frames_manifest.json> \
+  --output-folder <static-output> --scene-id s0000_c0 \
+  --collision-anchored-fitting
+```
+This optional branch fits continuous speeds/timings from a vehicle-size-aware
+collision anchor instead of accepting exact values from the VLM. See
+`docs/collision_anchored_pipeline.md` for offline and CARLA-guided modes.
+
 
 ### Run Scenario Evaluations
 ```sh

@@ -296,6 +296,7 @@ def lower_to_risk_dsl(
         "duration_s": _to_float(trajectory_dsl.get("duration_s"), DEFAULT_DURATION_S),
         "metrics": list(trajectory_dsl.get("metrics") or DEFAULT_METRICS),
         "metadata": {
+            **dict(trajectory_dsl.get("metadata") or {}),
             "lowered_from": trajectory_dsl.get(
                 "schema_version", VIDEO_TRAJECTORY_SCHEMA_VERSION
             ),

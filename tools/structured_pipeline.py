@@ -1438,7 +1438,9 @@ def _expand_key_pairwise_relations(
                     {
                         "entity_id": entity["entity_id"],
                         "other_entity_id": other["entity_id"],
-                        "relation_source": "vlm",
+                        "relation_source": str(
+                            relation.get("relation_source") or "vlm"
+                        ),
                         "constraint_strength": _canonical_constraint_strength(
                             relation.get("constraint_strength") or "hard"
                         ),
@@ -1898,6 +1900,9 @@ def _lane_anchor_offset(entity, lane_width, lane_context=None):
 
 
 def _longitudinal_distance(entity):
+    user_target = entity.get("user_target_longitudinal_m")
+    if isinstance(user_target, (int, float)):
+        return float(user_target)
     order_relation = str(entity.get("order_relation") or "ahead")
     distance_band = str(entity.get("distance_band") or "near")
     base = float(DISTANCE_BAND_METERS.get(distance_band, 10.0))
@@ -1976,6 +1981,8 @@ def main():
                 "longitudinal_relation": entity.get("order_relation"),
                 "longitudinal_proximity": entity.get("distance_band"),
                 "longitudinal_m": longitudinal,
+                "user_target_longitudinal_m": entity.get("user_target_longitudinal_m"),
+                "user_constraint_ids": entity.get("user_constraint_ids"),
                 "road_id": entity.get("road_id"),
                 "layout_anchor_id": entity.get("layout_anchor_id"),
                 "anchor_relation": entity.get("anchor_relation"),
@@ -2074,6 +2081,9 @@ def _initial_lane_anchor_offset(
 
 
 def _initial_longitudinal_distance(entity: Dict[str, Any]) -> float:
+    user_target = entity.get("user_target_longitudinal_m")
+    if isinstance(user_target, (int, float)):
+        return float(user_target)
     order_relation = str(entity.get("order_relation") or "ahead")
     distance_band = str(entity.get("distance_band") or "near")
     base = float(DISTANCE_BAND_METERS.get(distance_band, 10.0))
@@ -2162,6 +2172,8 @@ def generate_initial_coordinates_from_relation_dsl(
                 "longitudinal_relation": entity.get("order_relation"),
                 "longitudinal_proximity": entity.get("distance_band"),
                 "longitudinal_m": longitudinal,
+                "user_target_longitudinal_m": entity.get("user_target_longitudinal_m"),
+                "user_constraint_ids": _deep_copy(entity.get("user_constraint_ids")),
                 "road_id": entity.get("road_id"),
                 "layout_anchor_id": entity.get("layout_anchor_id"),
                 "anchor_relation": _deep_copy(_coerce_dict(entity.get("anchor_relation"))),
@@ -2279,6 +2291,8 @@ def _shift_entity_longitudinal(
     anchor_lane: Dict[str, Any],
     delta_m: float,
 ) -> None:
+    if isinstance(entity.get("user_target_longitudinal_m"), (int, float)):
+        return
     start = _coerce_dict(anchor_lane.get("start"))
     end = _coerce_dict(anchor_lane.get("end"))
     forward_x, forward_y = _normalize_vector(
@@ -2292,6 +2306,24 @@ def _shift_entity_longitudinal(
             entity["longitudinal_m"] = float(entity.get("longitudinal_m")) + float(delta_m)
         except (TypeError, ValueError):
             pass
+
+
+def _choose_longitudinal_mover(
+    entity: Dict[str, Any],
+    other: Dict[str, Any],
+    preferred: Optional[Dict[str, Any]] = None,
+) -> Optional[Dict[str, Any]]:
+    entity_locked = isinstance(entity.get("user_target_longitudinal_m"), (int, float))
+    other_locked = isinstance(other.get("user_target_longitudinal_m"), (int, float))
+    if entity_locked and other_locked:
+        return None
+    if entity_locked:
+        return other
+    if other_locked:
+        return entity
+    if preferred is not None:
+        return preferred
+    return entity if _solve_priority(entity) > _solve_priority(other) else other
 
 
 def apply_pairwise_ordering(
@@ -2321,7 +2353,9 @@ def apply_pairwise_ordering(
             current_gap = longitudinal_a - longitudinal_b
             if current_gap >= target_gap:
                 continue
-            mover = entity if _solve_priority(entity) > _solve_priority(other) else other
+            mover = _choose_longitudinal_mover(entity, other)
+            if mover is None:
+                continue
             delta = target_gap - current_gap + 0.1
             if mover is entity:
                 _shift_entity_longitudinal(entity, anchor_lane, delta)
@@ -2331,7 +2365,9 @@ def apply_pairwise_ordering(
             current_gap = longitudinal_b - longitudinal_a
             if current_gap >= target_gap:
                 continue
-            mover = entity if _solve_priority(entity) > _solve_priority(other) else other
+            mover = _choose_longitudinal_mover(entity, other)
+            if mover is None:
+                continue
             delta = target_gap - current_gap + 0.1
             if mover is entity:
                 _shift_entity_longitudinal(entity, anchor_lane, -delta)
@@ -2339,7 +2375,15 @@ def apply_pairwise_ordering(
                 _shift_entity_longitudinal(other, anchor_lane, delta)
         else:
             midpoint = (longitudinal_a + longitudinal_b) / 2.0
-            if _solve_priority(entity) >= _solve_priority(other):
+            preferred = (
+                entity
+                if _solve_priority(entity) >= _solve_priority(other)
+                else other
+            )
+            mover = _choose_longitudinal_mover(entity, other, preferred)
+            if mover is None:
+                continue
+            if mover is entity:
                 _shift_entity_longitudinal(entity, anchor_lane, midpoint - longitudinal_a)
             else:
                 _shift_entity_longitudinal(other, anchor_lane, midpoint - longitudinal_b)
@@ -2548,6 +2592,13 @@ def _resolve_collisions(entities: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
                 mover = other
             else:
                 mover = entity
+            if isinstance(mover.get("user_target_longitudinal_m"), (int, float)):
+                alternative = other if mover is entity else entity
+                if isinstance(
+                    alternative.get("user_target_longitudinal_m"), (int, float)
+                ):
+                    continue
+                mover = alternative
             shift = threshold - distance + 0.1
             yaw = math.radians(float(mover["rotation"]["yaw"]))
             forward_x = math.cos(yaw)
@@ -3255,19 +3306,27 @@ def _refine_pairwise_relation(
     if expected_longitudinal == "ahead_of_other":
         current_gap = longitudinal_a - longitudinal_b
         if current_gap < target_gap:
-            mover = entity if _solve_priority(entity) > _solve_priority(other) else other
+            mover = _choose_longitudinal_mover(entity, other)
+            if mover is None:
+                return
             delta = target_gap - current_gap + 0.1
             _shift_entity_longitudinal(mover, anchor_lane, delta if mover is entity else -delta)
     elif expected_longitudinal == "behind_other":
         current_gap = longitudinal_b - longitudinal_a
         if current_gap < target_gap:
-            mover = entity if _solve_priority(entity) > _solve_priority(other) else other
+            mover = _choose_longitudinal_mover(entity, other)
+            if mover is None:
+                return
             delta = target_gap - current_gap + 0.1
             _shift_entity_longitudinal(mover, anchor_lane, -delta if mover is entity else delta)
     elif expected_longitudinal == "aligned_with_other":
         delta = longitudinal_b - longitudinal_a
         if abs(delta) > 0.05:
-            _shift_entity_longitudinal(entity, anchor_lane, delta)
+            mover = _choose_longitudinal_mover(entity, other, entity)
+            if mover is entity:
+                _shift_entity_longitudinal(entity, anchor_lane, delta)
+            elif mover is other:
+                _shift_entity_longitudinal(other, anchor_lane, -delta)
 
     if strength == "validation_only" or expected_lateral == "same_lateral_band":
         return

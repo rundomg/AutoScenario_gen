@@ -158,6 +158,24 @@ class VideoReconstructionRunnerTest(unittest.TestCase):
         self.assertEqual(generator.kwargs["user_request"], request)
         self.assertEqual(summary["user_request"], request)
 
+    def test_collision_anchored_fitting_replaces_target_numbers(self):
+        runner = self._runner(
+            enable_collision_fitting=True,
+            fitting_max_rollouts=12,
+            fitting_top_k=1,
+        )
+        summary = runner.run()
+        artifact = summary["artifact"]
+
+        self.assertTrue(summary["collision_anchored_fitting"])
+        self.assertTrue(Path(artifact["fitting_config_path"]).exists())
+        self.assertTrue(Path(artifact["fitted_spawn_payload_path"]).exists())
+        fitted = json.loads(Path(artifact["trajectory_dsl_path"]).read_text())
+        self.assertEqual(
+            fitted["metadata"]["parameter_source"],
+            "collision_anchored_fitting",
+        )
+
     def test_repair_loop_on_invalid_then_valid(self):
         class FlakyGenerator:
             def __init__(self):

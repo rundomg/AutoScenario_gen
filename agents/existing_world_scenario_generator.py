@@ -2717,14 +2717,33 @@ class ExistingWorldScenarioGenerator(ScenarioGenerator):
 
 
             class RiskMetricsRecorder:
-                def __init__(self, ego_actor, actor_by_id, output_path):
+                def __init__(self, ego_actor, actor_by_id, output_path, risk_dsl=None):
                     self.ego_actor = ego_actor
                     self.actor_by_id = actor_by_id
                     self.output_path = output_path
+                    self.risk_dsl = risk_dsl or {}
                     self.min_distance_m = float('inf')
                     self.min_ttc_s = float('inf')
                     self.collisions = []
-                    self.collision_sensor = None
+                    self.collision_actor_ids = set()
+                    self.post_collision_control_release_s = None
+                    self.collision_sensors = []
+                    self._collision_keys = set()
+                    self.current_elapsed_s = 0.0
+                    self.trajectory_logs = {}
+                    self.target_pair = list(
+                        (self.risk_dsl.get('metadata') or {}).get('target_collision_pair')
+                        or []
+                    )
+                    self.anchor_metadata = dict(
+                        (self.risk_dsl.get('metadata') or {}).get('collision_anchor')
+                        or {}
+                    )
+                    self.conflict_position = self.anchor_metadata.get('conflict_position')
+                    self.arrival_best = {
+                        str(actor_id): {'distance_m': float('inf'), 'time_s': None}
+                        for actor_id in self.target_pair
+                    }
                     self.motion_origins = {}
                     self.motion_stats = {}
                     for actor_id, actor in list(self.actor_by_id.items()):
@@ -2737,11 +2756,27 @@ class ExistingWorldScenarioGenerator(ScenarioGenerator):
                                 'first_motion_s': None,
                                 'max_speed_mps': 0.0,
                             }
+                            self.trajectory_logs[actor_id] = []
                         except Exception:
                             pass
-                    self._attach_collision_sensor()
+                    self._attach_collision_sensors()
 
                 def reset_motion_baseline(self):
+                    # Settle/release ticks are outside scenario time. Ignore any
+                    # spawn-contact callbacks and begin rollout metrics at t=0.
+                    self.collisions = []
+                    self.collision_actor_ids = set()
+                    self._collision_keys = set()
+                    self.current_elapsed_s = 0.0
+                    self.min_distance_m = float('inf')
+                    self.min_ttc_s = float('inf')
+                    self.trajectory_logs = {
+                        actor_id: [] for actor_id in self.trajectory_logs
+                    }
+                    self.arrival_best = {
+                        str(actor_id): {'distance_m': float('inf'), 'time_s': None}
+                        for actor_id in self.target_pair
+                    }
                     for actor_id, actor in list(self.actor_by_id.items()):
                         if actor is None:
                             continue
@@ -2755,23 +2790,107 @@ class ExistingWorldScenarioGenerator(ScenarioGenerator):
                         except Exception:
                             pass
 
-                def _attach_collision_sensor(self):
-                    if self.ego_actor is None:
-                        return
+                def _attach_collision_sensors(self):
                     try:
                         blueprint = blueprint_library.find('sensor.other.collision')
-                        self.collision_sensor = world.spawn_actor(
-                            blueprint,
-                            carla.Transform(),
-                            attach_to=self.ego_actor,
-                        )
-                        self.collision_sensor.listen(
-                            lambda event: self.collisions.append({'frame': int(event.frame)})
-                        )
                     except Exception:
-                        self.collision_sensor = None
+                        return
+                    for owner_id, actor in list(self.actor_by_id.items()):
+                        if actor is None:
+                            continue
+                        try:
+                            if 'vehicle' not in actor.type_id:
+                                continue
+                            sensor = world.spawn_actor(
+                                blueprint, carla.Transform(), attach_to=actor
+                            )
+                            sensor.listen(
+                                lambda event, captured_id=owner_id: self._record_collision(
+                                    captured_id, event
+                                )
+                            )
+                            self.collision_sensors.append(sensor)
+                        except Exception:
+                            pass
+
+                def _record_collision(self, owner_id, event):
+                    other_id = None
+                    other_actor = None
+                    try:
+                        other_numeric_id = int(event.other_actor.id)
+                        for actor_id, actor in self.actor_by_id.items():
+                            if actor is not None and int(actor.id) == other_numeric_id:
+                                other_id = actor_id
+                                other_actor = actor
+                                break
+                    except Exception:
+                        pass
+                    pair = sorted([str(owner_id), str(other_id or 'external')])
+                    key = (int(event.frame), tuple(pair))
+                    if key in self._collision_keys:
+                        return
+                    self._collision_keys.add(key)
+                    record = {
+                        'frame': int(event.frame),
+                        'time_s': float(self.current_elapsed_s),
+                        'collision_pair': pair,
+                    }
+                    try:
+                        location = self.actor_by_id[owner_id].get_transform().location
+                        record['location'] = {
+                            'x': float(location.x),
+                            'y': float(location.y),
+                            'z': float(location.z),
+                        }
+                    except Exception:
+                        pass
+                    if other_id is not None and other_actor is not None:
+                        try:
+                            owner_transform = self.actor_by_id[owner_id].get_transform()
+                            other_transform = other_actor.get_transform()
+
+                            def contact_side(origin_transform, target_transform):
+                                dx = target_transform.location.x - origin_transform.location.x
+                                dy = target_transform.location.y - origin_transform.location.y
+                                bearing = math.degrees(math.atan2(dy, dx))
+                                relative = (
+                                    bearing - float(origin_transform.rotation.yaw) + 180.0
+                                ) % 360.0 - 180.0
+                                if abs(relative) <= 45.0:
+                                    return 'front'
+                                if abs(relative) >= 135.0:
+                                    return 'rear'
+                                return 'right' if relative > 0.0 else 'left'
+
+                            record['contact_sides'] = {
+                                str(owner_id): contact_side(owner_transform, other_transform),
+                                str(other_id): contact_side(other_transform, owner_transform),
+                            }
+                            owner_velocity = self.actor_by_id[owner_id].get_velocity()
+                            other_velocity = other_actor.get_velocity()
+                            record['relative_impact_speed_mps'] = math.sqrt(
+                                (owner_velocity.x - other_velocity.x) ** 2
+                                + (owner_velocity.y - other_velocity.y) ** 2
+                                + (owner_velocity.z - other_velocity.z) ** 2
+                            )
+                        except Exception:
+                            pass
+                    try:
+                        impulse = event.normal_impulse
+                        record['normal_impulse'] = {
+                            'x': float(impulse.x),
+                            'y': float(impulse.y),
+                            'z': float(impulse.z),
+                        }
+                    except Exception:
+                        pass
+                    self.collision_actor_ids.add(str(owner_id))
+                    if other_id is not None:
+                        self.collision_actor_ids.add(str(other_id))
+                    self.collisions.append(record)
 
                 def tick(self, elapsed_s=None):
+                    self.current_elapsed_s = float(elapsed_s or 0.0)
                     for actor_id, actor in list(self.actor_by_id.items()):
                         if actor_id not in self.motion_stats or actor is None:
                             continue
@@ -2784,9 +2903,79 @@ class ExistingWorldScenarioGenerator(ScenarioGenerator):
                             and speed > 0.5
                         ):
                             stats['first_motion_s'] = float(elapsed_s)
+                        try:
+                            transform = actor.get_transform()
+                            velocity = actor.get_velocity()
+                            acceleration = actor.get_acceleration()
+                            bbox = actor.bounding_box.extent
+                            waypoint = world.get_map().get_waypoint(
+                                transform.location, project_to_road=True
+                            )
+                            self.trajectory_logs.setdefault(actor_id, []).append({
+                                'time_s': float(elapsed_s or 0.0),
+                                'transform': {
+                                    'x': float(transform.location.x),
+                                    'y': float(transform.location.y),
+                                    'z': float(transform.location.z),
+                                    'yaw': float(transform.rotation.yaw),
+                                },
+                                'velocity': {
+                                    'x': float(velocity.x),
+                                    'y': float(velocity.y),
+                                    'z': float(velocity.z),
+                                },
+                                'acceleration': {
+                                    'x': float(acceleration.x),
+                                    'y': float(acceleration.y),
+                                    'z': float(acceleration.z),
+                                },
+                                'lane_waypoint': (
+                                    {
+                                        'road_id': int(waypoint.road_id),
+                                        'lane_id': int(waypoint.lane_id),
+                                        's': float(waypoint.s),
+                                    }
+                                    if waypoint is not None else None
+                                ),
+                                'bounding_box_extent': {
+                                    'x': float(bbox.x),
+                                    'y': float(bbox.y),
+                                    'z': float(bbox.z),
+                                },
+                            })
+                            if (
+                                actor_id in self.arrival_best
+                                and isinstance(self.conflict_position, (list, tuple))
+                                and len(self.conflict_position) >= 2
+                            ):
+                                conflict_distance = math.sqrt(
+                                    (transform.location.x - float(self.conflict_position[0])) ** 2
+                                    + (transform.location.y - float(self.conflict_position[1])) ** 2
+                                )
+                                if conflict_distance < self.arrival_best[actor_id]['distance_m']:
+                                    self.arrival_best[actor_id] = {
+                                        'distance_m': conflict_distance,
+                                        'time_s': float(elapsed_s or 0.0),
+                                    }
+                        except Exception:
+                            pass
                     if self.ego_actor is None:
                         return
                     ego_speed = _autoscenario_vehicle_speed(self.ego_actor)
+                    if len(self.target_pair) == 2:
+                        target_a = self.actor_by_id.get(str(self.target_pair[0]))
+                        target_b = self.actor_by_id.get(str(self.target_pair[1]))
+                        if target_a is not None and target_b is not None:
+                            distance = self._bbox_separation(target_a, target_b)
+                            self.min_distance_m = min(self.min_distance_m, distance)
+                            speed_a = _autoscenario_vehicle_speed(target_a)
+                            speed_b = _autoscenario_vehicle_speed(target_b)
+                            closing_speed = abs(speed_a - speed_b)
+                            if closing_speed > 0.1:
+                                self.min_ttc_s = min(
+                                    self.min_ttc_s, distance / closing_speed
+                                )
+                            return
                     for actor_id, actor in list(self.actor_by_id.items()):
                         if actor_id == 'ego' or actor is None:
                             continue
@@ -2797,14 +2986,55 @@ class ExistingWorldScenarioGenerator(ScenarioGenerator):
                         if closing_speed > 0.1 and distance < float('inf'):
                             self.min_ttc_s = min(self.min_ttc_s, distance / closing_speed)
 
+                @staticmethod
+                def _bbox_separation(actor_a, actor_b):
+                    try:
+                        transform_a = actor_a.get_transform()
+                        transform_b = actor_b.get_transform()
+                        yaw_a = math.radians(float(transform_a.rotation.yaw))
+                        yaw_b = math.radians(float(transform_b.rotation.yaw))
+                        extent_a = actor_a.bounding_box.extent
+                        extent_b = actor_b.bounding_box.extent
+                        axes = [
+                            (math.cos(yaw_a), math.sin(yaw_a)),
+                            (-math.sin(yaw_a), math.cos(yaw_a)),
+                            (math.cos(yaw_b), math.sin(yaw_b)),
+                            (-math.sin(yaw_b), math.cos(yaw_b)),
+                        ]
+                        dx = transform_b.location.x - transform_a.location.x
+                        dy = transform_b.location.y - transform_a.location.y
+
+                        def radius(yaw, extent, axis):
+                            forward = (math.cos(yaw), math.sin(yaw))
+                            right = (-math.sin(yaw), math.cos(yaw))
+                            return (
+                                float(extent.x)
+                                * abs(forward[0] * axis[0] + forward[1] * axis[1])
+                                + float(extent.y)
+                                * abs(right[0] * axis[0] + right[1] * axis[1])
+                            )
+
+                        maximum_gap = -float('inf')
+                        for axis in axes:
+                            projected_centres = abs(dx * axis[0] + dy * axis[1])
+                            maximum_gap = max(
+                                maximum_gap,
+                                projected_centres
+                                - radius(yaw_a, extent_a, axis)
+                                - radius(yaw_b, extent_b, axis),
+                            )
+                        return max(0.0, maximum_gap)
+                    except Exception:
+                        return _autoscenario_actor_distance(actor_a, actor_b)
+
                 def close(self):
-                    if self.collision_sensor is not None:
+                    for collision_sensor in self.collision_sensors:
                         try:
-                            self.collision_sensor.stop()
+                            collision_sensor.stop()
                         except Exception:
                             pass
                         try:
-                            self.collision_sensor.destroy()
+                            collision_sensor.destroy()
                         except Exception:
                             pass
                     actor_motion = {}
@@ -2831,10 +3061,44 @@ class ExistingWorldScenarioGenerator(ScenarioGenerator):
                     data = {
                         'collision': bool(self.collisions),
                         'collision_events': self.collisions,
+                        'collision_pair': (
+                            self.collisions[0].get('collision_pair')
+                            if self.collisions else None
+                        ),
+                        'collision_time_s': (
+                            self.collisions[0].get('time_s')
+                            if self.collisions else None
+                        ),
+                        'collision_location': (
+                            self.collisions[0].get('location')
+                            if self.collisions else None
+                        ),
+                        'relative_impact_speed_mps': (
+                            self.collisions[0].get('relative_impact_speed_mps')
+                            if self.collisions else None
+                        ),
                         'min_distance_m': None if self.min_distance_m == float('inf') else self.min_distance_m,
+                        'minimum_pair_bbox_distance_m': None if self.min_distance_m == float('inf') else self.min_distance_m,
                         'min_ttc_s': None if self.min_ttc_s == float('inf') else self.min_ttc_s,
                         'actor_ids': sorted(self.actor_by_id.keys()),
                         'actor_motion': actor_motion,
+                        'trajectory_logs': self.trajectory_logs,
+                        'arrival_times': {
+                            actor_id: (
+                                row.get('time_s')
+                                if row.get('distance_m', float('inf')) <= 3.0
+                                else None
+                            )
+                            for actor_id, row in self.arrival_best.items()
+                        },
+                        'arrival_min_distances_m': {
+                            actor_id: (
+                                None
+                                if row.get('distance_m') == float('inf')
+                                else row.get('distance_m')
+                            )
+                            for actor_id, row in self.arrival_best.items()
+                        },
                         'post_collision_control_release_s': self.post_collision_control_release_s,
                     }
                     os.makedirs(os.path.dirname(self.output_path) or '.', exist_ok=True)
@@ -2876,7 +3140,12 @@ class ExistingWorldScenarioGenerator(ScenarioGenerator):
                 else EgoController(ego_actor, risk_dsl)
             )
             dsl_controller = DslEventController(ego_actor, actor_by_id, risk_dsl)
-            metrics = RiskMetricsRecorder(ego_actor, actor_by_id, _AUTOSCENARIO_RISK_METRICS)
+            metrics = RiskMetricsRecorder(
+                ego_actor,
+                actor_by_id,
+                _AUTOSCENARIO_RISK_METRICS,
+                risk_dsl,
+            )
 
             duration_s = float(
                 os.environ.get('AUTOSCENARIO_RISK_DURATION', str(risk_dsl.get('duration_s', 12.0)))
@@ -3039,6 +3308,9 @@ class ExistingWorldScenarioGenerator(ScenarioGenerator):
             try:
                 for tick_index in range(max_ticks):
                     elapsed_s = tick_index * tick_dt
+                    # Collision callbacks run during world.tick(); publish the
+                    # upcoming simulation time before advancing the world.
+                    metrics.current_elapsed_s = elapsed_s
                     if metrics.collisions:
                         if not _autoscenario_post_collision_released:
                             # Clear the last commanded throttle/brake once, then

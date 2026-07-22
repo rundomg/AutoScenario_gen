@@ -17,6 +17,10 @@ from agents.vehicle_orientation_interpreter import VehicleOrientationInterpreter
 from agents.vehicle_position_interpreter import VehiclePositionInterpreter
 from tools.utils import read_file, write_to_file
 from tools.structured_pipeline import normalize_scene_understanding
+from tools.user_text_constraints import (
+    apply_user_constraints_to_scene,
+    normalize_user_constraint_bundle,
+)
 from tools import vehicle_detector
 
 
@@ -452,6 +456,25 @@ Output JSON only:
             payload, validation_error = self.extract_decision_data(output_fn)
             attempts += 1
             if validation_error is None:
+                metadata = payload.setdefault("metadata", {})
+                bundle, constraint_errors = normalize_user_constraint_bundle(
+                    metadata.get("user_constraints")
+                )
+                if constraint_errors or not bundle.get("constraints"):
+                    detail = "; ".join(constraint_errors) or "constraint list is empty"
+                    validation_error = (
+                        "User-description merge did not preserve explicit statements in "
+                        f"metadata.user_constraints: {detail}"
+                    )
+                else:
+                    metadata["user_constraints"] = bundle
+                    payload, application = apply_user_constraints_to_scene(payload)
+                    if application.get("unresolved"):
+                        validation_error = (
+                            "User-description constraints reference unresolved targets: "
+                            + ", ".join(application["unresolved"])
+                        )
+            if validation_error is None:
                 payload.setdefault("metadata", {})["user_description_applied"] = True
                 write_to_file(output_fn, json.dumps(payload, indent=2, sort_keys=True))
                 return payload
@@ -523,6 +546,14 @@ Output JSON only:
             payload, validation_error = self.extract_decision_data(output_fn)
             attempts += 1
             if validation_error is None:
+                original_constraints = (
+                    (scene_understanding.get("metadata") or {}).get("user_constraints")
+                )
+                if original_constraints:
+                    payload.setdefault("metadata", {})["user_constraints"] = deepcopy(
+                        original_constraints
+                    )
+                    payload, _application = apply_user_constraints_to_scene(payload)
                 payload.setdefault("metadata", {})["verification_feedback_applied"] = True
                 write_to_file(output_fn, json.dumps(payload, indent=2, sort_keys=True))
                 return payload
@@ -760,7 +791,34 @@ Output JSON only:
 	            "absence/presence of a raised center median or center island, straight-road vs "
 	            "junction evidence, and continuous curbside parking lanes.\n"
 	            "8. Use conservative uncertainty where the user and VLM are both ambiguous.\n"
-	            "9. Do not store or repeat the raw user description in metadata.\n\n"
+	            "9. Do not store or repeat the raw user description in metadata.\n"
+            "10. Preserve every explicit user statement independently in "
+            "metadata.user_constraints. This side-channel is mandatory and must contain "
+            "only facts stated by the user, never facts inferred only from the image. "
+            "Use source=user_text and strength=hard for definite statements; use soft only "
+            "for explicitly uncertain wording. Intermediate VLM confidence is not a gate "
+            "for these constraints.\n\n"
+            "metadata.user_constraints schema:\n"
+            '{"schema_version":"user-constraints-v1","source":"user_text",'
+            '"constraints":[{"id":"user_...","target":"scene|entity|relation",'
+            '"entity_id":"det id when target is entity/relation",'
+            '"reference_entity_id":"ego or det id when target is relation",'
+            '"path":"canonical field path","value":"JSON value",'
+            '"strength":"hard|soft","evidence":"short user-stated phrase",'
+            '"tolerance":1.5}]}\n'
+            "For scene facts use paths under road_network.map_matching, "
+            "road_network.lane_groups[0], actor_layout, or general_environment. "
+            "For actor facts use category, subtype, count, appearance.color, motion_state, "
+            "turn_intent, heading_relation_to_ego, lane_side_relation, "
+            "lane_index_relation, longitudinal_relation, longitudinal_proximity, "
+            "longitudinal_m, layout_anchor_id, or anchor_relation.lane_from_right. "
+            "Encode an exact user distance such as '5m ahead' as entity path "
+            "longitudinal_m with numeric value 5 and tolerance 1.5. When the user gives "
+            "absolute right-to-left lane slots, preserve ego as scene path "
+            "road_network.map_matching.ego_lane_from_right and each actor as entity path "
+            "anchor_relation.lane_from_right. Ego-relative left is lane_index_relation=-1 "
+            "and right is +1. Pairwise facts that cannot be represented as entity fields "
+            "use target=relation.\n\n"
             "Required top-level keys: traffic_subjects, key_pairwise_relations, "
             "road_network, actor_layout, general_environment, metadata. Put all "
             "visible spawnable vehicles in traffic_subjects using real categories "

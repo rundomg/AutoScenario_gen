@@ -51,6 +51,10 @@ class VideoAccidentInterpreter(TaskAgent):
         {
           "scene_id": "...",
           "accident_type": "free text, e.g. rear-end / cut-in / pedestrian crossing",
+          "accident_type_confidence": 0.0,
+          "striking_actor_ref": "ego or participant ref",
+          "struck_actor_ref": "ego or participant ref",
+          "collision_time_range_s": [2.0, 3.0],
           "summary": "one or two sentences on the accident mechanism",
           "participants": [
             {
@@ -59,9 +63,16 @@ class VideoAccidentInterpreter(TaskAgent):
               "visual_description": "short visual cue (colour, position)",
               "start_position_relative_to_ego": "e.g. ahead same lane ~12 m / left lane",
               "role": "lead_vehicle|cut_in_vehicle|crossing|oncoming|...",
+              "maneuver": "keep_lane|straight|turn_left|turn_right|lane_change_left|lane_change_right",
+              "behavior_sequence": ["keep", "decelerate", "brake", "stop"],
+              "relative_motion_trend": "closing|separating|stopped|uncertain",
+              "semantic_confidence": 0.0,
               "mapping_hint": "short visual/geometric reason for the match",
               "matched_actor_id": "real id from the supplied actor table, or null",
-              "match_confidence": 0.0
+              "match_confidence": 0.0,
+              "candidate_actor_ids": [
+                {"actor_id": "another real table id", "confidence": 0.0}
+              ]
             }
           ],
           "actor_motion_states": [
@@ -79,6 +90,9 @@ class VideoAccidentInterpreter(TaskAgent):
               "description": "what happens"
             }
           ],
+          "relative_motion_constraints": [
+            {"actor_a_ref": "ego", "actor_b_ref": "v1", "trend": "closing", "confidence": 0.0}
+          ],
           "end_state": {
             "collision": true,
             "collision_pair": ["ego", "v1"],
@@ -92,6 +106,11 @@ class VideoAccidentInterpreter(TaskAgent):
         - Use ego-relative descriptions; longitudinal ahead is positive.
         - Keep the timeline coarse (start/mid/end), do not invent exact metres or
           seconds you cannot see.
+        - collision_time_range_s is the only allowed time estimate: give a broad
+          interval relative to START. Do not estimate initial speeds, exact
+          acceleration/deceleration, brake onset, collision coordinates, or
+          per-frame controls; downstream fitting obtains all continuous values.
+        - behavior_sequence contains only the observed semantic phase order.
         - For lateral maneuvers, still describe them, but note that placement may be
           approximated by the downstream reconstruction.
         - participants[].ref ids must be referenced consistently in event_sequence
@@ -101,6 +120,9 @@ class VideoAccidentInterpreter(TaskAgent):
           and ego-relative geometry. Never invent an actor id. Use null when no
           table row is defensible, and explain the ambiguity in uncertainty.
         - match_confidence must be between 0 and 1.
+        - If actor matching is ambiguous, keep the best id in matched_actor_id
+          and list up to three plausible real ids in candidate_actor_ids. Do not
+          invent candidates; downstream geometry and simulation choose top-K.
         - Inspect EVERY non-ego vehicle from the actor table across the ordered
           frames and include it exactly once in actor_motion_states, even when it
           is not an accident participant. This is a simple moving/stationary
@@ -228,6 +250,33 @@ class VideoAccidentInterpreter(TaskAgent):
                     f"`participants[{index}].matched_actor_id` references unknown "
                     f"actor id `{matched_id}`; allowed ids: {sorted(actor_ids)}."
                 )
+            candidates = participant.get("candidate_actor_ids") or []
+            if not isinstance(candidates, list):
+                return f"`participants[{index}].candidate_actor_ids` must be a list."
+            for candidate_index, candidate in enumerate(candidates):
+                if not isinstance(candidate, dict):
+                    return (
+                        f"`participants[{index}].candidate_actor_ids[{candidate_index}]` "
+                        "must be an object."
+                    )
+                candidate_id = str(candidate.get("actor_id") or "")
+                if candidate_id not in actor_ids:
+                    return (
+                        f"`participants[{index}].candidate_actor_ids[{candidate_index}]` "
+                        f"references unknown actor id `{candidate_id}`."
+                    )
+                try:
+                    confidence = float(candidate.get("confidence"))
+                except (TypeError, ValueError):
+                    return (
+                        f"`participants[{index}].candidate_actor_ids[{candidate_index}]` "
+                        "confidence must be numeric."
+                    )
+                if not 0.0 <= confidence <= 1.0:
+                    return (
+                        f"`participants[{index}].candidate_actor_ids[{candidate_index}]` "
+                        "confidence must be between 0 and 1."
+                    )
         motion_rows = payload.get("actor_motion_states")
         if not isinstance(motion_rows, list):
             return "`actor_motion_states` must be a list covering every non-ego vehicle."

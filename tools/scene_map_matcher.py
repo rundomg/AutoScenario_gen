@@ -218,6 +218,8 @@ class SceneMapMatcher:
         blacklist_radius_m: float = 35.0,
         topology_cache_dir: Optional[str] = None,
         legacy_map_match: bool = False,
+        require_urban_junction: bool = False,
+        require_crosswalk_near_junction: bool = False,
     ):
         self.host = host
         self.port = port
@@ -238,6 +240,10 @@ class SceneMapMatcher:
         self.blacklist_radius_m = blacklist_radius_m
         self.topology_cache_dir = topology_cache_dir
         self.legacy_map_match = legacy_map_match
+        self.require_urban_junction = bool(require_urban_junction)
+        self.require_crosswalk_near_junction = bool(
+            require_crosswalk_near_junction
+        )
 
     def analyze_scene_assets(self, scene_id: str, output_folder: str) -> str:
         paths = self._build_source_paths(scene_id, output_folder)
@@ -2277,6 +2283,11 @@ class SceneMapMatcher:
             except Exception:
                 continue
             world_name = cache.get("world_name", os.path.basename(cache_path))
+            if self.load_world_name:
+                requested_world = str(self.load_world_name).rstrip("/").split("/")[-1]
+                cached_world = str(world_name).rstrip("/").split("/")[-1]
+                if cached_world != requested_world:
+                    continue
             if (
                 cache.get("schema_version") != TOPOLOGY_CACHE_SCHEMA_VERSION
                 or cache.get("feature_set") != TOPOLOGY_CACHE_FEATURE_SET
@@ -2323,7 +2334,25 @@ class SceneMapMatcher:
                 if blacklisted:
                     details["blacklisted"] = True
                 hard_reject = bool(details.get("hard_reject"))
-                reject_reasons = details.get("reject_reasons") or []
+                reject_reasons = list(details.get("reject_reasons") or [])
+                if self.require_urban_junction:
+                    environment = candidate.get("environment_context") or {}
+                    arms = candidate.get("physical_junction_arms") or {}
+                    if str(candidate.get("candidate_topology_type") or "") != "cross_intersection":
+                        reject_reasons.append("required_cross_intersection")
+                    if int(arms.get("leg_count") or 0) < 4:
+                        reject_reasons.append("required_four_physical_arms")
+                    if str(environment.get("environment_class") or "") != "urban_like":
+                        reject_reasons.append("required_urban_environment")
+                if (
+                    self.require_crosswalk_near_junction
+                    and not bool(candidate.get("has_crosswalk_nearby"))
+                ):
+                    reject_reasons.append("required_crosswalk_near_junction")
+                if reject_reasons:
+                    hard_reject = True
+                    details["hard_reject"] = True
+                    details["reject_reasons"] = reject_reasons
                 reject_reason = (
                     "; ".join(str(item) for item in reject_reasons)
                     if reject_reasons

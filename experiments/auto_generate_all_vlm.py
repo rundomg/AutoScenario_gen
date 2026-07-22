@@ -54,6 +54,14 @@ from tools.actor_graph_verifier import (
     build_source_actor_graph,
     compare_actor_graphs,
 )
+from tools.user_text_constraints import (
+    apply_user_constraints_to_relation_dsl,
+    apply_user_constraints_to_scene,
+    evaluate_user_constraints,
+    hard_entity_constraint_values,
+    hard_scene_constraint_value,
+    has_hard_scene_constraint,
+)
 
 load_dotenv()
 
@@ -98,6 +106,12 @@ class AutoGenerator:
             info_dict.get("map_match_blacklist_radius_m", 35.0)
         )
         self.topology_cache_dir = info_dict.get("topology_cache_dir")
+        self.require_urban_junction = bool(
+            info_dict.get("require_urban_junction", False)
+        )
+        self.require_crosswalk_on_all_junction_arms = bool(
+            info_dict.get("require_crosswalk_on_all_junction_arms", False)
+        )
         self._active_scene_understanding = {}
 
         self.scene_understanding_interpreter = SceneUnderstandingInterpreter()
@@ -118,6 +132,10 @@ class AutoGenerator:
             auxiliary_weight=float(info_dict.get("map_match_auxiliary_weight", 0.10)),
             blacklist_radius_m=self.map_match_blacklist_radius_m,
             topology_cache_dir=self.topology_cache_dir,
+            require_urban_junction=self.require_urban_junction,
+            require_crosswalk_near_junction=(
+                self.require_crosswalk_on_all_junction_arms
+            ),
         )
         self.carla_spawn_context = self._load_carla_spawn_context()
         actual_map_name = self._normalize_carla_world_name(
@@ -261,7 +279,116 @@ class AutoGenerator:
                 issues.append(
                     f"insufficient_ego_inbound_lanes:{inbound_count}<{int(forward_lane_count)}"
                 )
+        if self.require_crosswalk_on_all_junction_arms:
+            coverage = self._crosswalk_coverage_for_junction_arms(structure)
+            structure["crosswalk_arm_coverage"] = coverage
+            missing = coverage.get("missing_arms") or []
+            if missing:
+                issues.append("crosswalk_missing_on_arms:" + ",".join(missing))
         return sorted(set(issues))
+
+    @staticmethod
+    def _angle_distance_deg(first: float, second: float) -> float:
+        return abs((float(first) - float(second) + 180.0) % 360.0 - 180.0)
+
+    def _crosswalk_coverage_for_junction_arms(self, structure: dict) -> dict:
+        """Verify one distinct CARLA crosswalk at the mouth of every junction arm."""
+        result = {
+            "required": True,
+            "status": "unavailable",
+            "covered_arms": [],
+            "missing_arms": [],
+            "assignments": [],
+        }
+        legs = [leg for leg in structure.get("legs") or [] if isinstance(leg, dict)]
+        leg_names = [str(leg.get("name") or "") for leg in legs]
+        result["missing_arms"] = leg_names
+        try:
+            import carla
+
+            client = carla.Client(self.carla_host, self.carla_port)
+            client.set_timeout(self.carla_timeout)
+            world_map = client.get_world().get_map()
+            points = list(world_map.get_crosswalks() or [])
+        except Exception as exc:
+            result["error"] = str(exc)
+            return result
+
+        polygons = []
+        current = []
+        for point in points:
+            current.append(point)
+            if len(current) >= 4 and point.distance(current[0]) <= 0.25:
+                polygons.append(current)
+                current = []
+
+        center = structure.get("center") or {}
+        cx = float(center.get("x", 0.0))
+        cy = float(center.get("y", 0.0))
+        radius = float(structure.get("junction_radius_m") or 20.0) + 20.0
+        nearby = []
+        for index, polygon in enumerate(polygons):
+            px = sum(float(point.x) for point in polygon) / len(polygon)
+            py = sum(float(point.y) for point in polygon) / len(polygon)
+            distance = math.hypot(px - cx, py - cy)
+            if distance > radius:
+                continue
+            nearby.append(
+                {
+                    "index": index,
+                    "x": px,
+                    "y": py,
+                    "distance_to_center_m": distance,
+                    "bearing_deg": math.degrees(math.atan2(py - cy, px - cx)),
+                }
+            )
+
+        used = set()
+        assignments = []
+        missing = []
+        for leg in legs:
+            name = str(leg.get("name") or "")
+            heading = float(leg.get("heading_out_deg") or 0.0)
+            candidates = [
+                item
+                for item in nearby
+                if item["index"] not in used
+                and self._angle_distance_deg(item["bearing_deg"], heading) <= 50.0
+            ]
+            if not candidates:
+                missing.append(name)
+                continue
+            chosen = min(
+                candidates,
+                key=lambda item: (
+                    self._angle_distance_deg(item["bearing_deg"], heading),
+                    item["distance_to_center_m"],
+                ),
+            )
+            used.add(chosen["index"])
+            assignments.append(
+                {
+                    "arm": name,
+                    "arm_heading_deg": heading,
+                    "crosswalk_center": {"x": chosen["x"], "y": chosen["y"]},
+                    "distance_to_center_m": round(chosen["distance_to_center_m"], 3),
+                    "angular_error_deg": round(
+                        self._angle_distance_deg(chosen["bearing_deg"], heading), 3
+                    ),
+                }
+            )
+
+        result.update(
+            {
+                "status": "pass" if not missing and len(legs) == 4 else "failed",
+                "covered_arms": [item["arm"] for item in assignments],
+                "missing_arms": missing if len(legs) == 4 else leg_names,
+                "assignments": assignments,
+                "nearby_crosswalk_count": len(nearby),
+                "map_name": world_map.name,
+            }
+        )
+        return result
 
     @staticmethod
     def _matched_structure_summary(matched_structure: dict, source: str = None) -> dict:
@@ -660,6 +787,28 @@ class AutoGenerator:
                 "user_description_applied"
             ] = False
 
+        if user_scene_description and (
+            (scene_understanding.get("metadata") or {}).get(
+                "user_description_applied"
+            )
+            is not True
+        ):
+            error = (scene_understanding.get("metadata") or {}).get(
+                "user_description_merge_error"
+            )
+            raise RuntimeError(
+                "User text was not converted into enforceable constraints; "
+                "static reconstruction stopped instead of silently ignoring it."
+                + (f" Details: {error}" if error else "")
+            )
+
+        # The VLM JSON is an intermediate representation. Re-apply the separate
+        # user-text side-channel after normalization/merge so later heuristics
+        # cannot silently replace an explicit statement.
+        scene_understanding, _constraint_application = apply_user_constraints_to_scene(
+            scene_understanding
+        )
+
         write_to_file(
             output_fn,
             json.dumps(scene_understanding, indent=2, sort_keys=True),
@@ -674,6 +823,10 @@ class AutoGenerator:
             scene_understanding,
             self.carla_spawn_context,
             legacy_actor_layout=self.legacy_actor_layout,
+        )
+        relation_dsl = apply_user_constraints_to_relation_dsl(
+            scene_understanding,
+            relation_dsl,
         )
         self._write_debug_json(scene_id, "relation_dsl", relation_dsl)
         return relation_dsl
@@ -917,6 +1070,11 @@ class AutoGenerator:
         payload["metadata"]["carla_weather_preset"] = self._carla_weather_preset(
             general_environment
         )
+        active_constraints = (
+            (self._active_scene_understanding or {}).get("metadata") or {}
+        ).get("user_constraints")
+        if active_constraints:
+            payload["metadata"]["user_constraints"] = deepcopy(active_constraints)
         write_to_file(
             self._spawn_payload_path(scene_id),
             json.dumps(payload, indent=2, sort_keys=True),
@@ -1044,12 +1202,24 @@ class AutoGenerator:
         dense_wps = (self.carla_spawn_context or {}).get("dense_local_waypoints") or []
         if not topology_sample:
             return
+        hard_ego_lane = has_hard_scene_constraint(
+            scene_understanding,
+            "road_network.map_matching.ego_lane_from_right",
+            "actor_layout.ego_approach.ego_lane_from_right",
+            "metadata.ego_localization.ego_lane_from_right",
+        )
         if not dense_wps:
             # Cache-only mode (no live CARLA): use the sibling-lane geometry
             # baked into the candidate to hop ego to the correct driving lane
             # (lateral), then slide it longitudinally using the candidate's own
             # cached distance_to_junction_ahead and forward direction.
-            self._index_ego_lateral_cache_only(scene_understanding, topology_sample)
+            resolved = self._index_ego_lateral_cache_only(
+                scene_understanding, topology_sample
+            )
+            if hard_ego_lane and not resolved:
+                raise CandidateValidationError(
+                    "Matched candidate cannot satisfy hard user ego-lane constraint."
+                )
             self._index_ego_longitudinal_cache_only(scene_understanding, topology_sample)
             return
 
@@ -1060,6 +1230,11 @@ class AutoGenerator:
         # ------------------------------------------------------------------
         lane_offset = self._trusted_ego_lane_offset(scene_understanding)
         corrected_wp = _find_lane_in_dense(candidate_lane, lane_offset, dense_wps)
+        if corrected_wp is None and hard_ego_lane:
+            raise CandidateValidationError(
+                "Loaded CARLA map cannot satisfy hard user ego-lane constraint "
+                f"ego_lane_from_right={lane_offset}."
+            )
         if corrected_wp is not None:
             end_wp = _next_wp_along_lane(corrected_wp, dense_wps, lookahead_m=20.0)
             end_dict = {
@@ -1082,6 +1257,10 @@ class AutoGenerator:
                 "lane_id": corrected_wp["lane_id"],
                 "start": start_dict,
                 "end": end_dict,
+                "resolved_ego_lane_from_right": lane_offset,
+                "ego_lane_constraint_source": (
+                    "user_text" if hard_ego_lane else "vlm_or_heuristic"
+                ),
             }
             print(
                 f"  [ego_indexer] lateral: lane_offset={lane_offset} → "
@@ -1120,7 +1299,7 @@ class AutoGenerator:
 
     def _index_ego_lateral_cache_only(
         self, scene_understanding: dict, topology_sample: list
-    ) -> None:
+    ) -> bool:
         """Hop ego to the correct driving lane without live CARLA.
 
         Uses the sibling-lane ``start`` geometry baked into the candidate's
@@ -1133,11 +1312,11 @@ class AutoGenerator:
         """
         candidate_lane = topology_sample[0]
         if not isinstance(candidate_lane, dict):
-            return
+            return False
         lane_offset = self._trusted_ego_lane_offset(scene_understanding)
         target = _select_sibling_lane_cache_only(candidate_lane, lane_offset)
         if target is None:
-            return
+            return False
         old_start = candidate_lane.get("start") or {}
         old_end = candidate_lane.get("end") or {}
         target_start = target.get("start") or {}
@@ -1161,6 +1340,17 @@ class AutoGenerator:
             "lane_id": target.get("lane_id", candidate_lane.get("lane_id")),
             "start": new_start,
             "end": new_end,
+            "resolved_ego_lane_from_right": lane_offset,
+            "ego_lane_constraint_source": (
+                "user_text"
+                if has_hard_scene_constraint(
+                    scene_understanding,
+                    "road_network.map_matching.ego_lane_from_right",
+                    "actor_layout.ego_approach.ego_lane_from_right",
+                    "metadata.ego_localization.ego_lane_from_right",
+                )
+                else "vlm_or_heuristic"
+            ),
         }
         topology_sample[0] = updated
         self.carla_spawn_context["topology_sample"][0] = updated
@@ -1168,6 +1358,7 @@ class AutoGenerator:
             f"  [ego_indexer] lateral(cache): offset={lane_offset} → "
             f"lane_id={updated['lane_id']}"
         )
+        return True
 
     def _index_ego_longitudinal_cache_only(
         self, scene_understanding: dict, topology_sample: list
@@ -2003,7 +2194,23 @@ class AutoGenerator:
 
     @staticmethod
     def _trusted_ego_lane_offset(scene_understanding: dict) -> int:
-        """Use an explicit ego lane only when the VLM supplied confidence."""
+        """Resolve ego lane with immutable user text ahead of VLM/heuristics."""
+        user_paths = (
+            "road_network.map_matching.ego_lane_from_right",
+            "actor_layout.ego_approach.ego_lane_from_right",
+            "metadata.ego_localization.ego_lane_from_right",
+        )
+        if has_hard_scene_constraint(scene_understanding, *user_paths):
+            user_value = hard_scene_constraint_value(scene_understanding, *user_paths)
+            try:
+                return max(0, int(user_value))
+            except (TypeError, ValueError):
+                # Invalid user constraints are rejected by the schema normalizer;
+                # keep this guard for hand-authored legacy artifacts.
+                pass
+
+        # The following confidence gate applies only to image-derived VLM facts.
+        # It must never gate an explicit user-text constraint.
         metadata = scene_understanding.get("metadata") or {}
         ego_loc = metadata.get("ego_localization")
         ego_loc = ego_loc if isinstance(ego_loc, dict) else {}
@@ -2795,6 +3002,71 @@ class AutoGenerator:
                 outcomes.append(outcome)
                 continue
             op = str(patch.get("op") or "")
+            locked = hard_entity_constraint_values(
+                self._active_scene_understanding or {}, entity_id
+            )
+            conflict_reason = None
+            if op in {"set_pose_target", "set_lane_target"}:
+                target_lane = str(patch.get("target_lane") or "")
+                locked_lane = locked.get("lane_side_relation")
+                if locked_lane is not None and target_lane != str(locked_lane):
+                    conflict_reason = "conflicts_with_hard_user_lane_constraint"
+            if op == "set_pose_target" and conflict_reason is None:
+                locked_m = locked.get("longitudinal_m")
+                target_m = patch.get("target_longitudinal_m")
+                if (
+                    isinstance(locked_m, (int, float))
+                    and isinstance(target_m, (int, float))
+                    and abs(float(locked_m) - float(target_m)) > 1.5
+                ):
+                    conflict_reason = "conflicts_with_hard_user_distance_constraint"
+                locked_heading = locked.get("heading_relation_to_ego")
+                target_heading = patch.get("target_heading_relation")
+                if (
+                    conflict_reason is None
+                    and locked_heading is not None
+                    and target_heading
+                    and str(locked_heading) != str(target_heading)
+                ):
+                    conflict_reason = "conflicts_with_hard_user_heading_constraint"
+            if op == "set_heading_relation" and conflict_reason is None:
+                locked_heading = locked.get("heading_relation_to_ego")
+                if locked_heading is not None and str(patch.get("target_heading") or "") != str(
+                    locked_heading
+                ):
+                    conflict_reason = "conflicts_with_hard_user_heading_constraint"
+            if op == "set_distance_band" and conflict_reason is None:
+                locked_band = locked.get("longitudinal_proximity")
+                if locked_band is not None and str(patch.get("target_band") or "") != str(
+                    locked_band
+                ):
+                    conflict_reason = "conflicts_with_hard_user_distance_band_constraint"
+            if op == "set_pairwise_relation" and conflict_reason is None:
+                target_relation = str(patch.get("target_relation") or "")
+                if target_relation in {"ahead_of", "behind_other"} and any(
+                    key in locked for key in ("longitudinal_m", "longitudinal_proximity")
+                ):
+                    conflict_reason = "may_override_hard_user_distance_constraint"
+                if target_relation in {"left_of_other", "right_of_other"} and any(
+                    key in locked
+                    for key in (
+                        "lane_side_relation",
+                        "lane_index_relation",
+                        "anchor_relation.lane_from_right",
+                    )
+                ):
+                    conflict_reason = "may_override_hard_user_lane_constraint"
+            if (
+                op == "resolve_overlap"
+                and conflict_reason is None
+                and "longitudinal_m" in locked
+            ):
+                conflict_reason = "may_override_hard_user_distance_constraint"
+            if conflict_reason is not None:
+                outcome["status"] = "blocked"
+                outcome["reason"] = conflict_reason
+                outcomes.append(outcome)
+                continue
             override = overrides.setdefault(entity_id, {})
             if op == "set_pose_target":
                 if pose_target_is_satisfied(entity, patch):
@@ -3409,6 +3681,39 @@ class AutoGenerator:
     def _spawn_layout_repair_summary_path(self, scene_id: str) -> str:
         return join(self.output_folder, f"{scene_id}_spawn_repair.json")
 
+    def _user_constraint_report_path(self, scene_id: str) -> str:
+        return join(self.output_folder, f"{scene_id}_user_constraints.json")
+
+    def _validate_final_user_constraints(
+        self,
+        scene_id: str,
+        scene_understanding: dict,
+        match_report_path: str,
+        repair_summary: Optional[dict] = None,
+    ) -> dict:
+        payload = self._load_json_if_exists(self._spawn_payload_path(scene_id))
+        selected_round = int((repair_summary or {}).get("selected_round") or 0)
+        render_graph = (
+            self._load_json_if_exists(
+                self._render_actor_graph_path(scene_id, selected_round)
+            )
+            if selected_round > 0
+            else {}
+        )
+        report = evaluate_user_constraints(
+            scene_understanding,
+            payload,
+            self._load_json_if_exists(match_report_path),
+            self.carla_spawn_context or {},
+            render_graph,
+        )
+        if report.get("enabled"):
+            write_to_file(
+                self._user_constraint_report_path(scene_id),
+                json.dumps(report, indent=2, sort_keys=True, ensure_ascii=False),
+            )
+        return report
+
     def _run_summary_path(self) -> str:
         return join(self.output_folder, "run_summary.json")
 
@@ -3783,6 +4088,26 @@ class AutoGenerator:
         match_report = self._load_json_if_exists(match_report_path)
         best_match = match_report.get("best_match") or {}
         anchor_loc = best_match.get("location") or {}
+        if self.carla_map:
+            matched_world = self._normalize_carla_world_name(
+                match_report.get("world_name")
+            )
+            requested_world = self._normalize_carla_world_name(self.carla_map)
+            if matched_world != requested_world:
+                raise CandidateValidationError(
+                    f"Matched world {matched_world!r} does not satisfy requested "
+                    f"CARLA map {requested_world!r}."
+                )
+        if self.require_urban_junction:
+            candidate_features = best_match.get("candidate_features") or {}
+            environment = candidate_features.get("environment_context") or {}
+            arms = candidate_features.get("physical_junction_arms") or {}
+            if str(candidate_features.get("candidate_topology_type") or "") != "cross_intersection":
+                raise CandidateValidationError("Candidate is not a cross intersection.")
+            if int(arms.get("leg_count") or 0) < 4:
+                raise CandidateValidationError("Candidate does not have four physical arms.")
+            if str(environment.get("environment_class") or "") != "urban_like":
+                raise CandidateValidationError("Candidate is not in an urban region.")
         if self.require_carla_connection:
             # Cache-based matching never loads the matched world, so the matched
             # map must be loaded here before any live geometry (dense waypoints,
@@ -3844,6 +4169,22 @@ class AutoGenerator:
             )
         else:
             print("Spawn layout verify-repair skipped.")
+        user_constraint_report = self._validate_final_user_constraints(
+            scene_id,
+            scene_understanding,
+            match_report_path,
+            repair_summary,
+        )
+        if user_constraint_report.get("failure_count"):
+            failed_ids = [
+                item.get("constraint_id")
+                for item in user_constraint_report.get("results") or []
+                if item.get("status") == "failed"
+            ]
+            raise CandidateValidationError(
+                "Final CARLA spawn payload violates hard user constraint(s): "
+                + ", ".join(str(item) for item in failed_ids)
+            )
         quick_bev = self._capture_quick_bev_preview(scene_id, final_scene_path)
         print(f"  Scene match report: {match_report_path}")
         print(f"  Spawn script:       {final_scene_path}")
@@ -3902,6 +4243,7 @@ class AutoGenerator:
                     ((scene_understanding.get("metadata") or {}).get("vehicle_detection") or {})
                 ),
                 "traffic_subject_count": len(scene_understanding.get("traffic_subjects") or []),
+                "user_constraints": user_constraint_report,
                 "matched_structure": self._matched_structure_summary(
                     matched_structure,
                     (self.carla_spawn_context or {}).get("matched_structure_source"),
@@ -3976,6 +4318,21 @@ if __name__ == "__main__":
         action="store_true",
         help="Exit non-zero when structural or high-severity actor validation fails.",
     )
+    parser.add_argument(
+        "--carla-map",
+        default="",
+        help="Restrict cache matching and CARLA loading to this map (for example Town13).",
+    )
+    parser.add_argument(
+        "--require-urban-junction",
+        action="store_true",
+        help="Accept only an urban four-arm cross intersection.",
+    )
+    parser.add_argument(
+        "--require-crosswalk-on-all-junction-arms",
+        action="store_true",
+        help="Use live CARLA geometry to require a distinct crosswalk on every junction arm.",
+    )
     args = parser.parse_args()
 
     output_folder = args.output_folder
@@ -4000,6 +4357,11 @@ if __name__ == "__main__":
         "verify_min_score": 0.70,
         "verify_mode": "vlm",
         "strict_validation": args.strict_validation,
+        "carla_map": args.carla_map.strip() or None,
+        "require_urban_junction": args.require_urban_junction,
+        "require_crosswalk_on_all_junction_arms": (
+            args.require_crosswalk_on_all_junction_arms
+        ),
         "map_match_blacklist_radius_m": 35.0,
         "map_match_topology_weight": 0.70,
         "map_match_side_context_weight": 0.20,

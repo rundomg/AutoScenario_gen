@@ -1808,6 +1808,50 @@ class TestGenerationPipelineHelpers(unittest.TestCase):
             self.assertTrue((Path(tmp) / "merged_su.json").exists())
             self.assertFalse((Path(tmp) / "merged_user_description.txt").exists())
 
+    def test_generate_scene_understanding_never_silently_ignores_user_text(self):
+        scene_understanding = {
+            "traffic_subjects": [],
+            "background_traffic": [],
+            "key_pairwise_relations": [],
+            "road_network": {"lane_groups": []},
+            "general_environment": {},
+            "metadata": {"schema_version": "scene-understanding-v1"},
+        }
+
+        class FailedMergeInterpreter:
+            def call_agent(self, user_request, add_info):
+                return dict(scene_understanding)
+
+            def merge_with_user_description(self, scene, description, output_fn):
+                failed = dict(scene)
+                failed["metadata"] = {
+                    "user_description_applied": False,
+                    "user_description_merge_error": "missing user_constraints",
+                }
+                return failed
+
+        with tempfile.TemporaryDirectory() as tmp:
+            generator = AutoGenerator(
+                tmp,
+                {
+                    "input_type": "image",
+                    "require_carla_connection": False,
+                    "merge_user_description": True,
+                },
+            )
+            generator.scene_understanding_interpreter = FailedMergeInterpreter()
+            with self.assertRaisesRegex(
+                RuntimeError, "stopped instead of silently ignoring"
+            ):
+                generator.generate_scene_understanding(
+                    "",
+                    {
+                        "scene_id": "failed_merge",
+                        "image_path": "unused.jpg",
+                        "user_scene_description": "自车在最右侧车道",
+                    },
+                )
+
     def test_cone_category_normalizes_to_static_spawn_payload(self):
         scene_understanding = {
             "traffic_subjects": [

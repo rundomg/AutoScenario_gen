@@ -82,6 +82,169 @@ class TestFallbackTopologySample(unittest.TestCase):
             self.assertIn(key, entry)
 
 
+class TestUserTextEgoLanePriority(unittest.TestCase):
+    @staticmethod
+    def _scene(with_constraints=True):
+        metadata = {}
+        if with_constraints:
+            metadata["user_constraints"] = {
+                "schema_version": "user-constraints-v1",
+                "source": "user_text",
+                "constraints": [
+                    {
+                        "id": "ego_rightmost",
+                        "target": "scene",
+                        "path": "road_network.map_matching.ego_lane_from_right",
+                        "value": 0,
+                        "source": "user_text",
+                        "strength": "hard",
+                        "evidence": "自车在最右侧车道",
+                    }
+                ],
+            }
+        return {
+            "metadata": metadata,
+            "road_network": {
+                "lane_groups": [{"forward_lane_count": 2}],
+                "map_matching": {
+                    "ego_lane_from_right": 0,
+                    "forward_lane_count": 2,
+                    "has_center_median": False,
+                },
+            },
+            "traffic_subjects": [
+                {
+                    "id": "det_3",
+                    "heading_relation_to_ego": "same_direction",
+                    "lane_index_relation": 0,
+                },
+                {
+                    "id": "det_5",
+                    "heading_relation_to_ego": "same_direction",
+                    "lane_index_relation": 1,
+                },
+            ],
+        }
+
+    def test_user_constraint_does_not_require_vlm_confidence_or_evidence(self):
+        self.assertEqual(
+            AutoGenerator._trusted_ego_lane_offset(self._scene(with_constraints=True)),
+            0,
+        )
+
+    def test_image_only_path_keeps_existing_confidence_gate_and_heuristic(self):
+        self.assertEqual(
+            AutoGenerator._trusted_ego_lane_offset(self._scene(with_constraints=False)),
+            1,
+        )
+
+    def test_cache_indexer_moves_user_constrained_ego_to_rightmost_lane(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            generator = _make_generator(tmp)
+            generator.carla_spawn_context = {
+                "topology_sample": [
+                    {
+                        "road_id": 7,
+                        "lane_id": 1,
+                        "start": {"x": -70.0, "y": -88.0, "z": 0.0, "yaw": 0.0},
+                        "end": {"x": -50.0, "y": -88.0, "z": 0.0, "yaw": 0.0},
+                        "same_direction_lane_evidence": {
+                            "inspected_lanes": [
+                                {
+                                    "accepted": True,
+                                    "road_id": 7,
+                                    "lane_id": 2,
+                                    "start": {
+                                        "x": -70.0,
+                                        "y": -84.5,
+                                        "z": 0.0,
+                                        "yaw": 0.0,
+                                    },
+                                }
+                            ]
+                        },
+                    }
+                ],
+                "dense_local_waypoints": [],
+            }
+
+            generator._index_ego_on_candidate_lane(self._scene(with_constraints=True))
+
+            anchor = generator.carla_spawn_context["topology_sample"][0]
+            self.assertEqual(anchor["lane_id"], 2)
+            self.assertEqual(anchor["resolved_ego_lane_from_right"], 0)
+            self.assertEqual(anchor["ego_lane_constraint_source"], "user_text")
+
+    def test_actor_repair_cannot_override_hard_user_lane(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            generator = _make_generator(tmp)
+            generator._active_scene_understanding = {
+                "traffic_subjects": [
+                    {"id": "det_5", "lane_side_relation": "left_lane"}
+                ],
+                "metadata": {
+                    "user_constraints": {
+                        "schema_version": "user-constraints-v1",
+                        "source": "user_text",
+                        "constraints": [
+                            {
+                                "id": "wait_left",
+                                "target": "entity",
+                                "entity_id": "det_5",
+                                "path": "lane_side_relation",
+                                "value": "left_lane",
+                                "strength": "hard",
+                            }
+                        ],
+                    }
+                },
+            }
+            payload = {
+                "entities": [
+                    {
+                        "id": "ego",
+                        "lane_side_relation": "same_lane",
+                        "lane_index_relation": 0,
+                        "location": {"x": 0.0, "y": 0.0, "z": 0.3},
+                        "rotation": {"yaw": 0.0},
+                    },
+                    {
+                        "id": "det_5",
+                        "lane_side_relation": "left_lane",
+                        "lane_index_relation": -1,
+                        "location": {"x": 5.0, "y": -3.5, "z": 0.3},
+                        "rotation": {"yaw": 0.0},
+                    },
+                ]
+            }
+            Path(generator._spawn_payload_path("locked")).write_text(
+                json.dumps(payload), encoding="utf-8"
+            )
+
+            result = generator._apply_actor_repair_patches(
+                "locked",
+                {},
+                {
+                    "patches": [
+                        {
+                            "op": "set_lane_target",
+                            "entity_id": "det_5",
+                            "target_lane": "right_lane",
+                        }
+                    ]
+                },
+            )
+
+            self.assertEqual(result["blocked_count"], 1)
+            repaired = json.loads(
+                Path(generator._spawn_payload_path("locked")).read_text(
+                    encoding="utf-8"
+                )
+            )
+            actor = next(item for item in repaired["entities"] if item["id"] == "det_5")
+            self.assertEqual(actor["lane_side_relation"], "left_lane")
+
+
 class TestLayoutCapture(unittest.TestCase):
     def test_capture_layout_images_prefers_ego_view_and_sets_both_outputs(self):
         with tempfile.TemporaryDirectory() as tmp:
